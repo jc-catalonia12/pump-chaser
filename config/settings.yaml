@@ -1,4 +1,7 @@
 mexc:
+  # Global default. If mexc.com is blocked in your region, use the alternate host, e.g.:
+  #   rest_base_url: https://contract.mexc.co
+  #   ws_url: wss://contract.mexc.co/edge
   rest_base_url: https://contract.mexc.com
   ws_url: wss://contract.mexc.com/edge
   request_timeout_sec: 15.0

@@ -734,7 +734,7 @@ pub async fn user_settings_get(State(state): State<Arc<AppState>>) -> Json<Value
         "config_path": settings_file_path().display().to_string(),
         "values": user_settings_values(&cfg),
         "sections": settings_schema(),
-        "note": "Changes are saved to settings.yaml. Stop and start the scanner for strategy thresholds to fully apply.",
+        "note": "Changes are saved to settings.yaml. Stop and start the scanner after editing MEXC endpoints or strategy thresholds.",
     }))
 }
 

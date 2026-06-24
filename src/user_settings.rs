@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::{
-    AppConfig, ConfluenceConfig, ExecutionConfig, LearningConfig, RiskConfig,
-    ScalpConfig, TradingConfig, WatchlistConfig, ZonesConfig,
+    AppConfig, ConfluenceConfig, ExecutionConfig, LearningConfig, RiskConfig, ScalpConfig,
+    TradingConfig, WatchlistConfig, ZonesConfig,
 };
 use crate::error::{BotError, Result};
 use crate::utils::discover_project_root;
@@ -60,6 +60,10 @@ pub fn save_app_config(cfg: &AppConfig) -> Result<()> {
 
 pub fn user_settings_values(cfg: &AppConfig) -> Value {
     json!({
+        "mexc": {
+            "rest_base_url": cfg.mexc.rest_base_url,
+            "ws_url": cfg.mexc.ws_url,
+        },
         "execution": cfg.execution,
         "trading": cfg.trading,
         "risk": cfg.risk,
@@ -89,6 +93,23 @@ pub fn user_settings_values(cfg: &AppConfig) -> Value {
 
 pub fn settings_schema() -> Vec<SettingsSection> {
     vec![
+        SettingsSection {
+            id: "mexc".into(),
+            title: "MEXC API Endpoints".into(),
+            description: "REST + WebSocket hostnames. Change these if contract.mexc.com is blocked in your region (e.g. Philippines: contract.mexc.co). Restart the scanner after saving; wallet sync uses the new URLs immediately.".into(),
+            fields: vec![
+                field_text(
+                    "mexc.rest_base_url",
+                    "Futures REST base URL",
+                    Some("e.g. https://contract.mexc.com or https://contract.mexc.co"),
+                ),
+                field_text(
+                    "mexc.ws_url",
+                    "Futures WebSocket URL",
+                    Some("e.g. wss://contract.mexc.com/edge or wss://contract.mexc.co/edge"),
+                ),
+            ],
+        },
         SettingsSection {
             id: "execution".into(),
             title: "Execution & Safety".into(),
@@ -202,6 +223,19 @@ pub fn apply_user_settings(cfg: &mut AppConfig, patch: &Value) -> Result<()> {
     let mut merged = user_settings_values(cfg);
     deep_merge(&mut merged, patch);
 
+    if let Some(v) = merged.get("mexc") {
+        let mut mexc = cfg.mexc.clone();
+        let m = v
+            .as_object()
+            .ok_or_else(|| BotError::Config("mexc must be object".into()))?;
+        if let Some(x) = m.get("rest_base_url") {
+            mexc.rest_base_url = normalize_mexc_url(json_to_string(x)?, true)?;
+        }
+        if let Some(x) = m.get("ws_url") {
+            mexc.ws_url = normalize_mexc_url(json_to_string(x)?, false)?;
+        }
+        cfg.mexc = mexc;
+    }
     if let Some(v) = merged.get("execution") {
         cfg.execution = serde_json::from_value::<ExecutionConfig>(v.clone())?;
     }
@@ -288,6 +322,19 @@ fn deep_merge(base: &mut Value, patch: &Value) {
             }
         }
         (slot, value) => *slot = value.clone(),
+    }
+}
+
+fn field_text(key: &str, label: &str, hint: Option<&str>) -> SettingsField {
+    SettingsField {
+        key: key.into(),
+        label: label.into(),
+        field_type: "text".into(),
+        hint: hint.map(str::to_string),
+        options: None,
+        min: None,
+        max: None,
+        step: None,
     }
 }
 
@@ -382,6 +429,31 @@ fn json_to_bool(v: &Value) -> Result<bool> {
         .ok_or_else(|| BotError::Config(format!("expected boolean, got {v}")))
 }
 
+fn json_to_string(v: &Value) -> Result<String> {
+    v.as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| BotError::Config(format!("expected non-empty string, got {v}")))
+}
+
+/// Trim trailing slashes; require https for REST and wss for WebSocket.
+fn normalize_mexc_url(raw: String, rest: bool) -> Result<String> {
+    let url = raw.trim().trim_end_matches('/').to_string();
+    if rest {
+        if !url.starts_with("https://") {
+            return Err(BotError::Config(
+                "REST base URL must start with https://".into(),
+            ));
+        }
+    } else if !url.starts_with("wss://") {
+        return Err(BotError::Config(
+            "WebSocket URL must start with wss://".into(),
+        ));
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +469,22 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.scanner.min_24h_turnover_usdt, 750_000.0);
         assert_eq!(cfg.scanner.kline_interval, original_interval);
+    }
+
+    #[test]
+    fn merge_updates_mexc_endpoints() {
+        let mut cfg = AppConfig::load().expect("settings.yaml");
+        apply_user_settings(
+            &mut cfg,
+            &json!({
+                "mexc": {
+                    "rest_base_url": "https://contract.mexc.co",
+                    "ws_url": "wss://contract.mexc.co/edge"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(cfg.mexc.rest_base_url, "https://contract.mexc.co");
+        assert_eq!(cfg.mexc.ws_url, "wss://contract.mexc.co/edge");
     }
 }

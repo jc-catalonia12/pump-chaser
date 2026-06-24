@@ -324,8 +324,9 @@ function buildSettingsPatch() {
     let value;
     if (type === "bool") {
       value = el.checked;
-    } else if (type === "select") {
-      value = el.value;
+    } else if (type === "select" || type === "text") {
+      value = el.value.trim();
+      if (type === "text" && !value) return;
     } else if (type === "integer") {
       value = parseInt(el.value, 10);
     } else {
@@ -359,6 +360,16 @@ function renderSettingsField(field, value) {
     return `<div class="settings-field">
       <label for="${id}">${field.label}</label>
       <select id="${id}" data-setting-key="${field.key}" data-setting-type="select">${options}</select>
+      ${hint}
+    </div>`;
+  }
+
+  if (field.type === "text") {
+    const display = value != null ? String(value) : "";
+    return `<div class="settings-field">
+      <label for="${id}">${field.label}</label>
+      <input type="text" id="${id}" data-setting-key="${field.key}" data-setting-type="text"
+        value="${display.replace(/"/g, "&quot;")}" spellcheck="false" autocomplete="off" />
       ${hint}
     </div>`;
   }
