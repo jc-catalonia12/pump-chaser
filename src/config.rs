@@ -68,11 +68,11 @@ fn default_rate_limit_ms() -> u64 {
 }
 
 fn default_mexc_rest() -> String {
-    "https://contract.mexc.com".into()
+    "https://contract.mexc.co".into()
 }
 
 fn default_mexc_ws() -> String {
-    "wss://contract.mexc.com/edge".into()
+    "wss://contract.mexc.co/edge".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -316,6 +316,17 @@ function setNestedValue(obj, key, value) {
   cur[parts[parts.length - 1]] = value;
 }
 
+function settingsFieldType(field) {
+  return field.type || field.field_type || "number";
+}
+
+function isSettingsTextField(field) {
+  const t = settingsFieldType(field);
+  if (t === "text") return true;
+  const key = field.key || "";
+  return key.includes("url") || key.includes("_base_url");
+}
+
 function buildSettingsPatch() {
   const patch = {};
   $$("[data-setting-key]").forEach((el) => {
@@ -324,9 +335,9 @@ function buildSettingsPatch() {
     let value;
     if (type === "bool") {
       value = el.checked;
-    } else if (type === "select" || type === "text") {
+    } else if (type === "select" || type === "text" || type === "url") {
       value = el.value.trim();
-      if (type === "text" && !value) return;
+      if ((type === "text" || type === "url") && !value) return;
     } else if (type === "integer") {
       value = parseInt(el.value, 10);
     } else {
@@ -341,8 +352,9 @@ function buildSettingsPatch() {
 function renderSettingsField(field, value) {
   const id = `setting-${field.key.replace(/\./g, "-")}`;
   const hint = field.hint ? `<span class="field-hint">${field.hint}</span>` : "";
+  const fieldType = settingsFieldType(field);
 
-  if (field.type === "bool") {
+  if (fieldType === "bool") {
     const checked = value ? "checked" : "";
     return `<div class="settings-field">
       <label class="settings-toggle" for="${id}">
@@ -353,7 +365,7 @@ function renderSettingsField(field, value) {
     </div>`;
   }
 
-  if (field.type === "select") {
+  if (fieldType === "select") {
     const options = (field.options || [])
       .map((opt) => `<option value="${opt}"${opt === value ? " selected" : ""}>${opt}</option>`)
       .join("");
@@ -364,21 +376,23 @@ function renderSettingsField(field, value) {
     </div>`;
   }
 
-  if (field.type === "text") {
+  if (isSettingsTextField(field)) {
     const display = value != null ? String(value) : "";
+    const inputKind = (field.key || "").includes("url") ? "url" : "text";
     return `<div class="settings-field">
       <label for="${id}">${field.label}</label>
-      <input type="text" id="${id}" data-setting-key="${field.key}" data-setting-type="text"
-        value="${display.replace(/"/g, "&quot;")}" spellcheck="false" autocomplete="off" />
+      <input type="text" id="${id}" data-setting-key="${field.key}" data-setting-type="${inputKind}"
+        class="settings-text-input" value="${display.replace(/"/g, "&quot;")}"
+        spellcheck="false" autocomplete="off" inputmode="url" />
       ${hint}
     </div>`;
   }
 
-  const step = field.step ?? (field.type === "integer" ? 1 : 0.001);
+  const step = field.step ?? (fieldType === "integer" ? 1 : 0.001);
   const min = field.min != null ? ` min="${field.min}"` : "";
   const max = field.max != null ? ` max="${field.max}"` : "";
   const display = value != null && !Number.isNaN(Number(value)) ? Number(value) : "";
-  const inputType = field.type === "integer" ? "integer" : "number";
+  const inputType = fieldType === "integer" ? "integer" : "number";
 
   return `<div class="settings-field">
     <label for="${id}">${field.label}</label>

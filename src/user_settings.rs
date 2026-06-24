@@ -96,17 +96,17 @@ pub fn settings_schema() -> Vec<SettingsSection> {
         SettingsSection {
             id: "mexc".into(),
             title: "MEXC API Endpoints".into(),
-            description: "REST + WebSocket hostnames. Change these if contract.mexc.com is blocked in your region (e.g. Philippines: contract.mexc.co). Restart the scanner after saving; wallet sync uses the new URLs immediately.".into(),
+            description: "REST + WebSocket hostnames (default: contract.mexc.co). Use contract.mexc.com if mexc.co is blocked in your region. Restart the scanner after saving; wallet sync uses the new URLs immediately.".into(),
             fields: vec![
                 field_text(
                     "mexc.rest_base_url",
                     "Futures REST base URL",
-                    Some("e.g. https://contract.mexc.com or https://contract.mexc.co"),
+                    Some("e.g. https://contract.mexc.co"),
                 ),
                 field_text(
                     "mexc.ws_url",
                     "Futures WebSocket URL",
-                    Some("e.g. wss://contract.mexc.com/edge or wss://contract.mexc.co/edge"),
+                    Some("e.g. wss://contract.mexc.co/edge"),
                 ),
             ],
         },
@@ -469,6 +469,16 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.scanner.min_24h_turnover_usdt, 750_000.0);
         assert_eq!(cfg.scanner.kline_interval, original_interval);
+    }
+
+    #[test]
+    fn schema_mexc_fields_are_text_type() {
+        let sections = settings_schema();
+        let v = serde_json::to_value(&sections).expect("serialize schema");
+        let fields = v[0]["fields"].as_array().expect("mexc fields");
+        assert_eq!(fields[0]["type"], "text");
+        assert_eq!(fields[0]["key"], "mexc.rest_base_url");
+        assert_eq!(fields[1]["type"], "text");
     }
 
     #[test]
