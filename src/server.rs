@@ -1,9 +1,9 @@
 //! Axum server bootstrap — shared by CLI and Tauri desktop.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use tokio::sync::RwLock;
+use tokio::sync::RwLock as AsyncRwLock;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -29,18 +29,18 @@ pub async fn run() -> Result<()> {
     init_runtime_paths();
     let mut loaded = AppConfig::load()?;
     normalize_config_paths(&mut loaded);
-    let config = Arc::new(RwLock::new(loaded));
-    let config_snap = config.read().await.clone();
+    let config: crate::config::SharedAppConfig = Arc::new(RwLock::new(loaded));
+    let config_snap = config.read().unwrap().clone();
     let db = Arc::new(Database::connect(&config_snap.storage.sqlite_path).await?);
     db.migrate().await?;
 
-    let risk = Arc::new(tokio::sync::RwLock::new(
-        RiskManager::new(Arc::new(config_snap.clone()), db.clone()).await?,
+    let risk = Arc::new(AsyncRwLock::new(
+        RiskManager::new(config.clone(), db.clone()).await?,
     ));
-    let secrets = Arc::new(tokio::sync::RwLock::new(load_secrets()));
+    let secrets = Arc::new(AsyncRwLock::new(load_secrets()));
 
-    let scanner = Arc::new(tokio::sync::RwLock::new(ScannerService::new(
-        Arc::new(config_snap.clone()),
+    let scanner = Arc::new(AsyncRwLock::new(ScannerService::new(
+        config.clone(),
         db.clone(),
         risk.clone(),
         secrets.clone(),

@@ -43,6 +43,26 @@ fn event_label(event_key: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Human-readable label for a strategy id (`confluence`, `volume_pump`, …).
+fn fmt_strategy(strategy: &str) -> String {
+    match strategy {
+        "confluence" => "Confluence".into(),
+        "volume_pump" => "Volume Pump".into(),
+        "scalp" => "Scalp".into(),
+        other => other
+            .split('_')
+            .map(|w| {
+                let mut c = w.chars();
+                match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
 /// Human-readable label for an exit/close reason string.
 fn fmt_reason(reason: &str) -> String {
     if reason.starts_with("take_profit_l") {
@@ -101,6 +121,20 @@ fn build_trade_message(event_key: &str, details: Option<&Value>) -> String {
         sym_line.push_str(badge);
     }
     lines.push(sym_line);
+
+    let strategy = d
+        .get("strategy")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            d.get("payload")
+                .and_then(|p| p.get("strategy"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        });
+    if let Some(s) = strategy {
+        lines.push(format!("🧠 <b>Strategy</b>  {}", fmt_strategy(s)));
+    }
     lines.push(String::new());
 
     // ── Price fields ──────────────────────────────────────────────────────
@@ -418,6 +452,27 @@ impl Alerter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn fmt_strategy_labels() {
+        assert_eq!(fmt_strategy("confluence"), "Confluence");
+        assert_eq!(fmt_strategy("volume_pump"), "Volume Pump");
+        assert_eq!(fmt_strategy("scalp"), "Scalp");
+    }
+
+    #[test]
+    fn trade_message_includes_strategy() {
+        let details = json!({
+            "symbol": "BILL_USDT",
+            "side": "LONG",
+            "strategy": "volume_pump",
+            "entry_price": 0.00123,
+            "margin_usdt": 5.0,
+        });
+        let text = build_trade_message("position_opened", Some(&details));
+        assert!(text.contains("Volume Pump"));
+        assert!(text.contains("Strategy"));
+    }
 
     #[test]
     fn trade_event_rate_key_is_per_symbol() {

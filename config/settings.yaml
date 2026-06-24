@@ -1,5 +1,4 @@
 mexc:
-  # Alternate host if mexc.co is blocked: https://contract.mexc.com and wss://contract.mexc.com/edge
   rest_base_url: https://contract.mexc.co
   ws_url: wss://contract.mexc.co/edge
   request_timeout_sec: 15.0
@@ -19,54 +18,63 @@ zones:
   pivot_right: 2
   zone_width_pct: 0.2
   proximity_pct: 0.25
-# Post-gate trading profile:
-#   1) Confluence scores the setup (Min1 bars)
-#   2) ML hard gate — only trade when setup_probability >= supervised_threshold (63%)
-#   3) Outcomes / post-gate win rate use max_hold_sec + projected TP/SL below
 confluence:
   enabled: true
-  min_composite_score: 68.0
-  min_zone_score: 55.0
+  min_composite_score: 60.0
+  min_zone_score: 58.0
   min_confluences: 4
-  min_move_pct: 0.15
-  max_move_pct: 2.5
+  min_move_pct: 0.2
+  max_move_pct: 3.0
   volume_surge_multiplier: 2.0
   volume_zscore_threshold: 2.3
   alert_cooldown_sec: 300
-  default_sl_pct: 0.018
-  trailing_stop_pct: 0.008
+  default_sl_pct: 0.02
+  trailing_stop_pct: 0.01
   trailing_activation_pct: 0.012
   tp_levels_pct:
-  - 0.01
-  - 0.025
+  - 0.02
   - 0.045
+  - 0.08
   tp_close_fractions:
   - 0.4
   - 0.35
   - 0.25
-  max_hold_sec: 2400
+  max_hold_sec: 3600
   max_risk_per_trade: 0.03
-  max_concurrent_positions: 3
-  require_structure: true
+  max_concurrent_positions: 1
+  require_structure: false
   require_market_structure_bias: true
-  require_ema_trend: true
   market_structure_lookback_bars: 48
-  require_inside_zone: false
+  require_inside_zone: true
+  require_ema_trend: false
   ema_trend_span: 20
-  require_pullback_candle: true
+  require_pullback_candle: false
   max_range_extreme_pct: 0.18
-  max_extension_pct: 1.5
-  base_leverage: 8
-  moderate_leverage: 10
-  strong_leverage: 10
+  max_extension_pct: 1.8
+  base_leverage: 20
+  moderate_leverage: 50
+  strong_leverage: 100
+  htf_enabled: true
+  htf_interval: Min15
+  htf_lookback_bars: 120
+  liquidity_grab_enabled: true
+  require_liquidity_grab: true
+  liquidity_grab_lookback_bars: 80
+  liquidity_grab_max_age_bars: 5
+  liquidity_grab_sweep_pct: 0.04
+  liquidity_grab_min_rejection: 0.4
+  trailing_extended_activation_pct: 0.03
+  trailing_extended_stop_pct: 0.014
+  trailing_runner_activation_pct: 0.05
+  trailing_runner_stop_pct: 0.024
 trading:
-  mode: confluence
+  mode: all
 risk:
   max_risk_per_trade: 0.03
-  max_leverage: 125
-  max_concurrent_positions: 3
+  max_leverage: 200
+  max_concurrent_positions: 4
   daily_loss_limit: 0.1
-  min_position_margin_usdt: 3.0
+  min_position_margin_usdt: 5.0
   use_live_wallet_equity: true
   max_exposure_pct: 0.8
   max_funding_rate_abs: 0.001
@@ -74,18 +82,14 @@ risk:
   default_sl_pct: 0.03
   trailing_stop_pct: 0.02
   allow_hedge: false
-  # ── Circuit breakers ────────────────────────────────────────────────────────
-  # Pause trading after this many consecutive stop-outs. 0 = disabled.
   max_consecutive_losses: 3
-  # Seconds to stay paused after a loss streak trips (default 30 min).
   loss_streak_cooldown_sec: 1800
-  # Auto-activate the kill switch if drawdown from peak exceeds this fraction.
-  # 0.15 = 15%. Set to 1.0 to disable.
   max_drawdown_halt_pct: 0.15
-  # Seconds to block re-entry on the same symbol after a stop-out (default 15 min).
   symbol_loss_cooldown_sec: 1200
-  # Mark the WS feed as stale if no ticker batch has arrived in this many seconds.
   ws_stale_sec: 30
+  min_profit_usdt: 2.5
+  max_confluence_positions: 2
+  max_volume_pump_positions: 2
 execution:
   live_trading_enabled: true
   dry_run: false
@@ -95,23 +99,17 @@ storage:
 ml:
   enabled: true
   supervised_enabled: true
-  # Post-gate threshold — matches Training tab "Post-Gate Win Rate (≥63%)"
   supervised_threshold: 0.63
   min_training_samples: 100
-  hard_ml_gate: true
+  hard_ml_gate: false
   onnx_model_path: data/models/supervised.onnx
-  # Asymmetric SGD weights for real trade outcomes (losses train harder)
   trade_win_weight: 2.0
   trade_loss_weight: 3.5
-  # Shadow samples: win/loss at shadow_resolve_weight; expired at 0.3x soft-label 0.45
-  # Training data filtering: when hard_ml_gate is true, bootstrap skips signals that
-  # were below the supervised_threshold (pre-gate era) to reduce label noise.
 server:
   host: 127.0.0.1
   port: 8001
 learning:
   enabled: true
-  # Shadow samples train the gate; live trades only open on post-gate passes.
   shadow_ml_rejects: true
   shadow_ml_reject_weight: 0.75
   shadow_max_per_symbol_hour: 2
@@ -125,20 +123,51 @@ watchlist:
   mode: all
 backtest:
   engine: builtin
-  # Defaults used by the /backtest endpoint when not overridden by request body
-  default_fee_pct: 0.001
-  walk_forward_train_frac: 0.8
 exchanges:
   mexc_client: native
-# ── Webhook alerts ────────────────────────────────────────────────────────────
-# Set enabled: true and provide a webhook_url to receive alerts on Telegram or
-# Discord when critical events occur (kill switch, circuit breaker, WS stale).
-#
-# Telegram:  webhook_url: "https://api.telegram.org/bot<TOKEN>/sendMessage"
-#            telegram_chat_id: "<CHAT_ID>"
-# Discord:   webhook_url: "https://discord.com/api/webhooks/<ID>/<TOKEN>"
 alerts:
   enabled: false
-  webhook_url: ""
-  telegram_chat_id: ""
+  webhook_url: ''
+  telegram_chat_id: ''
   min_interval_sec: 300
+sniper:
+  entry_mode: sniper
+  limit_offset_pct: 0.001
+  limit_ttl_sec: 30
+  sniper_lookback_bars: 5
+  sniper_min_wick_rejection: 0.4
+  sniper_max_pullback_pct: 0.7
+  htf_setup_expiry_sec: 600
+pump:
+  enabled: true
+  volume_surge_multiplier: 3.5
+  volume_zscore_threshold: 2.5
+  price_change_pct_min: 0.8
+  price_change_pct_max: 8.0
+  ewma_span: 20
+  min_composite_score: 62.0
+  universe_rank_max: 5
+  min_24h_turnover_usdt: 500000.0
+  max_24h_turnover_usdt: 50000000.0
+  alert_cooldown_sec: 180
+  entry_mode: limit
+  limit_offset_pct: 0.001
+  limit_ttl_sec: 15
+  default_sl_pct: 0.012
+  tp_levels_pct:
+  - 0.015
+  - 0.03
+  - 0.05
+  tp_close_fractions:
+  - 0.5
+  - 0.3
+  - 0.2
+  max_hold_sec: 900
+  trailing_stop_pct: 0.008
+  trailing_activation_pct: 0.01
+  base_leverage: 20
+  moderate_leverage: 50
+  strong_leverage: 100
+  max_concurrent_positions: 1
+  min_profit_usdt: 1.0
+  max_risk_per_trade: 0.01

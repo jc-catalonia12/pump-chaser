@@ -14,9 +14,24 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde::Serialize;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, SharedAppConfig};
 use crate::db::{Database, PortfolioState};
 use crate::error::{BotError, Result};
+use crate::signals::PumpSignal;
+
+/// Sized live/paper entry that passed risk checks but is not yet persisted.
+#[derive(Debug, Clone)]
+pub struct PreparedOpen {
+    pub side: String,
+    pub size: f64,
+    pub leverage: i64,
+    /// `market`, `limit`, or `sniper` — copied from the signal at commit time.
+    pub entry_mode: String,
+    /// Fill price for market entries; limit price for resting limit orders.
+    pub entry_price: f64,
+    /// Resting limit price when `entry_mode` is limit/sniper.
+    pub limit_price: Option<f64>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RiskMetrics {
@@ -33,7 +48,7 @@ pub struct RiskMetrics {
 }
 
 pub struct RiskManager {
-    config: Arc<AppConfig>,
+    config: SharedAppConfig,
     db: Arc<Database>,
     state: PortfolioState,
     /// In-memory per-symbol stop-out cooldown: symbol → unix timestamp expiry.
@@ -43,7 +58,7 @@ pub struct RiskManager {
 }
 
 impl RiskManager {
-    pub async fn new(config: Arc<AppConfig>, db: Arc<Database>) -> Result<Self> {
+    pub async fn new(config: SharedAppConfig, db: Arc<Database>) -> Result<Self> {
         let mut state = db.get_portfolio_state().await?;
         roll_pnl_periods(&mut state);
         if state.daily_pnl_date.is_empty() {
@@ -58,6 +73,7 @@ impl RiskManager {
     }
 
     pub fn metrics(&self, open_positions: i64) -> RiskMetrics {
+        let cfg = self.config.read().unwrap();
         let equity = self.state.equity.max(1.0);
         RiskMetrics {
             equity: round2(self.state.equity),
@@ -69,7 +85,7 @@ impl RiskManager {
             open_positions,
             trading_paused: self.state.trading_paused != 0,
             kill_switch: self.state.kill_switch != 0,
-            max_risk_per_trade_pct: round2(self.config.risk.max_risk_per_trade * 100.0),
+            max_risk_per_trade_pct: round2(cfg.risk.max_risk_per_trade * 100.0),
         }
     }
 
@@ -80,22 +96,23 @@ impl RiskManager {
     ///            bot pauses for `loss_streak_cooldown_sec`; if drawdown exceeds
     ///            `max_drawdown_halt_pct` the kill switch fires automatically.
     pub async fn record_trade_outcome(&mut self, symbol: &str, won: bool) -> Result<()> {
+        let cfg = self.config.read().unwrap().clone();
         if won {
             self.state.consecutive_losses = 0;
         } else {
             self.state.consecutive_losses += 1;
 
             // Per-symbol cooldown: block re-entry on this symbol for a window.
-            let cooldown = self.config.risk.symbol_loss_cooldown_sec as i64;
+            let cooldown = cfg.risk.symbol_loss_cooldown_sec as i64;
             if cooldown > 0 {
                 let expiry = Utc::now().timestamp() + cooldown;
                 self.symbol_cooldowns.insert(symbol.to_string(), expiry);
             }
 
             // Consecutive-loss streak breaker.
-            let max_streak = self.config.risk.max_consecutive_losses as i64;
+            let max_streak = cfg.risk.max_consecutive_losses as i64;
             if max_streak > 0 && self.state.consecutive_losses >= max_streak {
-                let cooldown_sec = self.config.risk.loss_streak_cooldown_sec as i64;
+                let cooldown_sec = cfg.risk.loss_streak_cooldown_sec as i64;
                 let until = Utc::now().timestamp() + cooldown_sec;
                 self.state.paused_until = until;
                 self.state.trading_paused = 1;
@@ -117,7 +134,7 @@ impl RiskManager {
             }
 
             // Max-drawdown auto-kill-switch.
-            let dd_limit = self.config.risk.max_drawdown_halt_pct;
+            let dd_limit = cfg.risk.max_drawdown_halt_pct;
             if dd_limit < 1.0 {
                 let drawdown = self.current_drawdown();
                 if drawdown >= dd_limit {
@@ -142,11 +159,13 @@ impl RiskManager {
                 }
             }
         }
+        drop(cfg);
         self.persist().await
     }
 
     /// Check whether a new position may be opened (system-wide check).
     pub async fn can_open_position(&self, open_count: i64) -> Result<()> {
+        let cfg = self.config.read().unwrap();
         if self.state.kill_switch != 0 {
             return Err(BotError::RiskBlocked("Kill switch active".into()));
         }
@@ -165,14 +184,14 @@ impl RiskManager {
         } else if self.state.trading_paused != 0 {
             return Err(BotError::RiskBlocked("Trading paused".into()));
         }
-        if open_count >= self.config.risk.max_concurrent_positions as i64 {
+        if open_count >= cfg.risk.max_concurrent_positions as i64 {
             return Err(BotError::RiskBlocked(format!(
                 "Max positions ({}) reached",
-                self.config.risk.max_concurrent_positions
+                cfg.risk.max_concurrent_positions
             )));
         }
         let equity = self.state.equity.max(1.0);
-        if self.state.daily_pnl.abs() / equity >= self.config.risk.daily_loss_limit {
+        if self.state.daily_pnl.abs() / equity >= cfg.risk.daily_loss_limit {
             return Err(BotError::RiskBlocked("Daily loss limit hit".into()));
         }
         Ok(())
@@ -285,6 +304,7 @@ impl RiskManager {
         open_positions: i64,
         open_scalp: i64,
         open_confluence: i64,
+        open_volume_pump: i64,
         ws_stale: bool,
     ) -> serde_json::Value {
         let equity = self.state.equity.max(1.0);
@@ -296,6 +316,7 @@ impl RiskManager {
         let now = Utc::now().timestamp();
         let circuit_active = self.state.paused_until > now;
         let circuit_remaining = if circuit_active { self.state.paused_until - now } else { 0 };
+        let cfg = self.config.read().unwrap();
         serde_json::json!({
             "equity": round2(self.state.equity),
             "peak_equity": round2(self.state.peak_equity),
@@ -309,24 +330,26 @@ impl RiskManager {
             "open_positions": open_positions,
             "open_scalp_positions": open_scalp,
             "open_confluence_positions": open_confluence,
-            "max_positions": self.config.risk.max_concurrent_positions,
+            "open_volume_pump_positions": open_volume_pump,
+            "max_positions": cfg.risk.max_concurrent_positions,
             "max_scalp_positions": 0,
-            "max_confluence_positions": self.config.risk.max_concurrent_positions,
+            "max_confluence_positions": cfg.risk.max_confluence_positions,
+            "max_volume_pump_positions": cfg.risk.max_volume_pump_positions,
             "trading_paused": self.state.trading_paused != 0,
             "kill_switch": self.state.kill_switch != 0,
-            "max_risk_per_trade_pct": round2(self.config.risk.max_risk_per_trade * 100.0),
+            "max_risk_per_trade_pct": round2(cfg.risk.max_risk_per_trade * 100.0),
             "paper_trading": true,
-            "live_trading": self.config.execution.live_trading_enabled,
-            "ml_enabled": self.config.ml.enabled,
-            "learning_enabled": self.config.learning.enabled,
-            "trading_mode": self.config.trading.mode,
-            "scalp_enabled": self.config.scalp.enabled,
+            "live_trading": cfg.execution.live_trading_enabled,
+            "ml_enabled": cfg.ml.enabled,
+            "learning_enabled": cfg.learning.enabled,
+            "trading_mode": cfg.trading.mode,
+            "scalp_enabled": cfg.scalp.enabled,
             "ws_stale": ws_stale,
             // Circuit-breaker state
             "consecutive_losses": self.state.consecutive_losses,
             "circuit_breaker_active": circuit_active,
             "circuit_breaker_remaining_sec": circuit_remaining,
-            "max_drawdown_halt_pct": self.config.risk.max_drawdown_halt_pct * 100.0,
+            "max_drawdown_halt_pct": cfg.risk.max_drawdown_halt_pct * 100.0,
         })
     }
 
@@ -343,7 +366,8 @@ impl RiskManager {
         self.state.peak_equity = self.state.peak_equity.max(self.state.equity);
 
         let equity = self.state.equity.max(1.0);
-        if self.state.daily_pnl.abs() / equity >= self.config.risk.daily_loss_limit {
+        let daily_limit = self.config.read().unwrap().risk.daily_loss_limit;
+        if self.state.daily_pnl.abs() / equity >= daily_limit {
             self.state.trading_paused = 1;
         }
         self.persist().await
@@ -353,13 +377,13 @@ impl RiskManager {
         self.db.save_portfolio_state(&self.state).await
     }
 
-    pub async fn try_open_from_signal(
+    /// Validate risk gates and compute size without writing to the positions table.
+    pub async fn prepare_open_from_signal(
         &mut self,
-        signal: &crate::signals::PumpSignal,
-        paper: bool,
-    ) -> Result<Option<i64>> {
+        signal: &PumpSignal,
+    ) -> Result<Option<PreparedOpen>> {
         let open_count = self.db.count_open_positions().await?;
-        if let Err(crate::error::BotError::RiskBlocked(msg)) = self.can_open_position(open_count).await {
+        if let Err(BotError::RiskBlocked(msg)) = self.can_open_position(open_count).await {
             let _ = self
                 .db
                 .log_event("trade_blocked", &msg, Some(signal.to_payload()))
@@ -367,8 +391,40 @@ impl RiskManager {
             return Ok(None);
         }
 
-        // Per-symbol cooldown check.
-        if let Err(crate::error::BotError::RiskBlocked(msg)) = self.can_open_symbol(&signal.symbol) {
+        let cfg = self.config.read().unwrap().clone();
+        let strategy_cap = strategy_position_cap(&cfg, &signal.strategy);
+        let strategy_open = self
+            .db
+            .count_open_positions_by_strategy(&signal.strategy)
+            .await?;
+        if strategy_open >= strategy_cap as i64 {
+            let _ = self
+                .db
+                .log_event(
+                    "trade_blocked",
+                    &format!(
+                        "Max {} positions ({}) reached",
+                        signal.strategy, strategy_cap
+                    ),
+                    Some(signal.to_payload()),
+                )
+                .await;
+            return Ok(None);
+        }
+
+        if self.db.has_open_position_on_symbol(&signal.symbol).await? {
+            let _ = self
+                .db
+                .log_event(
+                    "trade_blocked",
+                    &format!("{} already has an open position", signal.symbol),
+                    Some(signal.to_payload()),
+                )
+                .await;
+            return Ok(None);
+        }
+
+        if let Err(BotError::RiskBlocked(msg)) = self.can_open_symbol(&signal.symbol) {
             let _ = self
                 .db
                 .log_event("trade_blocked", &msg, Some(signal.to_payload()))
@@ -376,7 +432,7 @@ impl RiskManager {
             return Ok(None);
         }
 
-        if signal.suggested_risk_pct / 100.0 > self.config.risk.max_risk_per_trade {
+        if signal.suggested_risk_pct / 100.0 > max_risk_for_strategy(&cfg, &signal.strategy) {
             let _ = self
                 .db
                 .log_event(
@@ -394,9 +450,7 @@ impl RiskManager {
             "short"
         };
 
-        // Hedge guard: unless explicitly allowed, never open a position that is
-        // opposite to one already open on the same symbol.
-        if !self.config.risk.allow_hedge {
+        if !cfg.risk.allow_hedge {
             let opposite = if side == "long" { "short" } else { "long" };
             if let Ok(Some(_)) = self
                 .db
@@ -421,39 +475,142 @@ impl RiskManager {
         let leverage = signal.suggested_leverage.max(1);
         let equity = self.state.equity.max(1.0);
         let risk_usd = equity * (signal.suggested_risk_pct / 100.0);
-        let sl_dist = (signal.last_price - signal.projected_stop_loss).abs().max(signal.last_price * 0.005);
+        let sl_dist = (signal.last_price - signal.projected_stop_loss)
+            .abs()
+            .max(signal.last_price * 0.005);
         let mut size = risk_usd / sl_dist;
         let margin = size * signal.last_price / leverage as f64;
-        if margin < self.config.risk.min_position_margin_usdt {
-            size = self.config.risk.min_position_margin_usdt * leverage as f64 / signal.last_price;
+        if margin < cfg.risk.min_position_margin_usdt {
+            size = cfg.risk.min_position_margin_usdt * leverage as f64 / signal.last_price;
         }
         if size <= 0.0 {
             return Ok(None);
         }
 
+        // Minimum gross profit gate: reject if the expected total PnL across all
+        // TP levels is below the strategy minimum.
+        let min_profit = min_profit_for_strategy(&cfg, &signal.strategy);
+        if min_profit > 0.0 && !signal.projected_take_profits.is_empty() {
+            let entry = signal.last_price;
+            let total_projected: f64 = signal
+                .projected_take_profits
+                .iter()
+                .zip(signal.tp_close_fractions.iter().chain(std::iter::repeat(&0.25)))
+                .map(|(tp, frac)| (tp - entry).abs() * size * frac)
+                .sum();
+            if total_projected < min_profit {
+                let _ = self
+                    .db
+                    .log_event(
+                        "trade_blocked",
+                        &format!(
+                            "Expected profit {total_projected:.2} USDT < min {min_profit:.2} USDT — size too small for {}", signal.symbol
+                        ),
+                        Some(signal.to_payload()),
+                    )
+                    .await;
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(PreparedOpen {
+            side: side.into(),
+            size,
+            leverage: leverage as i64,
+            entry_mode: signal.entry_mode.clone(),
+            entry_price: signal.last_price,
+            limit_price: if matches!(signal.entry_mode.as_str(), "limit" | "sniper") {
+                Some(
+                    if signal.limit_entry_price > 0.0 {
+                        signal.limit_entry_price
+                    } else {
+                        signal.last_price
+                    },
+                )
+            } else {
+                None
+            },
+        }))
+    }
+
+    /// Persist a prepared entry after the exchange order (if any) has succeeded.
+    pub async fn commit_open_from_signal(
+        &mut self,
+        signal: &PumpSignal,
+        paper: bool,
+        prepared: &PreparedOpen,
+    ) -> Result<Option<i64>> {
         let id = self
             .db
             .insert_position(
                 &signal.symbol,
-                side,
-                signal.last_price,
-                size,
+                &prepared.side,
+                prepared.entry_price,
+                prepared.size,
                 signal.projected_stop_loss,
                 paper,
                 &signal.strategy,
-                leverage as i64,
+                prepared.leverage,
                 signal.signal_id,
+                &prepared.entry_mode,
+                prepared.limit_price,
             )
             .await?;
         let _ = self
             .db
             .log_event(
                 "position_opened",
-                &format!("Opened {side} {} @ {:.6}", signal.symbol, signal.last_price),
-                Some(serde_json::json!({ "position_id": id, "strategy": signal.strategy })),
+                &format!(
+                    "Opened {} {} @ {:.6} ({})",
+                    prepared.side,
+                    signal.symbol,
+                    prepared.entry_price,
+                    prepared.entry_mode,
+                ),
+                Some(serde_json::json!({
+                    "position_id": id,
+                    "strategy": signal.strategy,
+                    "entry_mode": prepared.entry_mode,
+                    "symbol": signal.symbol,
+                    "side": prepared.side,
+                })),
             )
             .await;
         Ok(Some(id))
+    }
+
+    pub async fn try_open_from_signal(
+        &mut self,
+        signal: &PumpSignal,
+        paper: bool,
+    ) -> Result<Option<i64>> {
+        let Some(prepared) = self.prepare_open_from_signal(signal).await? else {
+            return Ok(None);
+        };
+        self.commit_open_from_signal(signal, paper, &prepared).await
+    }
+}
+
+fn strategy_position_cap(config: &AppConfig, strategy: &str) -> u32 {
+    match strategy {
+        "volume_pump" => config.risk.max_volume_pump_positions,
+        "confluence" => config.risk.max_confluence_positions,
+        "scalp" => config.risk.max_concurrent_positions,
+        _ => config.risk.max_concurrent_positions,
+    }
+}
+
+fn max_risk_for_strategy(config: &AppConfig, strategy: &str) -> f64 {
+    match strategy {
+        "volume_pump" => config.pump.max_risk_per_trade.min(config.risk.max_risk_per_trade),
+        _ => config.risk.max_risk_per_trade,
+    }
+}
+
+fn min_profit_for_strategy(config: &AppConfig, strategy: &str) -> f64 {
+    match strategy {
+        "volume_pump" => config.pump.min_profit_usdt,
+        _ => config.risk.min_profit_usdt,
     }
 }
 
@@ -485,11 +642,43 @@ fn round2(v: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AppConfig;
+    use crate::config::{AppConfig, SharedAppConfig};
+    use crate::signals::{PumpSignal, SignalStrength};
+    use chrono::Utc;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
-    async fn test_db() -> (Arc<Database>, Arc<AppConfig>) {
+    fn sample_signal(strategy: &str, symbol: &str) -> PumpSignal {
+        PumpSignal {
+            symbol: symbol.into(),
+            strategy: strategy.into(),
+            composite_score: 75.0,
+            strength: SignalStrength::Moderate,
+            last_price: 100.0,
+            price_change_pct: 2.0,
+            volume_surge_ratio: 4.0,
+            confluence_count: 0,
+            confluences: vec![],
+            confluence_details: vec![],
+            setup_probability_pct: 70.0,
+            suggested_risk_pct: 1.0,
+            suggested_leverage: 10,
+            zone_score: 0.0,
+            zone_message: String::new(),
+            sizing_tier: "moderate".into(),
+            message: "test".into(),
+            generated_at: Utc::now(),
+            signal_id: None,
+            projected_stop_loss: 98.0,
+            projected_take_profits: vec![103.0, 105.0, 107.0],
+            tp_close_fractions: vec![0.5, 0.3, 0.2],
+            ml_features: vec![],
+            entry_mode: "limit".into(),
+            limit_entry_price: 0.0,
+        }
+    }
+
+    async fn test_db() -> (Arc<Database>, SharedAppConfig) {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let cfg_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/settings.yaml");
@@ -498,7 +687,7 @@ mod tests {
         cfg.storage.sqlite_path = db_path.to_string_lossy().into();
         let db = Arc::new(Database::connect(&cfg.storage.sqlite_path).await.unwrap());
         db.migrate().await.unwrap();
-        (db, Arc::new(cfg))
+        (db, Arc::new(std::sync::RwLock::new(cfg)))
     }
 
     #[tokio::test]
@@ -515,9 +704,12 @@ mod tests {
 
     #[tokio::test]
     async fn consecutive_loss_streak_trips_circuit_breaker() {
-        let (db, mut cfg) = test_db().await;
-        Arc::get_mut(&mut cfg).unwrap().risk.max_consecutive_losses = 3;
-        Arc::get_mut(&mut cfg).unwrap().risk.loss_streak_cooldown_sec = 600;
+        let (db, cfg) = test_db().await;
+        {
+            let mut c = cfg.write().unwrap();
+            c.risk.max_consecutive_losses = 3;
+            c.risk.loss_streak_cooldown_sec = 600;
+        }
         let mut rm = RiskManager::new(cfg.clone(), db.clone()).await.unwrap();
         rm.state.equity = 1000.0;
         rm.state.peak_equity = 1000.0;
@@ -539,9 +731,12 @@ mod tests {
 
     #[tokio::test]
     async fn drawdown_halt_activates_kill_switch() {
-        let (db, mut cfg) = test_db().await;
-        Arc::get_mut(&mut cfg).unwrap().risk.max_drawdown_halt_pct = 0.10;
-        Arc::get_mut(&mut cfg).unwrap().risk.max_consecutive_losses = 0; // disable streak breaker
+        let (db, cfg) = test_db().await;
+        {
+            let mut c = cfg.write().unwrap();
+            c.risk.max_drawdown_halt_pct = 0.10;
+            c.risk.max_consecutive_losses = 0;
+        }
         let mut rm = RiskManager::new(cfg.clone(), db.clone()).await.unwrap();
         rm.state.equity = 900.0;
         rm.state.peak_equity = 1000.0; // 10% drawdown exactly
@@ -552,8 +747,8 @@ mod tests {
 
     #[tokio::test]
     async fn symbol_cooldown_blocks_reentry() {
-        let (db, mut cfg) = test_db().await;
-        Arc::get_mut(&mut cfg).unwrap().risk.symbol_loss_cooldown_sec = 900;
+        let (db, cfg) = test_db().await;
+        cfg.write().unwrap().risk.symbol_loss_cooldown_sec = 900;
         let mut rm = RiskManager::new(cfg.clone(), db.clone()).await.unwrap();
         rm.state.equity = 1000.0;
         rm.state.peak_equity = 1000.0;
@@ -571,9 +766,12 @@ mod tests {
 
     #[tokio::test]
     async fn circuit_breaker_lifts_after_expiry() {
-        let (db, mut cfg) = test_db().await;
-        Arc::get_mut(&mut cfg).unwrap().risk.max_consecutive_losses = 1;
-        Arc::get_mut(&mut cfg).unwrap().risk.loss_streak_cooldown_sec = 1;
+        let (db, cfg) = test_db().await;
+        {
+            let mut c = cfg.write().unwrap();
+            c.risk.max_consecutive_losses = 1;
+            c.risk.loss_streak_cooldown_sec = 1;
+        }
         let mut rm = RiskManager::new(cfg.clone(), db.clone()).await.unwrap();
         rm.state.equity = 1000.0;
         rm.state.peak_equity = 1000.0;
@@ -586,5 +784,100 @@ mod tests {
         let lifted = rm.lift_circuit_breaker_if_expired().await;
         assert!(lifted, "circuit breaker should lift after expiry");
         assert_eq!(rm.state.trading_paused, 0);
+    }
+
+    #[tokio::test]
+    async fn per_strategy_slots_allow_parallel_strategies() {
+        let (db, cfg) = test_db().await;
+        {
+            let mut c = cfg.write().unwrap();
+            c.risk.max_concurrent_positions = 2;
+            c.risk.max_confluence_positions = 1;
+            c.risk.max_volume_pump_positions = 1;
+        }
+        let mut rm = RiskManager::new(cfg.clone(), db.clone()).await.unwrap();
+        rm.state.equity = 10_000.0;
+        rm.state.peak_equity = 10_000.0;
+
+        let conf = sample_signal("confluence", "BTC_USDT");
+        assert!(
+            rm.prepare_open_from_signal(&conf).await.unwrap().is_some(),
+            "confluence should open first slot"
+        );
+        rm.commit_open_from_signal(&conf, true, &PreparedOpen {
+            side: "long".into(),
+            size: 1.0,
+            leverage: 10,
+            entry_mode: "market".into(),
+            entry_price: 100.0,
+            limit_price: None,
+        })
+        .await
+        .unwrap();
+
+        let pump = sample_signal("volume_pump", "ETH_USDT");
+        assert!(
+            rm.prepare_open_from_signal(&pump).await.unwrap().is_some(),
+            "volume pump should still open with confluence slot full"
+        );
+    }
+
+    #[tokio::test]
+    async fn volume_pump_slot_blocks_second_pump() {
+        let (db, cfg) = test_db().await;
+        cfg.write().unwrap().risk.max_volume_pump_positions = 1;
+        let mut rm = RiskManager::new(cfg.clone(), db.clone()).await.unwrap();
+        rm.state.equity = 10_000.0;
+        rm.state.peak_equity = 10_000.0;
+
+        let pump1 = sample_signal("volume_pump", "SOL_USDT");
+        rm.commit_open_from_signal(&pump1, true, &PreparedOpen {
+            side: "long".into(),
+            size: 1.0,
+            leverage: 10,
+            entry_mode: "limit".into(),
+            entry_price: 100.0,
+            limit_price: Some(100.0),
+        })
+        .await
+        .unwrap();
+
+        let pump2 = sample_signal("volume_pump", "AVAX_USDT");
+        assert!(
+            rm.prepare_open_from_signal(&pump2).await.unwrap().is_none(),
+            "second volume pump should be blocked"
+        );
+
+        let conf = sample_signal("confluence", "LINK_USDT");
+        assert!(
+            rm.prepare_open_from_signal(&conf).await.unwrap().is_some(),
+            "confluence should be unaffected by full pump slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_symbol_blocked_across_strategies() {
+        let (db, cfg) = test_db().await;
+        let mut rm = RiskManager::new(cfg.clone(), db.clone()).await.unwrap();
+        rm.state.equity = 10_000.0;
+        rm.state.peak_equity = 10_000.0;
+
+        let conf = sample_signal("confluence", "DOGE_USDT");
+        rm.commit_open_from_signal(&conf, true, &PreparedOpen {
+            side: "long".into(),
+            size: 1.0,
+            leverage: 10,
+            entry_mode: "market".into(),
+            entry_price: 100.0,
+            limit_price: None,
+        })
+        .await
+        .unwrap();
+
+        let pump = sample_signal("volume_pump", "DOGE_USDT");
+        assert!(
+            rm.prepare_open_from_signal(&pump).await.unwrap().is_none(),
+            "same symbol must not double across strategies"
+        );
     }
 }

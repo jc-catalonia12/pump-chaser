@@ -257,6 +257,14 @@ impl MexcPrivateClient {
             .await
     }
 
+    /// Cancel a specific open order by order ID.
+    /// MEXC endpoint: POST /api/v1/private/order/cancel
+    pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<Value> {
+        let payload = serde_json::json!({ "symbol": symbol, "orderId": order_id });
+        self.signed_post("/api/v1/private/order/cancel", &payload)
+            .await
+    }
+
     pub async fn change_leverage(
         &self,
         symbol: &str,

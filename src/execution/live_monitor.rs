@@ -20,26 +20,27 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::config::AppConfig;
+use crate::config::SharedAppConfig;
 use crate::db::Database;
+use crate::execution::trailing::{TrailingTrack, update_trailing, update_trailing_simple};
 use crate::exchange::{ContractInfo, MexcPrivateClient, TickerSnapshot};
 use crate::models::PositionSide;
 use crate::risk::RiskManager;
-use crate::utils::Alerter;
+use crate::utils::{Alerter, UserSecrets};
 
 pub struct LivePositionMonitor {
-    config: Arc<AppConfig>,
+    config: SharedAppConfig,
     db: Arc<Database>,
     client: MexcPrivateClient,
     alerter: Option<Arc<Alerter>>,
-    /// Per-position cached trailing-stop price.  Key = position id.
-    trailing_stops: HashMap<i64, f64>,
+    /// Per-position adaptive trailing state. Key = position id.
+    trailing_stops: HashMap<i64, TrailingTrack>,
     /// Contract metadata (size, fee rate) keyed by symbol — kept in sync with LiveTrader.
     contracts: HashMap<String, ContractInfo>,
 }
 
 impl LivePositionMonitor {
-    pub fn new(config: Arc<AppConfig>, db: Arc<Database>, client: MexcPrivateClient) -> Self {
+    pub fn new(config: SharedAppConfig, db: Arc<Database>, client: MexcPrivateClient) -> Self {
         Self {
             config,
             db,
@@ -58,6 +59,12 @@ impl LivePositionMonitor {
     /// Update the stored client when credentials change.
     pub fn update_client(&mut self, client: MexcPrivateClient) {
         self.client = client;
+    }
+
+    /// Rebuild REST client after MEXC endpoint change (same API keys).
+    pub fn refresh_exchange_client_from_secrets(&mut self, secrets: &UserSecrets) {
+        let mexc = self.config.read().unwrap().mexc.clone();
+        self.client = MexcPrivateClient::from_secrets(&mexc, secrets);
     }
 
     /// Keep contract metadata in sync with LiveTrader after symbol discovery.
@@ -113,6 +120,7 @@ impl LivePositionMonitor {
             return vec![];
         }
 
+        let cfg = self.config.read().unwrap().clone();
         let positions = self.db.get_open_positions().await.unwrap_or_default();
         let mut events = Vec::new();
 
@@ -144,33 +152,37 @@ impl LivePositionMonitor {
             let cs = self.contract_size(&symbol);
             let fee_rate = self.fee_rate(&symbol);
 
-            // ── Trailing stop ─────────────────────────────────────────────
-            let trail_pct = self.config.risk.trailing_stop_pct;
-            let trail_act_pct = self.config.confluence.trailing_activation_pct;
-            if trail_pct > 0.0 && entry > 0.0 {
-                let move_pct = if side == "long" {
-                    (price - entry) / entry
+            let strategy = pos
+                .get("strategy")
+                .and_then(|v| v.as_str())
+                .unwrap_or("confluence")
+                .to_string();
+
+            // ── Adaptive trailing stop (widens on large pumps/dumps) ───────
+            if entry > 0.0 {
+                let prev_sl = sl;
+                let track = self
+                    .trailing_stops
+                    .entry(id)
+                    .or_insert_with(|| TrailingTrack::seed(sl));
+                if track.stop <= 0.0 && sl > 0.0 {
+                    track.stop = sl;
+                }
+                sl = if strategy == "volume_pump" {
+                    let p = &cfg.pump;
+                    update_trailing_simple(
+                        &side,
+                        entry,
+                        price,
+                        track,
+                        p.trailing_activation_pct,
+                        p.trailing_stop_pct,
+                    )
                 } else {
-                    (entry - price) / entry
+                    update_trailing(&side, entry, price, track, &cfg.confluence)
                 };
-                if move_pct >= trail_act_pct {
-                    let new_trail = if side == "long" {
-                        price * (1.0 - trail_pct)
-                    } else {
-                        price * (1.0 + trail_pct)
-                    };
-                    let cached = self.trailing_stops.entry(id).or_insert(sl);
-                    let updated = if side == "long" {
-                        new_trail.max(*cached)
-                    } else {
-                        new_trail.min(*cached)
-                    };
-                    if (updated - *cached).abs() > 1e-10 {
-                        *cached = updated;
-                        // Persist updated SL to DB so the UI reflects it.
-                        let _ = self.db.update_position_sl_tp(id, Some(updated), None).await;
-                    }
-                    sl = *self.trailing_stops.get(&id).unwrap_or(&sl);
+                if (sl - prev_sl).abs() > 1e-10 {
+                    let _ = self.db.update_position_sl_tp(id, Some(sl), None).await;
                 }
             }
 
@@ -233,7 +245,8 @@ impl LivePositionMonitor {
                     // Move SL to entry after first TP ("free ride").
                     if level == 1 && entry > 0.0 {
                         sl = entry;
-                        self.trailing_stops.insert(id, entry);
+                        self.trailing_stops
+                            .insert(id, TrailingTrack { stop: entry, peak_favorable: price });
                         let _ = self.db.update_position_sl_tp(id, Some(entry), Some(&new_levels_str)).await;
                     } else {
                         let _ = self.db.update_position_sl_tp(id, None, Some(&new_levels_str)).await;
@@ -277,6 +290,7 @@ impl LivePositionMonitor {
                             let details = json!({
                                 "symbol": symbol,
                                 "side": side.to_uppercase(),
+                                "strategy": strategy,
                                 "entry_price": entry,
                                 "exit_price": price,
                                 "pnl": partial_pnl,

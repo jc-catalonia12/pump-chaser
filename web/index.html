@@ -141,6 +141,7 @@
             <div class="kpi-card">
               <span class="kpi-label">Open Positions</span>
               <span id="m-positions" class="kpi-value mono">—</span>
+              <span class="kpi-sub mono" id="m-positions-slots">—</span>
               <span class="kpi-sub mono" id="m-positions-pnl">—</span>
             </div>
             <div class="kpi-card">
@@ -497,6 +498,7 @@
                 </dl>
                 <div class="form-group" style="margin-top:0.75rem">
                   <label class="form-label">Notify on events</label>
+                  <p class="hint" style="margin:0.25rem 0 0.5rem">Controls Telegram alerts and in-app toast popups (bottom-right).</p>
                   <div id="tg-event-toggles" class="tg-event-toggles"></div>
                 </div>
                 <div class="btn-row" style="margin-top:0.75rem">
@@ -611,7 +613,9 @@
     </div>
   </div>
 
+  <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="false"></div>
+
   <script src="/charts.js" type="module"></script>
-  <script src="/app.js?v=3" type="module"></script>
+  <script src="/app.js?v=6" type="module"></script>
 </body>
 </html>

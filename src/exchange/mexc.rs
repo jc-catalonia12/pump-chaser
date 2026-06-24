@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use crate::config::AppConfig;
+use crate::config::SharedAppConfig;
 use crate::error::Result;
 use crate::exchange::rest::MexcRestClient;
 use crate::exchange::symbols::{discover_symbols, rank_by_liquidity};
@@ -13,15 +13,15 @@ use crate::exchange::ws::MexcWebSocketClient;
 
 #[derive(Clone)]
 pub struct MexcClient {
-    config: Arc<AppConfig>,
+    config: SharedAppConfig,
     rest: Arc<MexcRestClient>,
     ws: Arc<Mutex<MexcWebSocketClient>>,
     latest_tickers: Arc<RwLock<Vec<TickerSnapshot>>>,
 }
 
 impl MexcClient {
-    pub fn new(config: Arc<AppConfig>) -> Result<Self> {
-        let mexc = Arc::new(config.mexc.clone());
+    pub fn new(config: SharedAppConfig) -> Result<Self> {
+        let mexc = Arc::new(config.read().unwrap().mexc.clone());
         Ok(Self {
             config: config.clone(),
             rest: Arc::new(MexcRestClient::new(mexc.clone())?),
@@ -61,11 +61,13 @@ impl MexcClient {
     }
 
     pub async fn discover_contracts(&self) -> Result<Vec<ContractInfo>> {
-        discover_symbols(self.rest.as_ref(), &self.config.scanner).await
+        let scanner = self.config.read().unwrap().scanner.clone();
+        discover_symbols(self.rest.as_ref(), &scanner).await
     }
 
     pub async fn rank_symbols(&self, symbols: &[String]) -> Result<Vec<String>> {
-        let (top, _) = rank_by_liquidity(self.rest.as_ref(), symbols, &self.config.scanner).await?;
+        let scanner = self.config.read().unwrap().scanner.clone();
+        let (top, _) = rank_by_liquidity(self.rest.as_ref(), symbols, &scanner).await?;
         Ok(top)
     }
 

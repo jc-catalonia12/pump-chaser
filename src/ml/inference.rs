@@ -8,14 +8,12 @@
 //! The online model is the one that "keeps getting better": every closed trade
 //! feeds `record_outcome`, which updates the weights and persists them.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 use tracing::debug;
 #[cfg(feature = "onnx")]
 use tracing::warn;
 
-use crate::config::AppConfig;
+use crate::config::SharedAppConfig;
 use crate::exchange::KlineBar;
 use crate::ml::features::{
     legacy_onnx_feature_vector, normalize_feature_vector, TechnicalFeatureBuilder, FEATURE_DIM,
@@ -46,22 +44,24 @@ pub struct MlStatus {
 }
 
 pub struct MlPipeline {
-    config: Arc<AppConfig>,
+    config: SharedAppConfig,
     #[cfg(feature = "onnx")]
     classifier: Option<OnnxClassifier>,
     online: OnlineClassifier,
 }
 
 impl MlPipeline {
-    pub fn new(config: Arc<AppConfig>) -> Self {
-        let online = OnlineClassifier::load(config.ml.onnx_model_path.as_deref());
+    pub fn new(config: SharedAppConfig) -> Self {
+        let online = OnlineClassifier::load(config.read().unwrap().ml.onnx_model_path.as_deref());
         #[cfg(feature = "onnx")]
         {
-            let classifier = if config.ml.supervised_enabled {
-                OnnxClassifier::try_load(&config.ml)
+            let cfg = config.read().unwrap();
+            let classifier = if cfg.ml.supervised_enabled {
+                OnnxClassifier::try_load(&cfg.ml)
             } else {
                 None
             };
+            drop(cfg);
             Self {
                 config,
                 classifier,
@@ -75,7 +75,7 @@ impl MlPipeline {
     }
 
     fn min_samples(&self) -> u64 {
-        self.config.ml.min_training_samples as u64
+        self.config.read().unwrap().ml.min_training_samples as u64
     }
 
     #[cfg(feature = "onnx")]
@@ -88,19 +88,21 @@ impl MlPipeline {
     }
 
     pub fn status(&self) -> MlStatus {
+        let cfg = self.config.read().unwrap();
         let online_ready = self.online.is_ready(self.min_samples());
         MlStatus {
-            enabled: self.config.ml.enabled,
-            supervised_enabled: self.config.ml.supervised_enabled,
+            enabled: cfg.ml.enabled,
+            supervised_enabled: cfg.ml.supervised_enabled,
             supervised_fitted: online_ready || self.onnx_loaded(),
-            hard_ml_gate: self.config.ml.hard_ml_gate,
-            supervised_threshold: self.config.ml.supervised_threshold,
-            onnx_model_path: self.config.ml.onnx_model_path.clone(),
+            hard_ml_gate: cfg.ml.hard_ml_gate,
+            supervised_threshold: cfg.ml.supervised_threshold,
+            onnx_model_path: cfg.ml.onnx_model_path.clone(),
         }
     }
 
     /// Rich learning status for the dashboard / API.
     pub fn learning_status(&self) -> Value {
+        let cfg = self.config.read().unwrap();
         let online_ready = self.online.is_ready(self.min_samples());
         let active = if online_ready {
             "online"
@@ -110,15 +112,15 @@ impl MlPipeline {
             "warming_up"
         };
         json!({
-            "enabled": self.config.ml.enabled,
-            "supervised_enabled": self.config.ml.supervised_enabled,
-            "hard_ml_gate": self.config.ml.hard_ml_gate,
-            "supervised_threshold": self.config.ml.supervised_threshold,
+            "enabled": cfg.ml.enabled,
+            "supervised_enabled": cfg.ml.supervised_enabled,
+            "hard_ml_gate": cfg.ml.hard_ml_gate,
+            "supervised_threshold": cfg.ml.supervised_threshold,
             "active_model": active,
             "onnx_loaded": self.onnx_loaded(),
             "online_model": self.online.stats_with_threshold(
                 self.min_samples(),
-                self.config.ml.supervised_threshold,
+                cfg.ml.supervised_threshold,
             ),
         })
     }
@@ -144,7 +146,7 @@ impl MlPipeline {
     }
 
     fn adjust_score(&self, base_score: f64, proba: f64) -> f64 {
-        let threshold = self.config.ml.supervised_threshold;
+        let threshold = self.config.read().unwrap().ml.supervised_threshold;
         if proba < threshold {
             let penalty = (threshold - proba) * 20.0;
             (base_score - penalty).max(0.0)
@@ -157,7 +159,7 @@ impl MlPipeline {
     /// Predict win probability using the best available model, or None when
     /// neither model is ready yet.
     fn predict(&self, features: &[f64], klines: Option<&[KlineBar]>) -> Option<f64> {
-        if !self.config.ml.supervised_enabled {
+        if !self.config.read().unwrap().ml.supervised_enabled {
             return None;
         }
         if self.online.is_ready(self.min_samples()) {
@@ -209,7 +211,8 @@ impl MlPipeline {
         mut signal: PumpSignal,
         klines: Option<&[KlineBar]>,
     ) -> EnhanceOutcome {
-        if !self.config.ml.enabled {
+        let cfg = self.config.read().unwrap().clone();
+        if !cfg.ml.enabled {
             return EnhanceOutcome::Tradable(signal);
         }
 
@@ -224,12 +227,12 @@ impl MlPipeline {
                 .message
                 .push_str(&format!(" | ML win prob {:.0}%", signal.setup_probability_pct));
 
-            if self.config.ml.hard_ml_gate && p < self.config.ml.supervised_threshold {
+            if cfg.ml.hard_ml_gate && p < cfg.ml.supervised_threshold {
                 debug!(
                     "{} blocked by hard ML gate (prob {:.1}% < {:.0}%) — shadow candidate",
                     signal.symbol,
                     signal.setup_probability_pct,
-                    self.config.ml.supervised_threshold * 100.0
+                    cfg.ml.supervised_threshold * 100.0
                 );
                 return EnhanceOutcome::MlRejected(signal);
             }
@@ -244,7 +247,7 @@ impl MlPipeline {
         mut signal: PumpSignal,
         klines: Option<&[KlineBar]>,
     ) -> PumpSignal {
-        if !self.config.ml.enabled {
+        if !self.config.read().unwrap().ml.enabled {
             return signal;
         }
         let features =
@@ -278,7 +281,8 @@ impl MlPipeline {
 
     /// Stats augmented with gate-threshold accuracy for the Training screen.
     pub fn online_stats_with_threshold(&self) -> Value {
-        let threshold = self.config.ml.supervised_threshold;
+        let cfg = self.config.read().unwrap();
+        let threshold = cfg.ml.supervised_threshold;
         let min = self.min_samples();
         self.online.stats_with_threshold(min, threshold)
     }

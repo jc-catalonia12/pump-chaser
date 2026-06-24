@@ -220,7 +220,8 @@ impl Database {
     pub async fn get_unresolved_closed_positions(&self, limit: i64) -> Result<Vec<Value>> {
         let rows = sqlx::query(
             "SELECT p.signal_id AS signal_id, p.realized_pnl AS realized_pnl, \
-             p.symbol AS symbol, p.side AS side, p.exit_price AS exit_price, \
+             p.symbol AS symbol, p.side AS side, p.strategy AS strategy, \
+             p.exit_price AS exit_price, \
              p.exit_reason AS exit_reason, p.entry_price AS entry_price, \
              p.size AS size, p.leverage AS leverage, \
              s.payload AS payload, s.outcome AS outcome \
@@ -242,6 +243,7 @@ impl Database {
                     "realized_pnl": row.try_get::<f64, _>("realized_pnl").unwrap_or(0.0),
                     "symbol": row.try_get::<String, _>("symbol").unwrap_or_default(),
                     "side": row.try_get::<String, _>("side").unwrap_or_default(),
+                    "strategy": row.try_get::<Option<String>, _>("strategy").ok().flatten(),
                     "exit_price": row.try_get::<Option<f64>, _>("exit_price").ok().flatten(),
                     "exit_reason": row.try_get::<Option<String>, _>("exit_reason").ok().flatten(),
                     "entry_price": row.try_get::<f64, _>("entry_price").unwrap_or(0.0),

@@ -6,18 +6,47 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
-use crate::config::AppConfig;
+use crate::config::SharedAppConfig;
 use crate::db::Database;
 use crate::exchange::{ContractInfo, MexcPrivateClient, AssetBalance};
 use crate::models::PositionSide;
-use crate::risk::RiskManager;
+use crate::risk::manager::RiskManager;
 use crate::signals::PumpSignal;
 use crate::utils::UserSecrets;
 
 fn round_vol(vol: f64, contract: &ContractInfo) -> f64 {
     let unit = contract.vol_unit.max(1e-12);
     let steps = (vol / unit).floor();
-    (steps * unit).max(contract.min_vol)
+    let mut v = (steps * unit).max(contract.min_vol);
+    if contract.max_vol > 0.0 {
+        v = v.min(contract.max_vol);
+    }
+    v
+}
+
+/// Risk sizing is in base-coin quantity; MEXC `vol` is number of contracts.
+fn coins_to_contract_vol(coin_qty: f64, contract: Option<&ContractInfo>) -> f64 {
+    let cs = contract
+        .map(|c| c.contract_size)
+        .unwrap_or(1.0)
+        .max(1e-12);
+    let raw = coin_qty / cs;
+    match contract {
+        Some(c) => round_vol(raw, c),
+        None => raw.max(1.0),
+    }
+}
+
+fn mexc_reject_message(symbol: &str, result: &Value) -> String {
+    let msg = result
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("rejected by exchange");
+    let code = result
+        .get("code")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(0);
+    format!("Order rejected for {symbol}: {msg} (code {code})")
 }
 
 fn round_vol_safe(contracts: &HashMap<String, ContractInfo>, symbol: &str, vol: f64) -> f64 {
@@ -49,7 +78,7 @@ fn round_price(price: f64, contract: &ContractInfo) -> f64 {
 }
 
 pub struct LiveTrader {
-    config: Arc<AppConfig>,
+    config: SharedAppConfig,
     db: Arc<Database>,
     client: MexcPrivateClient,
     secrets: UserSecrets,
@@ -58,11 +87,12 @@ pub struct LiveTrader {
 
 impl LiveTrader {
     pub fn new(
-        config: Arc<AppConfig>,
+        config: SharedAppConfig,
         db: Arc<Database>,
         secrets: UserSecrets,
     ) -> Self {
-        let client = MexcPrivateClient::from_secrets(&config.mexc, &secrets);
+        let mexc = config.read().unwrap().mexc.clone();
+        let client = MexcPrivateClient::from_secrets(&mexc, &secrets);
         Self {
             config,
             db,
@@ -74,7 +104,14 @@ impl LiveTrader {
 
     pub fn update_secrets(&mut self, secrets: UserSecrets) {
         self.secrets = secrets.clone();
-        self.client = MexcPrivateClient::from_secrets(&self.config.mexc, &secrets);
+        let mexc = self.config.read().unwrap().mexc.clone();
+        self.client = MexcPrivateClient::from_secrets(&mexc, &secrets);
+    }
+
+    /// Rebuild REST client when MEXC endpoints change in settings.
+    pub fn refresh_exchange_client(&mut self) {
+        let mexc = self.config.read().unwrap().mexc.clone();
+        self.client = MexcPrivateClient::from_secrets(&mexc, &self.secrets);
     }
 
     /// Expose the private client for boot reconciliation.
@@ -106,9 +143,14 @@ impl LiveTrader {
             .unwrap_or(0.0006)
     }
 
+    pub fn secrets(&self) -> &UserSecrets {
+        &self.secrets
+    }
+
     pub fn is_live(&self) -> bool {
+        let cfg = self.config.read().unwrap();
         self.secrets.live_trading
-            && self.config.execution.live_trading_enabled
+            && cfg.execution.live_trading_enabled
             && self.client.has_credentials()
     }
 
@@ -128,11 +170,12 @@ impl LiveTrader {
     /// Returns the per-symbol max leverage from contract discovery (no API call required).
     /// Falls back to config max when the symbol is not cached.
     pub fn max_leverage_for_symbol(&self, symbol: &str) -> i32 {
+        let cfg = self.config.read().unwrap();
         self.contracts
             .get(symbol)
             .map(|c| c.max_leverage as i32)
             .filter(|&l| l > 0)
-            .unwrap_or(self.config.risk.max_leverage as i32)
+            .unwrap_or(cfg.risk.max_leverage as i32)
     }
 
     pub async fn open_from_signal(
@@ -152,6 +195,7 @@ impl LiveTrader {
             return Ok(pos_id);
         }
 
+        let cfg = self.config.read().unwrap().clone();
         let side = if signal.price_change_pct > 0.0 {
             PositionSide::Long
         } else {
@@ -159,39 +203,69 @@ impl LiveTrader {
         };
 
         let leverage = self.resolve_leverage(signal, side).await;
-        let pos_id = match risk.try_open_from_signal(signal, false).await? {
-            Some(id) => id,
+        let mut prepared = match risk.prepare_open_from_signal(signal).await? {
+            Some(p) => p,
             None => return Ok(None),
         };
+        prepared.leverage = leverage as i64;
 
-        let positions = self.db.get_open_positions().await?;
-        let pos = positions
-            .iter()
-            .find(|p| p.get("id").and_then(|v| v.as_i64()) == Some(pos_id))
-            .cloned()
-            .ok_or_else(|| crate::error::BotError::Execution("position not found".into()))?;
+        if self.contracts.get(&signal.symbol).is_none() {
+            warn!(
+                "{} contract metadata missing — vol conversion may be wrong until scanner finishes symbol discovery",
+                signal.symbol
+            );
+        }
 
-        let size = pos.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // ── Determine order type and price ───────────────────────────────────
+        // MEXC type 5 = market, type 1 = limit.
+        let is_limit = matches!(signal.entry_mode.as_str(), "limit" | "sniper");
+        let order_type = if is_limit { 1 } else { 5 };
+        let (offset, limit_ttl) = if signal.strategy == "volume_pump" {
+            (
+                cfg.pump.limit_offset_pct,
+                cfg.pump.limit_ttl_sec,
+            )
+        } else {
+            (
+                cfg.sniper.limit_offset_pct,
+                cfg.sniper.limit_ttl_sec,
+            )
+        };
+        let limit_price = if is_limit {
+            let base = if signal.limit_entry_price > 0.0 {
+                signal.limit_entry_price
+            } else {
+                signal.last_price
+            };
+            if side == PositionSide::Long {
+                base * (1.0 - offset)
+            } else {
+                base * (1.0 + offset)
+            }
+        } else {
+            signal.last_price
+        };
+
         let mut payload = json!({
             "symbol": signal.symbol,
-            "price": signal.last_price,
-            "vol": size,
+            "price": limit_price,
+            "vol": coins_to_contract_vol(prepared.size, self.contracts.get(&signal.symbol)),
             "side": if side == PositionSide::Long { 1 } else { 3 },
-            "type": 5,
+            "type": order_type,
             "openType": 2,
             "leverage": leverage,
         });
         payload = self.apply_precision(&signal.symbol, payload);
-        payload = self.enforce_min_margin(&signal.symbol, payload, signal.last_price, leverage);
+        payload = self.enforce_min_margin(&signal.symbol, payload, limit_price, leverage);
 
         let vol = payload.get("vol").and_then(|v| v.as_f64()).unwrap_or(0.0);
         if vol <= 0.0 {
-            self.rollback_position(pos_id, "volume below contract minimum")
-                .await;
             return Ok(None);
         }
+        // DB + exchange use contract count for live positions.
+        prepared.size = vol;
 
-        if self.config.execution.dry_run {
+        if cfg.execution.dry_run {
             let _ = self
                 .db
                 .log_event(
@@ -200,11 +274,17 @@ impl LiveTrader {
                     Some(json!({ "body": payload, "leverage": leverage })),
                 )
                 .await;
-            return Ok(Some(pos_id));
+            return Ok(None);
         }
 
         if !self.ensure_exchange_leverage(&signal.symbol, leverage, side).await {
-            self.rollback_position(pos_id, "failed to set MEXC leverage")
+            let _ = self
+                .db
+                .log_event(
+                    "live_order_error",
+                    &format!("Failed to set leverage for {}", signal.symbol),
+                    None,
+                )
                 .await;
             return Ok(None);
         }
@@ -212,26 +292,83 @@ impl LiveTrader {
         match self.client.submit_order(payload.clone()).await {
             Ok(result) => {
                 if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
-                    self.rollback_position(pos_id, "order rejected").await;
+                    let detail = mexc_reject_message(&signal.symbol, &result);
+                    warn!("{detail} payload={payload}");
                     let _ = self
                         .db
                         .log_event(
                             "live_order_error",
-                            &format!("Order rejected for {}", signal.symbol),
-                            Some(result),
+                            &detail,
+                            Some(json!({ "exchange": result, "payload": payload })),
                         )
                         .await;
                     return Ok(None);
                 }
+
+                prepared.entry_mode = signal.entry_mode.clone();
+                prepared.entry_price = if is_limit {
+                    limit_price
+                } else {
+                    signal.last_price
+                };
+                prepared.limit_price = if is_limit { Some(limit_price) } else { None };
+
+                let pos_id = match risk.commit_open_from_signal(signal, false, &prepared).await? {
+                    Some(id) => id,
+                    None => return Ok(None),
+                };
+
+                // For limit orders: schedule a background cancel if not filled within TTL.
+                if is_limit {
+                    if let Some(order_id) = result
+                        .get("data")
+                        .and_then(|d| d.as_str())
+                        .map(|s| s.to_string())
+                    {
+                        let cancel_client = self.client.clone();
+                        let cancel_symbol = signal.symbol.clone();
+                        let ttl = limit_ttl;
+                        let db_clone = self.db.clone();
+                        let pending_pos_id = pos_id;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(ttl)).await;
+                            match cancel_client.cancel_order(&cancel_symbol, &order_id).await {
+                                Ok(_) => {
+                                    let _ = db_clone.log_event(
+                                        "limit_order_cancelled",
+                                        &format!("Limit TTL expired for {} — cancelled {}", cancel_symbol, order_id),
+                                        None,
+                                    ).await;
+                                    if let Ok(Some(p)) = db_clone.get_position_by_id(pending_pos_id).await {
+                                        let filled = p
+                                            .get("exchange_position_id")
+                                            .and_then(|v| v.as_i64())
+                                            .is_some();
+                                        if !filled {
+                                            let _ = db_clone
+                                                .close_position_synced(pending_pos_id, "limit_ttl_expired")
+                                                .await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Order may have already filled — not an error
+                                    debug!("Limit cancel for {}: {e}", cancel_symbol);
+                                }
+                            }
+                        });
+                    }
+                }
+
+                let order_label = if is_limit { "limit_order" } else { "live_order" };
                 let _ = self
                     .db
                     .log_event(
-                        "live_order",
-                        &format!("Order filled for {}", signal.symbol),
+                        order_label,
+                        &format!("Order placed for {}", signal.symbol),
                         Some(result),
                     )
                     .await;
-                // Link position to exchange and then place SL / TP plan orders.
                 self.link_exchange_position(pos_id, &signal.symbol, side)
                     .await;
                 self.place_sl_tp_for_position(pos_id, signal, side, vol).await;
@@ -239,7 +376,6 @@ impl LiveTrader {
             }
             Err(exc) => {
                 error!("Open order failed for {}: {exc}", signal.symbol);
-                self.rollback_position(pos_id, &exc.to_string()).await;
                 let _ = self
                     .db
                     .log_event(
@@ -262,6 +398,7 @@ impl LiveTrader {
         side: PositionSide,
         filled_vol: f64,
     ) {
+        let cfg = self.config.read().unwrap().clone();
         let sl = signal.projected_stop_loss;
         let tps: Vec<(f64, f64)> = signal
             .projected_take_profits
@@ -288,7 +425,7 @@ impl LiveTrader {
         let tp_store = if !tp_json.is_empty() { Some(tp_str.as_str()) } else { None };
         let _ = self.db.update_position_sl_tp(pos_id, sl_store, tp_store).await;
 
-        if self.config.execution.dry_run {
+        if cfg.execution.dry_run {
             return;
         }
 
@@ -315,7 +452,7 @@ impl LiveTrader {
         // triggerType: 1 = price >= trigger, 2 = price <= trigger
         let (sl_trigger_type, tp_trigger_type) = sl_tp_trigger_types(side);
         const TREND_LAST_PRICE: i64 = 1;
-        let pacing_ms = self.config.mexc.rate_limit_delay_ms.max(250);
+        let pacing_ms = cfg.mexc.rate_limit_delay_ms.max(250);
 
         if sl > 0.0 {
             let body = self.build_plan_order_body(
@@ -511,7 +648,8 @@ impl LiveTrader {
         }
         payload = self.apply_precision(symbol, payload);
 
-        if self.config.execution.dry_run {
+        let cfg = self.config.read().unwrap().clone();
+        if cfg.execution.dry_run {
             let _ = self
                 .db
                 .log_event("live_order_dry_run", &format!("Would close {symbol}"), Some(payload.clone()))
@@ -565,12 +703,18 @@ impl LiveTrader {
     }
 
     pub async fn sync_exchange_positions(&self) -> Value {
+        let cfg = self.config.read().unwrap().clone();
         crate::execution::position_sync::sync_exchange_positions(
             &self.client,
             &self.db,
-            &self.config,
+            &cfg,
         )
         .await
+    }
+
+    /// Close open live rows that are not on the exchange (e.g. failed rollbacks).
+    pub async fn heal_phantom_open_positions(&self) -> usize {
+        crate::execution::position_sync::heal_stuck_live_positions(&self.client, &self.db).await
     }
 
     fn apply_precision(&self, symbol: &str, mut payload: Value) -> Value {
@@ -593,7 +737,7 @@ impl LiveTrader {
         entry: f64,
         leverage: i32,
     ) -> Value {
-        let min_margin = self.config.risk.min_position_margin_usdt;
+        let min_margin = self.config.read().unwrap().risk.min_position_margin_usdt;
         if min_margin <= 0.0 {
             return payload;
         }
@@ -602,22 +746,24 @@ impl LiveTrader {
         };
         let vol = payload.get("vol").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let lev = leverage.max(1) as f64;
-        let margin = vol * entry / lev;
+        let cs = contract.contract_size.max(1e-12);
+        let margin = vol * cs * entry / lev;
         if margin >= min_margin {
             return payload;
         }
-        let min_vol = (min_margin * lev) / entry.max(1e-12);
+        let min_vol = (min_margin * lev) / (entry.max(1e-12) * cs);
         let bumped = round_vol(min_vol, contract);
         payload["vol"] = json!(bumped);
         payload
     }
 
     async fn resolve_leverage(&self, signal: &PumpSignal, side: PositionSide) -> i32 {
+        let cfg = self.config.read().unwrap().clone();
         let mut symbol_max = self
             .contracts
             .get(&signal.symbol)
             .map(|c| c.max_leverage as i32)
-            .unwrap_or(self.config.risk.max_leverage as i32);
+            .unwrap_or(cfg.risk.max_leverage as i32);
 
         if self.client.has_credentials() {
             if let Ok(account_max) = self
@@ -631,7 +777,42 @@ impl LiveTrader {
             }
         }
 
-        signal.suggested_leverage.min(symbol_max as u32).max(1) as i32
+        // Safety clamp: ensure the SL price stays below the liquidation price.
+        // MEXC maintenance margin ≈ 0.5 % for most contracts; liquidation fires at
+        // roughly (1/L − 0.5 %) adverse move.  We require SL < liquidation by
+        // enforcing: leverage × (sl_pct + mm_buffer) < 1.
+        let sl_pct = if signal.last_price > 0.0 {
+            (signal.last_price - signal.projected_stop_loss)
+                .abs()
+                .max(0.0)
+                / signal.last_price
+        } else {
+            0.02
+        };
+        const MM_BUFFER: f64 = 0.005; // 0.5 % maintenance margin
+        let safe_leverage = if sl_pct + MM_BUFFER > 0.0 {
+            (0.95 / (sl_pct + MM_BUFFER)).floor() as i32
+        } else {
+            symbol_max
+        };
+        let safe_leverage = safe_leverage.max(1);
+
+        let final_lev = signal
+            .suggested_leverage
+            .min(symbol_max as u32)
+            .min(safe_leverage as u32)
+            .max(1) as i32;
+
+        if final_lev < signal.suggested_leverage as i32 {
+            debug!(
+                "{} leverage clamped {} → {} (SL={:.3}% safety cap)",
+                signal.symbol,
+                signal.suggested_leverage,
+                final_lev,
+                sl_pct * 100.0
+            );
+        }
+        final_lev
     }
 
     async fn ensure_exchange_leverage(&self, symbol: &str, leverage: i32, side: PositionSide) -> bool {
@@ -688,18 +869,6 @@ impl LiveTrader {
             return;
         }
     }
-
-    async fn rollback_position(&self, pos_id: i64, reason: &str) {
-        let _ = self.db.close_position(pos_id, 0.0, 1.0, 0.0, "rollback").await;
-        let _ = self
-            .db
-            .log_event(
-                "position_rollback",
-                &format!("Removed phantom position id={pos_id}"),
-                Some(json!({ "reason": reason, "position_id": pos_id })),
-            )
-            .await;
-    }
 }
 
 #[cfg(test)]
@@ -720,10 +889,21 @@ mod tests {
             price_scale: 5,
             vol_scale: 0,
             min_vol,
+            max_vol: 0.0,
             vol_unit,
             price_unit,
             max_leverage: max_lev,
         }
+    }
+
+    #[test]
+    fn coins_to_contract_vol_bill_style() {
+        let mut c = make_contract(1.0, 1.0, 0.00001, 50);
+        c.contract_size = 100.0;
+        c.max_vol = 7000.0;
+        assert!((coins_to_contract_vol(250.0, Some(&c)) - 2.0).abs() < 1e-10);
+        assert!((coins_to_contract_vol(50.0, Some(&c)) - 1.0).abs() < 1e-10);
+        assert!((coins_to_contract_vol(750_000.0, Some(&c)) - 7000.0).abs() < 1e-10);
     }
 
     #[test]

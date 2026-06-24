@@ -12,20 +12,21 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde_json::{json, Value};
 
-use crate::config::AppConfig;
+use crate::config::SharedAppConfig;
 use crate::db::Database;
 use crate::exchange::TickerSnapshot;
+use crate::execution::trailing::{TrailingTrack, update_trailing, update_trailing_simple};
 use crate::risk::RiskManager;
 
 pub struct PaperTrader {
-    config: Arc<AppConfig>,
+    config: SharedAppConfig,
     db: Arc<Database>,
-    /// In-memory trailing stop per position id.
-    trailing_stops: HashMap<i64, f64>,
+    /// In-memory adaptive trailing stop per position id.
+    trailing_stops: HashMap<i64, TrailingTrack>,
 }
 
 impl PaperTrader {
-    pub fn new(config: Arc<AppConfig>, db: Arc<Database>) -> Self {
+    pub fn new(config: SharedAppConfig, db: Arc<Database>) -> Self {
         Self {
             config,
             db,
@@ -39,6 +40,7 @@ impl PaperTrader {
         risk: &mut RiskManager,
     ) -> Vec<Value> {
         let mut events = Vec::new();
+        let cfg = self.config.read().unwrap().clone();
         let positions = self.db.get_open_positions().await.unwrap_or_default();
         for pos in positions {
             let Some(paper) = pos.get("paper").and_then(|v| v.as_bool()) else {
@@ -82,32 +84,31 @@ impl PaperTrader {
                 continue;
             }
 
-            // ── Trailing stop ratchet ──────────────────────────────────────
-            let trail_pct = self.config.confluence.trailing_stop_pct;
-            let trail_act = self.config.confluence.trailing_activation_pct;
-            if trail_pct > 0.0 && entry > 0.0 {
-                let move_pct = if side == "long" {
-                    (price - entry) / entry
+            // ── Adaptive trailing stop ratchet ─────────────────────────────
+            if entry > 0.0 {
+                let prev_sl = sl;
+                let track = self
+                    .trailing_stops
+                    .entry(id)
+                    .or_insert_with(|| TrailingTrack::seed(sl));
+                if track.stop <= 0.0 && sl > 0.0 {
+                    track.stop = sl;
+                }
+                sl = if strategy == "volume_pump" {
+                    let p = &cfg.pump;
+                    update_trailing_simple(
+                        &side,
+                        entry,
+                        price,
+                        track,
+                        p.trailing_activation_pct,
+                        p.trailing_stop_pct,
+                    )
                 } else {
-                    (entry - price) / entry
+                    update_trailing(&side, entry, price, track, &cfg.confluence)
                 };
-                if move_pct >= trail_act {
-                    let new_trail = if side == "long" {
-                        price * (1.0 - trail_pct)
-                    } else {
-                        price * (1.0 + trail_pct)
-                    };
-                    let cached = self.trailing_stops.entry(id).or_insert(sl);
-                    let updated = if side == "long" {
-                        new_trail.max(*cached)
-                    } else {
-                        new_trail.min(*cached)
-                    };
-                    if (updated - *cached).abs() > 1e-10 {
-                        *cached = updated;
-                        let _ = self.db.update_position_sl_tp(id, Some(updated), None).await;
-                    }
-                    sl = *self.trailing_stops.get(&id).unwrap_or(&sl);
+                if (sl - prev_sl).abs() > 1e-10 {
+                    let _ = self.db.update_position_sl_tp(id, Some(sl), None).await;
                 }
             }
 
@@ -164,7 +165,8 @@ impl PaperTrader {
                 // After first TP: move SL to entry ("free ride").
                 if level == 1 && entry > 0.0 {
                     sl = entry;
-                    self.trailing_stops.insert(id, entry);
+                    self.trailing_stops
+                        .insert(id, TrailingTrack { stop: entry, peak_favorable: price });
                     let _ = self.db.update_position_sl_tp(id, Some(entry), Some(&new_levels_str)).await;
                 } else {
                     let _ = self.db.update_position_sl_tp(id, None, Some(&new_levels_str)).await;
@@ -192,10 +194,10 @@ impl PaperTrader {
                     let new_remaining = (remaining - close_vol).max(0.0);
                     let _ = self.db.partial_close_position(id, new_remaining, price).await;
                     let _ = risk.update_pnl(pnl).await;
-                    let _ = self.db.log_event(
+                let _ = self.db.log_event(
                         "position_partial_tp",
                         &format!("Paper partial TP{level} {symbol} ({side}) @ {price:.6} closed {close_vol:.2}"),
-                        Some(json!({"pnl": pnl, "level": level})),
+                        Some(json!({"pnl": pnl, "level": level, "symbol": symbol})),
                     ).await;
                     events.push(json!({"position_id": id, "symbol": symbol, "reason": "take_profit_partial", "level": level, "pnl": pnl}));
                 }
@@ -228,9 +230,18 @@ impl PaperTrader {
             if let Ok(pnl) = self.db.close_position(id, price, 1.0, 0.0, reason).await {
                 let _ = risk.update_pnl(pnl).await;
                 let _ = risk.record_trade_outcome(&symbol, false).await;
+                let event_type = if reason.contains("stop") || reason == "trailing_stop" {
+                    "cut_loss"
+                } else {
+                    "position_closed"
+                };
                 let _ = self
                     .db
-                    .log_event("position_closed", &format!("Paper closed {symbol} ({reason})"), Some(json!({"pnl": pnl})))
+                    .log_event(
+                        event_type,
+                        &format!("Paper closed {symbol} ({reason})"),
+                        Some(json!({"pnl": pnl, "reason": reason, "symbol": symbol})),
+                    )
                     .await;
                 events.push(json!({"position_id": id, "symbol": symbol, "reason": reason, "pnl": pnl}));
                 self.trailing_stops.remove(&id);
@@ -240,10 +251,11 @@ impl PaperTrader {
     }
 
     fn check_time_exit(&self, strategy: &str, opened_at: &str) -> Option<String> {
-        let max_hold = if strategy == "confluence" {
-            self.config.confluence.max_hold_sec
-        } else {
-            0
+        let cfg = self.config.read().unwrap();
+        let max_hold = match strategy {
+            "confluence" => cfg.confluence.max_hold_sec,
+            "volume_pump" => cfg.pump.max_hold_sec,
+            _ => 0,
         };
         if max_hold == 0 {
             return None;
@@ -253,7 +265,11 @@ impl PaperTrader {
             .ok()?;
         let age = Utc::now().signed_duration_since(opened).num_seconds().max(0) as u64;
         if age >= max_hold {
-            Some("confluence_time_exit".into())
+            Some(if strategy == "volume_pump" {
+                "volume_pump_time_exit".into()
+            } else {
+                "confluence_time_exit".into()
+            })
         } else {
             None
         }

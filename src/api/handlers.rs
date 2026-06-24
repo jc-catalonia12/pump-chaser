@@ -13,14 +13,15 @@ use serde_json::{json, Value};
 use crate::user_settings::{
     apply_user_settings, save_app_config, settings_file_path, settings_schema, user_settings_values,
 };
+use crate::config::SharedAppConfig;
 use crate::AppState;
 
 async fn cfg(state: &AppState) -> crate::config::AppConfig {
-    state.config.read().await.clone()
+    state.config.read().unwrap().clone()
 }
 
-async fn cfg_arc(state: &AppState) -> Arc<crate::config::AppConfig> {
-    Arc::new(state.config.read().await.clone())
+async fn cfg_arc(state: &AppState) -> SharedAppConfig {
+    state.config.clone()
 }
 
 fn execution_health(secrets: &crate::utils::UserSecrets, cfg: &crate::config::AppConfig) -> Value {
@@ -64,7 +65,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     let scanner = state.scanner.read().await;
     let status = scanner.get_status().await;
     let secrets = state.secrets.read().await;
-    let cfg = state.config.read().await;
+    let cfg = state.config.read().unwrap().clone();
     let exchanges = json!({ "mexc": status.get("ws_connected").unwrap_or(&json!(false)) });
     let mut body = json!({
         "status": "ok",
@@ -338,7 +339,7 @@ pub async fn signals_chart(
     let bars_n = q.bars.clamp(30, 500) as usize;
     let scanner = state.scanner.read().await;
     let cached = scanner.get_symbol_klines(symbol).await;
-    let exchange = match crate::exchange::MexcClient::new(Arc::new(cfg.clone())) {
+    let exchange = match crate::exchange::MexcClient::new(state.config.clone()) {
         Ok(c) => c,
         Err(e) => return Json(json!({ "error": e.to_string() })),
     };
@@ -570,7 +571,7 @@ pub async fn position_chart(
     };
 
     let cached = scanner.get_symbol_klines(&symbol).await;
-    let exchange = match crate::exchange::MexcClient::new(Arc::new(cfg.clone())) {
+    let exchange = match crate::exchange::MexcClient::new(state.config.clone()) {
         Ok(c) => c,
         Err(e) => return Json(json!({ "error": e.to_string() })),
     };
@@ -729,12 +730,12 @@ pub async fn kill_switch_deactivate(State(state): State<Arc<AppState>>) -> Json<
 // --- Settings ---
 
 pub async fn user_settings_get(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let cfg = state.config.read().await;
+    let cfg = state.config.read().unwrap().clone();
     Json(json!({
         "config_path": settings_file_path().display().to_string(),
         "values": user_settings_values(&cfg),
         "sections": settings_schema(),
-        "note": "Changes are saved to settings.yaml. Stop and start the scanner after editing MEXC endpoints or strategy thresholds.",
+        "note": "Changes apply immediately for strategy, risk, and execution settings. Restart the scanner only after changing MEXC REST/WebSocket URLs.",
     }))
 }
 
@@ -743,8 +744,12 @@ pub async fn user_settings_put(
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let patch = body.get("values").cloned().unwrap_or(body);
+    let prev_mexc = {
+        let cfg = state.config.read().unwrap().clone();
+        cfg.mexc.clone()
+    };
     let mut updated = {
-        let cfg = state.config.read().await;
+        let cfg = state.config.read().unwrap().clone();
         cfg.clone()
     };
     if let Err(exc) = apply_user_settings(&mut updated, &patch) {
@@ -754,15 +759,20 @@ pub async fn user_settings_put(
         return Json(json!({ "error": exc.to_string() }));
     }
     {
-        let mut cfg = state.config.write().await;
+        let mut cfg = state.config.write().unwrap();
         *cfg = updated.clone();
+    }
+    {
+        let scanner = state.scanner.read().await;
+        scanner.on_config_updated(prev_mexc).await;
     }
     Json(json!({
         "ok": true,
         "config_path": settings_file_path().display().to_string(),
         "values": user_settings_values(&updated),
         "live_trading_enabled": updated.execution.live_trading_enabled,
-        "scanner_restart_recommended": true,
+        "applied_live": true,
+        "scanner_restart_recommended": false,
     }))
 }
 
@@ -795,7 +805,7 @@ pub async fn watchlist_settings_put(Json(body): Json<Value>) -> Json<Value> {
 // --- ML ---
 
 pub async fn ml_stack(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let cfg = state.config.read().await;
+    let cfg = state.config.read().unwrap().clone();
     #[cfg(feature = "onnx")]
     let onnx_path = crate::ml::onnx::resolve_model_path(&cfg.ml);
     #[cfg(feature = "onnx")]
@@ -823,7 +833,7 @@ pub async fn ml_stack(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 pub async fn ml_outcome_trends(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let cfg = state.config.read().await;
+    let cfg = state.config.read().unwrap().clone();
     Json(json!({
         "daily": [],
         "ml_buckets": [],
@@ -950,7 +960,7 @@ pub async fn ml_shadow_stats(State(state): State<Arc<AppState>>) -> Json<Value> 
 
 pub async fn user_profile(State(state): State<Arc<AppState>>) -> Json<Value> {
     let secrets = state.secrets.read().await;
-    let cfg = state.config.read().await;
+    let cfg = state.config.read().unwrap().clone();
     Json(json!({
         "sqlite_path": cfg.storage.sqlite_path,
         "credentials": secrets.to_public(),
@@ -975,7 +985,7 @@ pub async fn user_credentials_put(
 
     let mut dry_run_disabled = false;
     if body.get("execution_mode").and_then(|v| v.as_str()) == Some("live") {
-        let mut cfg = state.config.write().await;
+        let mut cfg = state.config.write().unwrap();
         if cfg.execution.dry_run {
             cfg.execution.dry_run = false;
             if let Err(exc) = save_app_config(&cfg) {
@@ -990,7 +1000,7 @@ pub async fn user_credentials_put(
     }
     let scanner = state.scanner.read().await;
     scanner.update_live_secrets(secrets.clone()).await;
-    let cfg = state.config.read().await;
+    let cfg = state.config.read().unwrap().clone();
     Json(json!({
         "ok": true,
         "credentials": secrets.to_public(),
@@ -1143,7 +1153,7 @@ pub async fn live_snapshot(State(state): State<Arc<AppState>>) -> Json<Value> {
     let scanner = state.scanner.read().await;
     let risk = scanner.get_risk_metrics().await;
     let secrets = state.secrets.read().await;
-    let cfg = state.config.read().await;
+    let cfg = state.config.read().unwrap().clone();
     let risk_guard = state.risk.read().await;
     let open = state.db.count_open_positions().await.unwrap_or(0);
     let m = risk_guard.metrics(open);

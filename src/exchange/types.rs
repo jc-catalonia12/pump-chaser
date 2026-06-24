@@ -48,6 +48,8 @@ pub struct ContractInfo {
     pub vol_scale: i32,
     #[serde(default = "default_min_vol")]
     pub min_vol: f64,
+    #[serde(default)]
+    pub max_vol: f64,
     #[serde(default = "default_vol_unit")]
     pub vol_unit: f64,
     #[serde(default = "default_price_unit")]

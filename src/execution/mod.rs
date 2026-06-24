@@ -2,6 +2,7 @@ pub mod live;
 pub mod live_monitor;
 pub mod paper;
 pub mod position_sync;
+pub mod trailing;
 
 pub use live::LiveTrader;
 pub use live_monitor::LivePositionMonitor;

@@ -131,6 +131,8 @@ impl Database {
             // Shadow-only learning signals
             "ALTER TABLE signals ADD COLUMN shadow_only INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE signals ADD COLUMN reject_reason TEXT",
+            "ALTER TABLE positions ADD COLUMN entry_mode TEXT NOT NULL DEFAULT 'market'",
+            "ALTER TABLE positions ADD COLUMN limit_price REAL",
         ] {
             let _ = sqlx::query(stmt).execute(&self.pool).await;
         }

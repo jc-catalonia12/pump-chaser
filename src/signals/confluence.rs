@@ -1,15 +1,14 @@
 //! Confluence signal engine — port of `signals/confluence.py`.
 
-use std::sync::Arc;
-
 use chrono::Utc;
 
-use crate::config::AppConfig;
+use crate::config::SharedAppConfig;
 use crate::risk::filters::passes_risk_filters;
 use crate::signals::indicators::{
     ewma, liquidity_score, momentum_score, oi_proxy_score, price_change_pct, volume_surge_ratio,
     zscore,
 };
+use crate::signals::liquidity_grab::detect_liquidity_grab;
 use crate::signals::state::{Side, SymbolState};
 use crate::signals::zones::{
     build_zones, market_structure_supports, structure_aligned, zone_confluence_score,
@@ -27,7 +26,7 @@ pub struct ScanDiagnosis {
 }
 
 pub struct ConfluenceEngine {
-    config: Arc<AppConfig>,
+    config: SharedAppConfig,
 }
 
 /// Which composite-score band qualifies for signal emission.
@@ -39,7 +38,7 @@ enum ScoreBand {
 }
 
 impl ConfluenceEngine {
-    pub fn new(config: Arc<AppConfig>) -> Self {
+    pub fn new(config: SharedAppConfig) -> Self {
         Self { config }
     }
 
@@ -48,7 +47,7 @@ impl ConfluenceEngine {
             return false;
         };
         let elapsed = Utc::now().signed_duration_since(last).num_seconds().max(0) as u64;
-        elapsed < self.config.confluence.alert_cooldown_sec
+        elapsed < self.config.read().unwrap().confluence.alert_cooldown_sec
     }
 
     pub fn evaluate(
@@ -79,8 +78,9 @@ impl ConfluenceEngine {
         focus_mode: bool,
         band: ScoreBand,
     ) -> Option<PumpSignal> {
-        let cfg = &self.config.confluence;
-        if !cfg.enabled || !self.config.zones.enabled {
+        let app = self.config.read().unwrap();
+        let cfg = &app.confluence;
+        if !cfg.enabled || !app.zones.enabled {
             return None;
         }
         let ticker = state.last_ticker.as_ref()?;
@@ -100,8 +100,8 @@ impl ConfluenceEngine {
             &state.symbol,
             ticker,
             &state.klines,
-            &self.config.risk,
-            &self.config.scanner,
+            &app.risk,
+            &app.scanner,
             funding_rate,
             side,
             focus_mode,
@@ -134,14 +134,17 @@ impl ConfluenceEngine {
         } else {
             ticker.volume24 * ticker.last_price
         };
-        let liq = liquidity_score(turnover, self.config.scanner.min_24h_turnover_usdt, 50_000_000.0);
+        let liq = liquidity_score(turnover, app.scanner.min_24h_turnover_usdt, 50_000_000.0);
         let mom = momentum_score(move_pct, cfg.max_move_pct);
         let _oi = oi_proxy_score(ticker.amount24, ticker.volume24, ticker.last_price);
 
-        let sd_zones = build_zones(&state.klines, &self.config.zones);
+        let sd_zones = build_zones(&state.klines, &app.zones);
         let (zone_score, zone_msg) =
-            zone_confluence_score(ticker.last_price, side, &sd_zones, self.config.zones.proximity_pct);
+            zone_confluence_score(ticker.last_price, side, &sd_zones, app.zones.proximity_pct);
         if zone_score < cfg.min_zone_score {
+            return None;
+        }
+        if cfg.require_inside_zone && !zone_msg.starts_with("At ") {
             return None;
         }
 
@@ -157,6 +160,48 @@ impl ConfluenceEngine {
         );
         if cfg.require_market_structure_bias && !bias_ok {
             return None;
+        }
+
+        // Higher-timeframe structural bias gate (15m/30m).
+        // If HTF bars are available and htf_enabled, the HTF trend must align
+        // with the trade direction; misaligned setups are blocked regardless of
+        // what the 1m chart shows.
+        if cfg.htf_enabled && !state.htf_klines.is_empty() {
+            let htf_bias = market_structure_supports(
+                &state.htf_klines,
+                side,
+                state.htf_klines.len(),
+            );
+            if !htf_bias {
+                return None;
+            }
+        }
+
+        // 15m liquidity grab: sweep of pooled liquidity + reclaim in trade direction.
+        let mut liq_grab_ok = false;
+        let mut liq_grab_msg = String::new();
+        let mut liq_grab_score = 0.0;
+        if cfg.liquidity_grab_enabled {
+            if state.htf_klines.is_empty() {
+                if cfg.require_liquidity_grab {
+                    return None;
+                }
+            } else {
+                let grab = detect_liquidity_grab(
+                    &state.htf_klines,
+                    side,
+                    cfg.liquidity_grab_lookback_bars as usize,
+                    cfg.liquidity_grab_max_age_bars as usize,
+                    cfg.liquidity_grab_sweep_pct,
+                    cfg.liquidity_grab_min_rejection,
+                );
+                liq_grab_ok = grab.detected;
+                liq_grab_msg = grab.message;
+                liq_grab_score = grab.score;
+                if cfg.require_liquidity_grab && !liq_grab_ok {
+                    return None;
+                }
+            }
         }
 
         let mut confluences = Vec::new();
@@ -178,6 +223,9 @@ impl ConfluenceEngine {
         if liq >= 25.0 {
             confluences.push("liquidity".into());
         }
+        if liq_grab_ok {
+            confluences.push("liq_grab".into());
+        }
 
         if confluences.len() < cfg.min_confluences as usize {
             return None;
@@ -191,6 +239,9 @@ impl ConfluenceEngine {
             + liq * 0.14
             + if structure_ok { 20.0 } else { 0.0 } * 0.12;
         composite += (confluences.len() as f64 * 2.0).min(8.0);
+        if liq_grab_ok {
+            composite = (composite + liq_grab_score * 0.12).min(100.0);
+        }
 
         let min_score = cfg.min_composite_score - if focus_mode { 2.0 } else { 0.0 };
         let score_ok = match band {
@@ -226,6 +277,9 @@ impl ConfluenceEngine {
             structure_ok,
             bias_ok,
             liq,
+            liq_grab_ok,
+            &liq_grab_msg,
+            liq_grab_score,
             funding_rate,
             funding_ok,
             cfg.ema_trend_span,
@@ -260,6 +314,8 @@ impl ConfluenceEngine {
             projected_take_profits: projected_tps,
             tp_close_fractions: cfg.tp_close_fractions.clone(),
             ml_features: Vec::new(),
+            entry_mode: "market".to_string(),
+            limit_entry_price: 0.0,
         })
     }
 
@@ -270,8 +326,9 @@ impl ConfluenceEngine {
         funding_rate: Option<f64>,
         focus_mode: bool,
     ) -> ScanDiagnosis {
-        let cfg = &self.config.confluence;
-        if !cfg.enabled || !self.config.zones.enabled {
+        let app = self.config.read().unwrap();
+        let cfg = &app.confluence;
+        if !cfg.enabled || !app.zones.enabled {
             return ScanDiagnosis {
                 action: "skipped".into(),
                 message: "Confluence engine disabled".into(),
@@ -316,8 +373,8 @@ impl ConfluenceEngine {
             &state.symbol,
             ticker,
             &state.klines,
-            &self.config.risk,
-            &self.config.scanner,
+            &app.risk,
+            &app.scanner,
             funding_rate,
             side,
             focus_mode,
@@ -371,12 +428,12 @@ impl ConfluenceEngine {
         } else {
             ticker.volume24 * ticker.last_price
         };
-        let liq = liquidity_score(turnover, self.config.scanner.min_24h_turnover_usdt, 50_000_000.0);
+        let liq = liquidity_score(turnover, app.scanner.min_24h_turnover_usdt, 50_000_000.0);
         let mom = momentum_score(move_pct, cfg.max_move_pct);
 
-        let sd_zones = build_zones(&state.klines, &self.config.zones);
+        let sd_zones = build_zones(&state.klines, &app.zones);
         let (zone_score, zone_msg) =
-            zone_confluence_score(ticker.last_price, side, &sd_zones, self.config.zones.proximity_pct);
+            zone_confluence_score(ticker.last_price, side, &sd_zones, app.zones.proximity_pct);
         if zone_score < cfg.min_zone_score {
             return ScanDiagnosis {
                 action: "rejected".into(),
@@ -411,6 +468,52 @@ impl ConfluenceEngine {
                 confluence_count: None,
                 side: Some(side_s),
             };
+        }
+
+        if cfg.htf_enabled && !state.htf_klines.is_empty() {
+            let htf_bias =
+                market_structure_supports(&state.htf_klines, side, state.htf_klines.len());
+            if !htf_bias {
+                return ScanDiagnosis {
+                    action: "rejected".into(),
+                    message: format!(
+                        "HTF ({}) structure opposes {} direction",
+                        cfg.htf_interval, side_s
+                    ),
+                    composite_score: None,
+                    confluence_count: None,
+                    side: Some(side_s),
+                };
+            }
+        }
+
+        if cfg.liquidity_grab_enabled && cfg.require_liquidity_grab {
+            if state.htf_klines.is_empty() {
+                return ScanDiagnosis {
+                    action: "rejected".into(),
+                    message: "Waiting for 15m HTF bars (liquidity grab)".into(),
+                    composite_score: None,
+                    confluence_count: None,
+                    side: Some(side_s),
+                };
+            }
+            let grab = detect_liquidity_grab(
+                &state.htf_klines,
+                side,
+                cfg.liquidity_grab_lookback_bars as usize,
+                cfg.liquidity_grab_max_age_bars as usize,
+                cfg.liquidity_grab_sweep_pct,
+                cfg.liquidity_grab_min_rejection,
+            );
+            if !grab.detected {
+                return ScanDiagnosis {
+                    action: "rejected".into(),
+                    message: grab.message,
+                    composite_score: None,
+                    confluence_count: None,
+                    side: Some(side_s),
+                };
+            }
         }
 
         let mut confluences = Vec::new();
@@ -567,6 +670,9 @@ fn confluence_details(
     structure_ok: bool,
     bias_ok: bool,
     liq: f64,
+    liq_grab_ok: bool,
+    liq_grab_msg: &str,
+    liq_grab_score: f64,
     funding_rate: Option<f64>,
     funding_ok: bool,
     ema_span: u32,
@@ -579,6 +685,7 @@ fn confluence_details(
         json!({"key":"structure","label":"Structure","active":structure_ok,"score":if structure_ok {100.0}else{0.0},"detail":"Structure aligned"}),
         json!({"key":"market_bias","label":"Market bias","active":bias_ok,"score":if bias_ok {100.0}else{0.0},"detail":"Market structure bias"}),
         json!({"key":"liquidity","label":"Liquidity","active":liq>=25.0,"score":liq.round(),"detail":format!("24h turnover score {liq:.0}")}),
+        json!({"key":"liq_grab","label":"15m Liq Grab","active":liq_grab_ok,"score":if liq_grab_ok {liq_grab_score.round()} else {0.0},"detail":if liq_grab_ok {liq_grab_msg} else {"No HTF grab detected"}}),
         json!({"key":"ema_trend","label":"EMA trend","active":true,"score":100.0,"detail":format!("{ema_span}-bar trend")}),
         json!({"key":"funding","label":"Funding","active":funding_ok,"score":if funding_ok {100.0}else{30.0},"detail":funding_rate.map(|r|format!("{:.4}%/period", r*100.0)).unwrap_or_else(||"not checked".into())}),
     ]
@@ -586,7 +693,10 @@ fn confluence_details(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::config::AppConfig;
     use crate::exchange::{KlineBar, TickerSnapshot};
 
     fn sample_state() -> SymbolState {
@@ -635,8 +745,12 @@ mod tests {
         cfg.confluence.min_zone_score = 0.0;
         cfg.confluence.min_confluences = 1;
         cfg.confluence.min_move_pct = 0.01;
+        cfg.confluence.liquidity_grab_enabled = false;
+        cfg.confluence.require_liquidity_grab = false;
+        cfg.confluence.htf_enabled = false;
+        cfg.confluence.require_inside_zone = false;
         cfg.zones.proximity_pct = 50.0;
-        let engine = ConfluenceEngine::new(Arc::new(cfg));
+        let engine = ConfluenceEngine::new(Arc::new(std::sync::RwLock::new(cfg)));
         let state = sample_state();
         let sig = engine.evaluate(&state, Some(0.0001), false);
         assert!(sig.is_some(), "expected confluence signal from sample state");

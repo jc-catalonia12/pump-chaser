@@ -134,7 +134,7 @@ fn help_message() -> String {
 /// Build an HTML-formatted status snapshot for Telegram.
 pub async fn build_info_message(state: &AppState) -> String {
     let secrets = state.secrets.read().await;
-    let cfg = state.config.read().await;
+    let cfg = state.config.read().unwrap().clone();
     let scanner = state.scanner.read().await;
 
     let status = scanner.get_status().await;
@@ -162,7 +162,7 @@ pub async fn build_info_message(state: &AppState) -> String {
         .to_string();
 
     if secrets.has_credentials() {
-        let live = LiveTrader::new(Arc::new(cfg.clone()), state.db.clone(), secrets.clone());
+        let live = LiveTrader::new(state.config.clone(), state.db.clone(), secrets.clone());
         if let Ok(balance) = live.get_wallet_balance().await {
             equity = balance.anchor_equity();
             available = balance.available;

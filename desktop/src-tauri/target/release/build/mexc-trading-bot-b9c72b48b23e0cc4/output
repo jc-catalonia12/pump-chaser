@@ -1,3 +1,0 @@
-cargo:rustc-env=BUILD_UNIX=1782279666
-cargo:rustc-env=GIT_SHA=bda9c25
-cargo:rerun-if-changed=build.rs

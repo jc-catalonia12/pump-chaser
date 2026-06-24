@@ -1,9 +1,13 @@
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use figment::{providers::Format, Figment};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BotError, Result};
+
+/// Live config shared across API, scanner, risk, and execution — updated when settings are saved.
+pub type SharedAppConfig = Arc<RwLock<AppConfig>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -29,6 +33,10 @@ pub struct AppConfig {
     pub exchanges: ExchangesConfig,
     #[serde(default)]
     pub alerts: AlertsConfig,
+    #[serde(default)]
+    pub sniper: SniperConfig,
+    #[serde(default)]
+    pub pump: PumpConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,10 +217,47 @@ pub struct ConfluenceConfig {
     pub max_extension_pct: f64,
     #[serde(default = "default_base_lev")]
     pub base_leverage: u32,
-    #[serde(default = "default_base_lev")]
+    #[serde(default = "default_moderate_lev")]
     pub moderate_leverage: u32,
-    #[serde(default = "default_base_lev")]
+    #[serde(default = "default_strong_lev")]
     pub strong_leverage: u32,
+    /// Require higher-timeframe structural bias to align with signal direction.
+    #[serde(default = "default_true")]
+    pub htf_enabled: bool,
+    /// Kline interval for higher-timeframe bias check (e.g. "Min15", "Min30").
+    #[serde(default = "default_htf_interval")]
+    pub htf_interval: String,
+    /// Number of HTF bars to fetch and analyse.
+    #[serde(default = "default_htf_lookback")]
+    pub htf_lookback_bars: u32,
+    /// Detect 15m liquidity grabs (sweep + reclaim) for entries.
+    #[serde(default = "default_true")]
+    pub liquidity_grab_enabled: bool,
+    /// Block entries unless a recent HTF liquidity grab aligns with direction.
+    #[serde(default = "default_true")]
+    pub require_liquidity_grab: bool,
+    /// HTF bars used to build the high/low liquidity pool.
+    #[serde(default = "default_liq_grab_lookback")]
+    pub liquidity_grab_lookback_bars: u32,
+    /// Max age (bars) of the grab candle on HTF.
+    #[serde(default = "default_liq_grab_age")]
+    pub liquidity_grab_max_age_bars: u32,
+    /// Minimum sweep beyond pool level (%).
+    #[serde(default = "default_liq_grab_sweep")]
+    pub liquidity_grab_sweep_pct: f64,
+    /// Minimum wick rejection ratio (0–1) on the grab candle.
+    #[serde(default = "default_liq_grab_rejection")]
+    pub liquidity_grab_min_rejection: f64,
+    /// Wider trail once move exceeds this fraction (e.g. 0.03 = 3%).
+    #[serde(default = "default_trail_ext_act")]
+    pub trailing_extended_activation_pct: f64,
+    #[serde(default = "default_trail_ext_stop")]
+    pub trailing_extended_stop_pct: f64,
+    /// Widest trail for large runners (pumps/dumps).
+    #[serde(default = "default_trail_run_act")]
+    pub trailing_runner_activation_pct: f64,
+    #[serde(default = "default_trail_run_stop")]
+    pub trailing_runner_stop_pct: f64,
 }
 
 fn default_min_zone_score() -> f64 {
@@ -272,11 +317,59 @@ fn default_extension() -> f64 {
 }
 
 fn default_base_lev() -> u32 {
-    8
+    20
+}
+
+fn default_moderate_lev() -> u32 {
+    50
+}
+
+fn default_strong_lev() -> u32 {
+    100
+}
+
+fn default_htf_interval() -> String {
+    "Min15".into()
+}
+
+fn default_htf_lookback() -> u32 {
+    120
+}
+
+fn default_liq_grab_lookback() -> u32 {
+    80
+}
+
+fn default_liq_grab_age() -> u32 {
+    5
+}
+
+fn default_liq_grab_sweep() -> f64 {
+    0.04
+}
+
+fn default_liq_grab_rejection() -> f64 {
+    0.4
+}
+
+fn default_trail_ext_act() -> f64 {
+    0.03
+}
+
+fn default_trail_ext_stop() -> f64 {
+    0.014
+}
+
+fn default_trail_run_act() -> f64 {
+    0.05
+}
+
+fn default_trail_run_stop() -> f64 {
+    0.024
 }
 
 fn default_min_score() -> f64 {
-    65.0
+    60.0
 }
 
 fn default_min_confluences() -> u32 {
@@ -349,6 +442,75 @@ pub struct RiskConfig {
     /// Seconds since last WS tick before marking the feed as stale.
     #[serde(default = "default_ws_stale_sec")]
     pub ws_stale_sec: u64,
+    /// Minimum expected gross profit in USDT across all TP levels to take a trade.
+    /// 0.0 = disabled (no minimum). Default 5.0.
+    #[serde(default = "default_min_profit_usdt")]
+    pub min_profit_usdt: f64,
+    /// Max open positions for confluence strategy (separate slot).
+    #[serde(default = "default_max_confluence_positions")]
+    pub max_confluence_positions: u32,
+    /// Max open positions for volume_pump strategy (separate slot).
+    #[serde(default = "default_max_volume_pump_positions")]
+    pub max_volume_pump_positions: u32,
+}
+
+// ── Execution mode ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryMode {
+    /// Immediate market fill on signal (original behaviour).
+    Market,
+    /// Place a limit order at `limit_offset_pct` above/below current price.
+    Limit,
+    /// Wait for a 1m sniper trigger (pullback / pin-bar) after the 15m setup
+    /// fires, then submit a limit order at the trigger price.
+    Sniper,
+}
+
+impl Default for EntryMode {
+    fn default() -> Self {
+        Self::Sniper
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SniperConfig {
+    /// How to enter confirmed setups.
+    #[serde(default)]
+    pub entry_mode: EntryMode,
+    /// Limit order offset from mark price (%): positive = more favourable.
+    /// e.g. 0.001 = 0.1% below mark for longs, 0.1% above for shorts.
+    #[serde(default = "default_limit_offset")]
+    pub limit_offset_pct: f64,
+    /// Seconds to wait for the limit order to fill before cancelling.
+    #[serde(default = "default_limit_ttl")]
+    pub limit_ttl_sec: u64,
+    /// Lookback bars (1m) to check for sniper trigger after HTF setup.
+    #[serde(default = "default_sniper_lookback")]
+    pub sniper_lookback_bars: u32,
+    /// Minimum wick-rejection ratio (0–1) on the 1m trigger candle (pin-bar).
+    #[serde(default = "default_sniper_rejection")]
+    pub sniper_min_wick_rejection: f64,
+    /// Maximum pullback allowed (fraction of SL distance) before trigger is invalid.
+    #[serde(default = "default_sniper_pullback")]
+    pub sniper_max_pullback_pct: f64,
+    /// Seconds an HTF setup stays valid, waiting for a 1m trigger.
+    #[serde(default = "default_sniper_expiry")]
+    pub htf_setup_expiry_sec: u64,
+}
+
+fn default_limit_offset() -> f64 { 0.001 }
+fn default_limit_ttl() -> u64 { 30 }
+fn default_sniper_lookback() -> u32 { 5 }
+fn default_sniper_rejection() -> f64 { 0.4 }
+fn default_sniper_pullback() -> f64 { 0.7 }
+fn default_sniper_expiry() -> u64 { 600 }
+
+impl Default for SniperConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("SniperConfig default")
+    }
 }
 
 fn default_funding_abs() -> f64 {
@@ -364,11 +526,11 @@ fn default_risk_pct() -> f64 {
 }
 
 fn default_max_leverage() -> u32 {
-    10
+    200
 }
 
 fn default_max_positions() -> u32 {
-    3
+    1
 }
 
 fn default_daily_loss() -> f64 {
@@ -401,6 +563,18 @@ fn default_symbol_cooldown() -> u64 {
 
 fn default_ws_stale_sec() -> u64 {
     30
+}
+
+fn default_min_profit_usdt() -> f64 {
+    5.0
+}
+
+fn default_max_confluence_positions() -> u32 {
+    1
+}
+
+fn default_max_volume_pump_positions() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -546,6 +720,90 @@ pub struct ScalpConfig {
 impl Default for ScalpConfig {
     fn default() -> Self {
         Self { enabled: false }
+    }
+}
+
+/// Volume-pump strategy: abnormal 1m volume + universe rank, fast limit entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_pump_vol_surge")]
+    pub volume_surge_multiplier: f64,
+    #[serde(default = "default_pump_vol_z")]
+    pub volume_zscore_threshold: f64,
+    #[serde(default = "default_pump_price_min")]
+    pub price_change_pct_min: f64,
+    #[serde(default = "default_pump_price_max")]
+    pub price_change_pct_max: f64,
+    #[serde(default = "default_pump_ewma_span")]
+    pub ewma_span: u32,
+    #[serde(default = "default_pump_min_score")]
+    pub min_composite_score: f64,
+    #[serde(default = "default_pump_universe_rank")]
+    pub universe_rank_max: u32,
+    #[serde(default = "default_pump_min_turnover")]
+    pub min_24h_turnover_usdt: f64,
+    #[serde(default = "default_pump_max_turnover")]
+    pub max_24h_turnover_usdt: f64,
+    #[serde(default = "default_pump_cooldown")]
+    pub alert_cooldown_sec: u64,
+    #[serde(default = "default_pump_entry_limit")]
+    pub entry_mode: EntryMode,
+    #[serde(default = "default_limit_offset")]
+    pub limit_offset_pct: f64,
+    #[serde(default = "default_pump_limit_ttl")]
+    pub limit_ttl_sec: u64,
+    #[serde(default = "default_pump_sl")]
+    pub default_sl_pct: f64,
+    #[serde(default = "default_pump_tp_levels")]
+    pub tp_levels_pct: Vec<f64>,
+    #[serde(default = "default_pump_tp_fracs")]
+    pub tp_close_fractions: Vec<f64>,
+    #[serde(default = "default_pump_max_hold")]
+    pub max_hold_sec: u64,
+    #[serde(default = "default_pump_trailing")]
+    pub trailing_stop_pct: f64,
+    #[serde(default = "default_pump_trail_act")]
+    pub trailing_activation_pct: f64,
+    #[serde(default = "default_base_lev")]
+    pub base_leverage: u32,
+    #[serde(default = "default_moderate_lev")]
+    pub moderate_leverage: u32,
+    #[serde(default = "default_strong_lev")]
+    pub strong_leverage: u32,
+    #[serde(default = "default_max_volume_pump_positions")]
+    pub max_concurrent_positions: u32,
+    #[serde(default = "default_pump_min_profit")]
+    pub min_profit_usdt: f64,
+    #[serde(default = "default_pump_risk_pct")]
+    pub max_risk_per_trade: f64,
+}
+
+fn default_pump_vol_surge() -> f64 { 3.5 }
+fn default_pump_vol_z() -> f64 { 2.5 }
+fn default_pump_price_min() -> f64 { 0.8 }
+fn default_pump_price_max() -> f64 { 8.0 }
+fn default_pump_ewma_span() -> u32 { 20 }
+fn default_pump_min_score() -> f64 { 62.0 }
+fn default_pump_universe_rank() -> u32 { 5 }
+fn default_pump_min_turnover() -> f64 { 500_000.0 }
+fn default_pump_max_turnover() -> f64 { 50_000_000.0 }
+fn default_pump_cooldown() -> u64 { 180 }
+fn default_pump_entry_limit() -> EntryMode { EntryMode::Limit }
+fn default_pump_limit_ttl() -> u64 { 15 }
+fn default_pump_sl() -> f64 { 0.012 }
+fn default_pump_tp_levels() -> Vec<f64> { vec![0.015, 0.03, 0.05] }
+fn default_pump_tp_fracs() -> Vec<f64> { vec![0.5, 0.3, 0.2] }
+fn default_pump_max_hold() -> u64 { 900 }
+fn default_pump_trailing() -> f64 { 0.008 }
+fn default_pump_trail_act() -> f64 { 0.01 }
+fn default_pump_min_profit() -> f64 { 1.0 }
+fn default_pump_risk_pct() -> f64 { 0.01 }
+
+impl Default for PumpConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("PumpConfig default")
     }
 }
 

@@ -57,6 +57,12 @@ export const EVENT_LABELS = {
     tone: "success",
     icon: "tp_hit",
   },
+  position_partial_tp: {
+    label: "Partial Take Profit",
+    description: "Partial position closed at profit target",
+    tone: "success",
+    icon: "tp_hit",
+  },
   breakeven: {
     label: "Breakeven Stop",
     description: "Stop moved to entry after profit",
@@ -120,6 +126,18 @@ export const EVENT_LABELS = {
   signal: {
     label: "Signal",
     description: "New confluence setup detected",
+    tone: "accent",
+    icon: "signal",
+  },
+  volume_pump_detected: {
+    label: "Volume Pump",
+    description: "Abnormal volume burst detected",
+    tone: "accent",
+    icon: "signal",
+  },
+  volume_pump_signal: {
+    label: "Volume Pump Signal",
+    description: "Volume pump trade signal saved",
     tone: "accent",
     icon: "signal",
   },

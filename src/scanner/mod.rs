@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, EntryMode, SharedAppConfig};
 use crate::db::Database;
 use crate::exchange::{MexcClient, TickerSnapshot};
 use crate::execution::{reconcile_on_boot, LivePositionMonitor, LiveTrader, PaperTrader};
@@ -18,10 +18,12 @@ use crate::ml::features::{normalize_feature_vector, TechnicalFeatureBuilder, FEA
 use crate::ml::{EnhanceOutcome, MlPipeline};
 use crate::risk::RiskManager;
 use crate::signals::confluence::{ConfluenceEngine, ScanDiagnosis};
+use crate::signals::pump::{turnover_velocity, VolumePumpEngine};
+use crate::signals::sniper::{self, TriggerResult};
 use crate::signals::{PumpSignal, SymbolState, SymbolStates};
 use crate::utils::{Alerter, UserSecrets};
 
-const VALID_TRADING_MODES: &[&str] = &["confluence", "pump", "scalp", "both", "all"];
+const VALID_TRADING_MODES: &[&str] = &["confluence", "pump", "volume_pump", "scalp", "both", "all"];
 
 /// How often the learning loop resolves closed trades and trains the model.
 const LEARNING_INTERVAL_SEC: u64 = 30;
@@ -100,11 +102,14 @@ pub struct ScannerService {
 }
 
 struct ScannerInner {
-    config: Arc<AppConfig>,
+    config: SharedAppConfig,
     db: Arc<Database>,
     risk: Arc<RwLock<RiskManager>>,
     exchange: MexcClient,
     confluence: ConfluenceEngine,
+    volume_pump: VolumePumpEngine,
+    /// Universe turnover-velocity rank (1 = hottest), refreshed each ticker batch.
+    pump_ranks: RwLock<HashMap<String, u32>>,
     paper: Mutex<PaperTrader>,
     live: Mutex<LiveTrader>,
     live_monitor: Mutex<LivePositionMonitor>,
@@ -121,12 +126,18 @@ struct ScannerInner {
     scan_log_gate: RwLock<HashMap<String, (i64, String)>>,
     ticker_map: RwLock<HashMap<String, TickerSnapshot>>,
     started_at: RwLock<Option<DateTime<Utc>>>,
+    /// Throttle automatic phantom-position healing (unix sec).
+    position_heal_at: AtomicI64,
     alerter: Arc<Alerter>,
 }
 
 impl ScannerService {
+    fn inner_cfg(&self) -> AppConfig {
+        self.inner.config.read().unwrap().clone()
+    }
+
     pub fn new(
-        config: Arc<AppConfig>,
+        config: SharedAppConfig,
         db: Arc<Database>,
         risk: Arc<RwLock<RiskManager>>,
         secrets: Arc<RwLock<UserSecrets>>,
@@ -142,8 +153,8 @@ impl ScannerService {
         };
         let exchange = MexcClient::new(config.clone())?;
         let live = LiveTrader::new(config.clone(), db.clone(), secrets_snap.clone());
-        let live_client = crate::exchange::MexcPrivateClient::from_secrets(&config.mexc, &secrets_snap);
-        let alerter = Arc::new(Alerter::new(config.alerts.clone()).with_secrets(secrets.clone()));
+        let live_client = crate::exchange::MexcPrivateClient::from_secrets(&config.read().unwrap().mexc, &secrets_snap);
+        let alerter = Arc::new(Alerter::new(config.read().unwrap().alerts.clone()).with_secrets(secrets.clone()));
         let live_monitor =
             LivePositionMonitor::new(config.clone(), db.clone(), live_client).with_alerter(alerter.clone());
         let inner = Arc::new(ScannerInner {
@@ -152,6 +163,8 @@ impl ScannerService {
             risk: risk.clone(),
             exchange,
             confluence: ConfluenceEngine::new(config.clone()),
+            volume_pump: VolumePumpEngine::new(config.clone()),
+            pump_ranks: RwLock::new(HashMap::new()),
             paper: Mutex::new(PaperTrader::new(config.clone(), db)),
             live: Mutex::new(live),
             live_monitor: Mutex::new(live_monitor),
@@ -166,6 +179,7 @@ impl ScannerService {
             scan_log_gate: RwLock::new(HashMap::new()),
             ticker_map: RwLock::new(HashMap::new()),
             started_at: RwLock::new(None),
+            position_heal_at: AtomicI64::new(0),
             alerter,
         });
         Ok(Self {
@@ -175,35 +189,66 @@ impl ScannerService {
     }
 
     fn active_strategies(&self) -> Vec<&str> {
-        let mode = self.inner.config.trading.mode.as_str();
+        let cfg = self.inner_cfg();
+        let mode = cfg.trading.mode.as_str();
         let mut active = Vec::new();
-        if matches!(mode, "confluence" | "all") && self.inner.config.confluence.enabled {
+        if matches!(mode, "confluence" | "all") && cfg.confluence.enabled {
             active.push("confluence");
         }
-        if matches!(mode, "pump" | "both" | "all") {
-            active.push("pump");
+        if matches!(mode, "pump" | "volume_pump" | "both" | "all") && cfg.pump.enabled {
+            active.push("volume_pump");
         }
-        if matches!(mode, "scalp" | "both" | "all") && self.inner.config.scalp.enabled {
+        if matches!(mode, "scalp" | "both" | "all") && cfg.scalp.enabled {
             active.push("scalp");
         }
         active
     }
 
     pub fn get_trading_settings(&self) -> Value {
+        let cfg = self.inner_cfg();
         json!({
-            "trading_mode": self.inner.config.trading.mode,
+            "trading_mode": cfg.trading.mode,
             "active_strategies": self.active_strategies(),
-            "scalp_enabled": self.inner.config.scalp.enabled,
+            "scalp_enabled": cfg.scalp.enabled,
             "scalp_active": self.active_strategies().contains(&"scalp"),
-            "confluence_enabled": self.inner.config.confluence.enabled,
+            "confluence_enabled": cfg.confluence.enabled,
+            "pump_enabled": cfg.pump.enabled,
             "valid_modes": VALID_TRADING_MODES,
         })
+    }
+
+    /// Refresh exchange clients after settings save (MEXC REST URLs).
+    pub async fn on_config_updated(&self, prev_mexc: crate::config::MexcConfig) {
+        let mexc = self.inner.config.read().unwrap().mexc.clone();
+        let mexc_changed = mexc.rest_base_url != prev_mexc.rest_base_url
+            || mexc.ws_url != prev_mexc.ws_url;
+        if mexc_changed {
+            let secrets = self.inner.live.lock().await.secrets().clone();
+            self.inner.live.lock().await.refresh_exchange_client();
+            self.inner
+                .live_monitor
+                .lock()
+                .await
+                .refresh_exchange_client_from_secrets(&secrets);
+            warn!(
+                "MEXC endpoints changed — stop and start the scanner to reconnect the WebSocket feed"
+            );
+            let _ = self
+                .inner
+                .db
+                .log_event(
+                    "config_updated",
+                    "MEXC endpoints changed — restart scanner for new WebSocket URL",
+                    None,
+                )
+                .await;
+        }
     }
 
     pub async fn get_watchlist_settings(&self) -> Value {
         let tracked = self.inner.tracked_symbols.read().await;
         json!({
-            "mode": self.inner.config.watchlist.mode,
+            "mode": self.inner_cfg().watchlist.mode,
             "tracked_count": tracked.len(),
             "tracked_symbols": tracked.clone(),
         })
@@ -233,9 +278,9 @@ impl ScannerService {
         let order = self.inner.tracked_symbols.read().await.clone();
         let states = self.inner.states.read().await;
         let tickers = self.inner.ticker_map.read().await;
-        let lookback = self.inner.config.scanner.kline_lookback_bars;
-        let interval = self.inner.config.scanner.kline_interval.clone();
-        let refresh_sec = self.inner.config.scanner.kline_refresh_sec;
+        let lookback = self.inner_cfg().scanner.kline_lookback_bars;
+        let interval = self.inner_cfg().scanner.kline_interval.clone();
+        let refresh_sec = self.inner_cfg().scanner.kline_refresh_sec;
         let ws_on = self.inner.ws_connected.load(Ordering::SeqCst);
 
         let rows: Vec<Value> = order
@@ -284,8 +329,8 @@ impl ScannerService {
             })
             .collect();
         json!({
-            "mode": self.inner.config.watchlist.mode,
-            "trading_mode": self.inner.config.trading.mode,
+            "mode": self.inner_cfg().watchlist.mode,
+            "trading_mode": self.inner_cfg().trading.mode,
             "count": order.len(),
             "scanner_running": self.inner.running.load(Ordering::SeqCst),
             "ws_connected": ws_on,
@@ -297,6 +342,19 @@ impl ScannerService {
 
     /// Open positions enriched with the live mark price and unrealized PnL.
     pub async fn get_open_positions_live(&self) -> Vec<Value> {
+        let now = Utc::now().timestamp();
+        let last = self.inner.position_heal_at.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 45 {
+            self.inner.position_heal_at.store(now, Ordering::Relaxed);
+            let live = self.inner.live.lock().await;
+            if live.has_credentials() {
+                let healed = live.heal_phantom_open_positions().await;
+                if healed > 0 {
+                    info!("Auto-healed {healed} phantom live position(s) not on MEXC");
+                }
+            }
+        }
+
         let mut positions = self.inner.db.get_open_positions().await.unwrap_or_default();
         let tickers = self.inner.ticker_map.read().await;
         // MEXC stores exchange-sourced position size as `holdVol` (number of
@@ -335,9 +393,28 @@ impl ScannerService {
                 .filter(|&m| m > 0.0)
                 .unwrap_or(entry);
 
+            let entry_mode = p
+                .get("entry_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("market")
+                .to_string();
+            let is_limit = matches!(entry_mode.as_str(), "limit" | "sniper");
+            let exchange_linked = p
+                .get("exchange_position_id")
+                .and_then(|v| v.as_i64())
+                .is_some();
+            let order_status = if is_limit && !paper && !exchange_linked {
+                "pending"
+            } else if is_limit {
+                "filled"
+            } else {
+                "open"
+            };
+
             if let Some(obj) = p.as_object_mut() {
                 obj.insert("mark_price".into(), json!(mark));
                 obj.insert("contract_size".into(), json!(contract_size));
+                obj.insert("order_status".into(), json!(order_status));
                 if entry > 0.0 {
                     let move_pct = if side == "short" {
                         (entry - mark) / entry * 100.0
@@ -378,15 +455,19 @@ impl ScannerService {
             .iter()
             .filter(|p| p.get("strategy").and_then(|v| v.as_str()) == Some("confluence"))
             .count() as i64;
+        let volume_pump = open
+            .iter()
+            .filter(|p| p.get("strategy").and_then(|v| v.as_str()) == Some("volume_pump"))
+            .count() as i64;
         let risk = self.inner.risk.read().await;
-        let stale_threshold = self.inner.config.risk.ws_stale_sec as i64;
+        let stale_threshold = self.inner_cfg().risk.ws_stale_sec as i64;
         let last_tick = self.inner.last_tick_at.load(Ordering::Relaxed);
         let ws_stale = if last_tick == 0 {
             false // still warming up — not yet considered stale
         } else {
             Utc::now().timestamp() - last_tick > stale_threshold
         };
-        risk.metrics_json(open_n, scalp, confluence, ws_stale)
+        risk.metrics_json(open_n, scalp, confluence, volume_pump, ws_stale)
     }
 
     pub async fn get_symbol_klines(&self, symbol: &str) -> Vec<crate::exchange::KlineBar> {
@@ -406,14 +487,22 @@ impl ScannerService {
             .get_trade_stats(200, Some("confluence"))
             .await
             .unwrap_or_else(|_| json!({}));
+        let pump_stats = self
+            .inner
+            .db
+            .get_trade_stats(200, Some("volume_pump"))
+            .await
+            .unwrap_or_else(|_| json!({}));
         let model = self.inner.ml.lock().await.learning_status();
-        let ml = &self.inner.config.ml;
-        let learning = &self.inner.config.learning;
+        let settings = self.inner_cfg();
+        let ml = &settings.ml;
+        let learning = &settings.learning;
         json!({
             "enabled": learning.enabled,
             "shadow_ml_rejects": learning.shadow_ml_rejects,
             "shadow_near_miss": learning.shadow_near_miss,
             "confluence_trade_stats": conf_stats,
+            "volume_pump_trade_stats": pump_stats,
             "model": model,
             "message": format!(
                 "Continuous learning — trade W/L {:.1}×/{:.1}×, ML rejects {:.2}×, near-miss {:.2}×",
@@ -565,8 +654,9 @@ impl ScannerService {
     pub async fn update_live_secrets(&self, secrets: UserSecrets) {
         self.inner.live.lock().await.update_secrets(secrets.clone());
         // Keep live_monitor client in sync so it can submit closes.
+        let cfg = self.inner_cfg();
         let new_client = crate::exchange::MexcPrivateClient::from_secrets(
-            &self.inner.config.mexc,
+            &cfg.mexc,
             &secrets,
         );
         self.inner.live_monitor.lock().await.update_client(new_client);
@@ -705,6 +795,7 @@ impl ScannerService {
                 let details = json!({
                     "symbol": symbol,
                     "side": side_str.to_uppercase(),
+                    "strategy": pos.get("strategy").and_then(|v| v.as_str()),
                     "exit_price": mark,
                     "pnl": pnl,
                     "reason": reason,
@@ -755,6 +846,10 @@ impl ScannerService {
 }
 
 impl ScannerInner {
+    fn cfg(&self) -> AppConfig {
+        self.config.read().unwrap().clone()
+    }
+
     /// Discover symbols, connect the ticker stream, and spawn the long-lived
     /// loops. Runs in the background so `start()` can return immediately.
     async fn bootstrap_streams(self: Arc<Self>, tasks: Arc<Mutex<Vec<JoinHandle<()>>>>) {
@@ -787,7 +882,8 @@ impl ScannerInner {
             let live = self.live.lock().await;
             if live.has_credentials() {
                 let client = live.private_client();
-                reconcile_on_boot(client, &self.db, &self.config).await;
+                let cfg = self.cfg();
+                reconcile_on_boot(client, &self.db, &cfg).await;
             }
         }
 
@@ -818,7 +914,7 @@ impl ScannerInner {
             let mut guard = tasks.lock().await;
             guard.push(ticker_task);
             guard.push(kline_task);
-            if self.config.learning.enabled {
+            if self.cfg().learning.enabled {
                 let learn_inner = self.clone();
                 let learn_task = tokio::spawn(async move {
                     learn_inner.learning_loop().await;
@@ -836,14 +932,20 @@ impl ScannerInner {
     }
 
     async fn kline_refresh_loop(&self) {
-        let interval = self.config.scanner.kline_interval.clone();
-        let lookback = self.config.scanner.kline_lookback_bars;
         while self.running.load(Ordering::SeqCst) {
+            let cfg = self.cfg();
+            let interval = cfg.scanner.kline_interval.clone();
+            let lookback = cfg.scanner.kline_lookback_bars;
+            let htf_enabled = cfg.confluence.htf_enabled;
+            let htf_interval = cfg.confluence.htf_interval.clone();
+            let htf_lookback = cfg.confluence.htf_lookback_bars;
+            let refresh_sec = cfg.scanner.kline_refresh_sec;
             let symbols = self.tracked_symbols.read().await.clone();
             for symbol in symbols {
                 if !self.running.load(Ordering::SeqCst) {
                     break;
                 }
+                // Primary (Min1) klines
                 match self.exchange.get_klines(&symbol, &interval).await {
                     Ok(mut bars) => {
                         if bars.len() > lookback as usize {
@@ -852,16 +954,29 @@ impl ScannerInner {
                         let mut states = self.states.write().await;
                         let state = states
                             .entry(symbol.clone())
-                            .or_insert_with(|| SymbolState::new(symbol));
+                            .or_insert_with(|| SymbolState::new(symbol.clone()));
                         state.update_klines(bars);
                     }
                     Err(exc) => debug!("Kline refresh {symbol} skipped: {exc}"),
                 }
+                // Higher-timeframe klines for structural bias (15m/30m)
+                if htf_enabled {
+                    match self.exchange.get_klines(&symbol, &htf_interval).await {
+                        Ok(mut bars) => {
+                            if bars.len() > htf_lookback as usize {
+                                bars = bars[bars.len() - htf_lookback as usize..].to_vec();
+                            }
+                            let mut states = self.states.write().await;
+                            if let Some(state) = states.get_mut(&symbol) {
+                                state.update_htf_klines(bars);
+                            }
+                        }
+                        Err(exc) => debug!("HTF kline refresh {symbol} skipped: {exc}"),
+                    }
+                }
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(
-                self.config.scanner.kline_refresh_sec,
-            ))
-            .await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(refresh_sec))
+                .await;
         }
     }
 
@@ -885,7 +1000,8 @@ impl ScannerInner {
             }
             // Also learn from signals that never became trades by replaying them
             // against the price action that followed. Multiplies training data.
-            if self.config.learning.enabled {
+            let learning_enabled = self.config.read().unwrap().learning.enabled;
+            if learning_enabled {
                 let _ = self.resolve_pending_signals_from_price(SIGNAL_RESOLVE_BATCH).await;
             }
         }
@@ -896,7 +1012,7 @@ impl ScannerInner {
     /// position. For each pending signal whose hold window has fully elapsed, we
     /// fetch the klines covering that window and label it win / loss / expired.
     async fn resolve_pending_signals_from_price(&self, max_signals: u32) -> u32 {
-        let max_hold = self.config.confluence.max_hold_sec.max(60) as i64;
+        let max_hold = self.cfg().confluence.max_hold_sec.max(60) as i64;
         let now = Utc::now().timestamp();
         let pending = self.db.get_pending_signals(300).await.unwrap_or_default();
         // 60 one-minute bars before the signal are enough to recompute the full
@@ -990,7 +1106,7 @@ impl ScannerInner {
             let Some((label, won)) = resolve_signal_outcome(&bars, start, side_long, sl, tp) else {
                 continue;
             };
-            let weight = shadow_resolve_weight(&self.config.learning, sig);
+            let weight = shadow_resolve_weight(&self.cfg().learning, sig);
             if self.db.update_signal_outcome(sig_id, label).await.is_ok() {
                 if label == "expired" {
                     self.ml.lock().await.record_outcome_soft(&features, 0.45, 0.3 * weight);
@@ -1078,11 +1194,11 @@ impl ScannerInner {
                 .to_string();
             {
                 let mut risk = self.risk.write().await;
-                let before_ks = risk.metrics_json(0, 0, 0, false)["kill_switch"]
+                let before_ks = risk.metrics_json(0, 0, 0, 0, false)["kill_switch"]
                     .as_bool()
                     .unwrap_or(false);
                 let _ = risk.record_trade_outcome(&symbol, won).await;
-                let after = risk.metrics_json(0, 0, 0, false);
+                let after = risk.metrics_json(0, 0, 0, 0, false);
                 // Fire alert if kill switch was just auto-activated.
                 if !before_ks && after["kill_switch"].as_bool().unwrap_or(false) {
                     self.alerter
@@ -1127,6 +1243,7 @@ impl ScannerInner {
                 let details = json!({
                     "symbol": symbol,
                     "side": side,
+                    "strategy": row.get("strategy").and_then(|v| v.as_str()),
                     "entry_price": entry_price,
                     "exit_price": exit_price,
                     "pnl": pnl,
@@ -1152,7 +1269,7 @@ impl ScannerInner {
                 .map(|arr| arr.iter().filter_map(|x| x.as_f64()).collect())
                 .unwrap_or_default();
             if features.iter().any(|&v| v != 0.0) {
-                let weight = self.config.ml.trade_outcome_weight(won);
+                let weight = self.cfg().ml.trade_outcome_weight(won);
                 self.ml
                     .lock()
                     .await
@@ -1192,8 +1309,8 @@ impl ScannerInner {
             .get_resolved_signals_with_features(1000)
             .await
             .unwrap_or_default();
-        let threshold_pct = self.config.ml.supervised_threshold * 100.0;
-        let hard_gate = self.config.ml.hard_ml_gate;
+        let threshold_pct = self.cfg().ml.supervised_threshold * 100.0;
+        let hard_gate = self.cfg().ml.hard_ml_gate;
         let mut ml = self.ml.lock().await;
         let mut trained = 0u32;
         let mut skipped_pregame = 0u32;
@@ -1226,11 +1343,9 @@ impl ScannerInner {
             // Assign weights mirroring the live training loop.
             let is_real_trade = sig.get("from_trade").and_then(|v| v.as_bool()).unwrap_or(false);
             let weight = if is_real_trade {
-                self.config
-                    .ml
-                    .trade_outcome_weight(outcome == "win")
+                self.cfg().ml.trade_outcome_weight(outcome == "win")
             } else {
-                shadow_resolve_weight(&self.config.learning, sig)
+                shadow_resolve_weight(&self.cfg().learning, sig)
             };
             if outcome == "expired" {
                 ml.record_outcome_soft(&features, 0.45, 0.3 * weight);
@@ -1251,7 +1366,7 @@ impl ScannerInner {
 
     /// Save a signal for shadow-only training (no execution).
     async fn save_shadow_signal(&self, signal: crate::signals::PumpSignal, reject_reason: &str) {
-        let learning = &self.config.learning;
+        let learning = &self.cfg().learning;
         if !learning.enabled {
             return;
         }
@@ -1287,7 +1402,7 @@ impl ScannerInner {
 
         // Dedupe: one shadow per symbol+side within confluence cooldown window.
         let side_long = signal.price_change_pct > 0.0;
-        let cooldown = self.config.confluence.alert_cooldown_sec as i64;
+        let cooldown = self.cfg().confluence.alert_cooldown_sec as i64;
         if let Ok(dup) = self
             .db
             .count_recent_shadow_signals_side(&signal.symbol, side_long, cooldown)
@@ -1327,13 +1442,119 @@ impl ScannerInner {
         }
     }
 
+    async fn refresh_pump_ranks(&self) {
+        let states = self.states.read().await;
+        let tracked = self.tracked_symbols.read().await.clone();
+        let mut scores: Vec<(String, f64)> = Vec::new();
+        for sym in tracked {
+            if let Some(s) = states.get(&sym) {
+                if s.klines.len() >= 20 {
+                    scores.push((sym, turnover_velocity(&s.klines)));
+                }
+            }
+        }
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut ranks = HashMap::new();
+        for (i, (sym, _)) in scores.iter().enumerate() {
+            ranks.insert(sym.clone(), (i + 1) as u32);
+        }
+        *self.pump_ranks.write().await = ranks;
+    }
+
+    async fn process_volume_pump_symbol(&self, symbol: &str, ticker: &TickerSnapshot) {
+        let pump_on = matches!(
+            self.cfg().trading.mode.as_str(),
+            "pump" | "volume_pump" | "both" | "all"
+        ) && self.cfg().pump.enabled;
+        if !pump_on {
+            return;
+        }
+
+        let rank = self.pump_ranks.read().await.get(symbol).copied();
+        let states = self.states.write().await;
+        let state = match states.get(symbol) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if self.volume_pump.in_cooldown(state) {
+            drop(states);
+            return;
+        }
+
+        if state.klines.len() < 10 || state.prices.len() < 6 {
+            drop(states);
+            return;
+        }
+
+        let evaluated = self.volume_pump.evaluate(state, rank, None);
+        let klines = state.klines.clone();
+        drop(states);
+
+        if let Some(signal) = evaluated {
+            let _ = self
+                .db
+                .log_event(
+                    "volume_pump_detected",
+                    &format!("Volume pump setup: {}", signal.symbol),
+                    Some(signal.to_payload()),
+                )
+                .await;
+            let mut ml = self.ml.lock().await;
+            match ml.enhance_signal_outcome(signal, Some(&klines)) {
+                EnhanceOutcome::Tradable(enhanced) => {
+                    drop(ml);
+                    self.emit_signal(enhanced).await;
+                    let mut states = self.states.write().await;
+                    if let Some(s) = states.get_mut(symbol) {
+                        s.last_pump_at = Some(Utc::now());
+                    }
+                }
+                EnhanceOutcome::MlRejected(rejected) => {
+                    drop(ml);
+                    self.save_shadow_signal(rejected, "ml_gate").await;
+                }
+            }
+            return;
+        }
+
+        let diagnosis = {
+            let states = self.states.read().await;
+            states
+                .get(symbol)
+                .map(|s| self.volume_pump.diagnose(s, rank, None))
+                .unwrap_or(ScanDiagnosis {
+                    action: "skipped".into(),
+                    message: "State unavailable".into(),
+                    composite_score: None,
+                    confluence_count: None,
+                    side: None,
+                })
+        };
+        if diagnosis.action == "rejected" || diagnosis.action == "warming" {
+            self.maybe_record_scan(
+                symbol,
+                &diagnosis.action,
+                &format!("[pump] {}", diagnosis.message),
+                diagnosis.composite_score,
+                diagnosis.confluence_count,
+                diagnosis.side.as_deref(),
+                ticker,
+            )
+            .await;
+        }
+    }
+
     async fn process_tickers(&self, tickers: Vec<TickerSnapshot>) {
         // Stamp the last time we received live ticker data for WS-staleness detection.
         self.last_tick_at.store(Utc::now().timestamp(), Ordering::Relaxed);
 
+        self.refresh_pump_ranks().await;
+
+        let app_cfg = self.cfg();
         let tracked: Vec<String> = self.tracked_symbols.read().await.clone();
-        let mode = self.config.trading.mode.clone();
-        let conf_on = matches!(mode.as_str(), "confluence" | "all") && self.config.confluence.enabled;
+        let mode = app_cfg.trading.mode.clone();
+        let conf_on = matches!(mode.as_str(), "confluence" | "all") && app_cfg.confluence.enabled;
 
         for ticker in tickers {
             self.ticker_map
@@ -1352,11 +1573,62 @@ impl ScannerInner {
             state.update_ticker(&ticker);
             state.last_scanned_at = Some(Utc::now());
 
-            if !conf_on {
+            if conf_on {
+            let mut skip_confluence_body = false;
+            // ── Sniper check: poll pending 15m setup for 1m trigger ────────
+            let pending_setup = state.pending_setup.take();
+            if let Some(pending) = pending_setup {
+                let klines_snap = state.klines.clone();
                 drop(states);
-                continue;
+                let sniper_cfg = &app_cfg.sniper;
+                match sniper::check_trigger(&pending, &klines_snap, sniper_cfg) {
+                    TriggerResult::Fire { signal, limit_price: _ } => {
+                        info!(
+                            "[sniper] 1m trigger fired for {} — emitting sniper entry",
+                            signal.symbol
+                        );
+                        let _ = self.db.log_event(
+                            "sniper_triggered",
+                            &format!("Sniper 1m trigger for {}", signal.symbol),
+                            Some(serde_json::json!({
+                                "limit_price": signal.limit_entry_price,
+                                "entry_mode": signal.entry_mode,
+                            })),
+                        ).await;
+                        self.emit_signal(signal).await;
+                        let mut states = self.states.write().await;
+                        if let Some(s) = states.get_mut(&symbol) {
+                            s.last_confluence_at = Some(Utc::now());
+                        }
+                        skip_confluence_body = true;
+                    }
+                    TriggerResult::Expired => {
+                        info!("[sniper] Setup expired for {} without trigger", symbol);
+                        let _ = self.db.log_event(
+                            "sniper_expired",
+                            &format!("Sniper setup expired for {} — no clean 1m trigger", symbol),
+                            None,
+                        ).await;
+                        skip_confluence_body = true;
+                    }
+                    TriggerResult::Waiting => {
+                        let mut states = self.states.write().await;
+                        if let Some(s) = states.get_mut(&symbol) {
+                            s.pending_setup = Some(pending);
+                        }
+                        skip_confluence_body = true;
+                    }
+                }
+            } else {
+                drop(states);
             }
+            // ──────────────────────────────────────────────────────────────
 
+            if !skip_confluence_body {
+            let mut states = self.states.write().await;
+            let state = states
+                .entry(symbol.clone())
+                .or_insert_with(|| SymbolState::new(symbol.clone()));
             if self.confluence.in_cooldown(state) {
                 drop(states);
                 self.maybe_record_scan(
@@ -1369,10 +1641,7 @@ impl ScannerInner {
                     &ticker,
                 )
                 .await;
-                continue;
-            }
-
-            if state.klines.len() < 15 || state.prices.len() < 8 {
+            } else if state.klines.len() < 15 || state.prices.len() < 8 {
                 let klines_n = state.klines.len();
                 let ticks_n = state.prices.len();
                 drop(states);
@@ -1386,16 +1655,14 @@ impl ScannerInner {
                     &ticker,
                 )
                 .await;
-                continue;
-            }
-
+            } else {
             let evaluated = self.confluence.evaluate(state, None, false);
-            let near_miss = if evaluated.is_none() && self.config.learning.shadow_near_miss {
+            let near_miss = if evaluated.is_none() && app_cfg.learning.shadow_near_miss {
                 self.confluence.evaluate_near_miss(
                     state,
                     None,
                     false,
-                    self.config.learning.near_miss_margin,
+                    app_cfg.learning.near_miss_margin,
                 )
             } else {
                 None
@@ -1408,10 +1675,41 @@ impl ScannerInner {
                 match ml.enhance_signal_outcome(signal, Some(&klines)) {
                     EnhanceOutcome::Tradable(enhanced) => {
                         drop(ml);
-                        self.emit_signal(enhanced).await;
-                        let mut states = self.states.write().await;
-                        if let Some(s) = states.get_mut(&symbol) {
-                            s.last_confluence_at = Some(Utc::now());
+                        let entry_mode = &app_cfg.sniper.entry_mode;
+                        if *entry_mode == EntryMode::Sniper {
+                            // Park the HTF-confirmed signal; wait for a 1m trigger
+                            let pending = sniper::record_setup(&enhanced);
+                            info!(
+                                "[sniper] HTF setup confirmed for {} — waiting for 1m trigger",
+                                enhanced.symbol
+                            );
+                            let _ = self.db.log_event(
+                                "sniper_setup_parked",
+                                &format!("15m setup parked for {} — waiting 1m trigger", enhanced.symbol),
+                                Some(serde_json::json!({ "score": enhanced.composite_score })),
+                            ).await;
+                            let mut states = self.states.write().await;
+                            if let Some(s) = states.get_mut(&symbol) {
+                                s.pending_setup = Some(pending);
+                                s.last_confluence_at = Some(Utc::now());
+                            }
+                        } else if *entry_mode == EntryMode::Limit {
+                            // Immediate limit order offset from current price
+                            let mut sig = enhanced.clone();
+                            sig.entry_mode = "limit".to_string();
+                            // limit_entry_price stays 0 → live.rs will apply the offset
+                            self.emit_signal(sig).await;
+                            let mut states = self.states.write().await;
+                            if let Some(s) = states.get_mut(&symbol) {
+                                s.last_confluence_at = Some(Utc::now());
+                            }
+                        } else {
+                            // Market mode — fire immediately (original behaviour)
+                            self.emit_signal(enhanced).await;
+                            let mut states = self.states.write().await;
+                            if let Some(s) = states.get_mut(&symbol) {
+                                s.last_confluence_at = Some(Utc::now());
+                            }
                         }
                     }
                     EnhanceOutcome::MlRejected(rejected) => {
@@ -1419,18 +1717,13 @@ impl ScannerInner {
                         self.save_shadow_signal(rejected, "ml_gate").await;
                     }
                 }
-                continue;
-            }
-
-            if let Some(near) = near_miss {
+            } else if let Some(near) = near_miss {
                 let mut ml = self.ml.lock().await;
                 let enriched = ml.attach_features(near, Some(&klines));
                 drop(ml);
                 self.save_shadow_signal(enriched, "confluence_near_miss")
                     .await;
-                continue;
-            }
-
+            } else {
             let diagnosis = {
                 let states = self.states.read().await;
                 states
@@ -1454,6 +1747,12 @@ impl ScannerInner {
                 &ticker,
             )
             .await;
+            }
+            }
+            }
+            } // conf_on
+
+            self.process_volume_pump_symbol(&symbol, &ticker).await;
         }
 
         let map = self.ticker_map.read().await.clone();
@@ -1549,20 +1848,29 @@ impl ScannerInner {
             )
             .await;
         }
+        let event_type = if signal.strategy == "volume_pump" {
+            "volume_pump_signal"
+        } else {
+            "signal"
+        };
+        let event_msg = if signal.strategy == "volume_pump" {
+            format!(
+                "Volume pump signal: {} score={:.1}",
+                signal.symbol, signal.composite_score
+            )
+        } else {
+            format!(
+                "Confluence signal: {} score={:.1}",
+                signal.symbol, signal.composite_score
+            )
+        };
         let _ = self
             .db
-            .log_event(
-                "signal",
-                &format!(
-                    "Confluence signal: {} score={:.1}",
-                    signal.symbol, signal.composite_score
-                ),
-                Some(payload),
-            )
+            .log_event(event_type, &event_msg, Some(payload))
             .await;
 
         // Gate execution when the WS feed is stale — prices may be stale too.
-        let stale_threshold = self.config.risk.ws_stale_sec as i64;
+        let stale_threshold = self.cfg().risk.ws_stale_sec as i64;
         let last_tick = self.last_tick_at.load(Ordering::Relaxed);
         let ws_stale = last_tick > 0 && Utc::now().timestamp() - last_tick > stale_threshold;
         if ws_stale {
@@ -1616,6 +1924,7 @@ impl ScannerInner {
                 let details = json!({
                     "symbol": signal.symbol,
                     "side": side_str,
+                    "strategy": signal.strategy,
                     "entry_price": entry,
                     "size": size,
                     "leverage": leverage,

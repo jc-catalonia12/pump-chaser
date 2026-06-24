@@ -48,6 +48,18 @@ pub struct PumpSignal {
     /// once the trade resolves. Empty until the ML pipeline enriches the signal.
     #[serde(default)]
     pub ml_features: Vec<f64>,
+    /// How this signal should be entered.
+    /// "market" = immediate market fill, "limit" = passive limit order,
+    /// "sniper" = 1m-triggered limit order after HTF setup confirmation.
+    #[serde(default = "default_entry_mode")]
+    pub entry_mode: String,
+    /// Price for the limit order (set by sniper module; 0.0 = use last_price ± offset).
+    #[serde(default)]
+    pub limit_entry_price: f64,
+}
+
+fn default_entry_mode() -> String {
+    "market".to_string()
 }
 
 impl PumpSignal {
@@ -76,6 +88,8 @@ impl PumpSignal {
             "projected_take_profits": self.projected_take_profits,
             "tp_close_fractions": self.tp_close_fractions,
             "ml_features": self.ml_features,
+            "entry_mode": self.entry_mode,
+            "limit_entry_price": self.limit_entry_price,
         })
     }
 }

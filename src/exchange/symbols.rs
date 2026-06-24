@@ -130,6 +130,10 @@ pub fn parse_contract(raw: &Value) -> ContractInfo {
             .get("minVol")
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0),
+        max_vol: raw
+            .get("maxVol")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
         vol_unit: raw
             .get("volUnit")
             .and_then(|v| v.as_f64())

@@ -39,6 +39,33 @@ function pnlClass(n) {
   return v > 0 ? " positive" : " negative";
 }
 
+function fmtStrategyLabel(strategy) {
+  const s = (strategy || "").toLowerCase();
+  if (s === "confluence") return "Confluence";
+  if (s === "volume_pump") return "Volume Pump";
+  if (s === "scalp") return "Scalp";
+  if (!s) return "—";
+  return s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function fmtEntryModeBadge(entryMode, orderStatus) {
+  const mode = (entryMode || "market").toLowerCase();
+  const status = (orderStatus || "open").toLowerCase();
+  let label = "Market";
+  let cls = "badge-market";
+  if (mode === "limit") {
+    label = "Limit";
+    cls = "badge-limit";
+  } else if (mode === "sniper") {
+    label = "Sniper";
+    cls = "badge-sniper";
+  }
+  if (status === "pending" && (mode === "limit" || mode === "sniper")) {
+    return `<span class="badge ${cls}" title="Resting limit order">${label}</span> <span class="tag tag-warn">pending</span>`;
+  }
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+
 function fmtBuildLabel(health = {}) {
   const parts = [`v${health.version || "?"}`];
   const os = health.build_os || "";
@@ -152,6 +179,267 @@ let settingsSections = [];
 let activityUnreadCount = 0;
 let notificationsOpen = false;
 let markingNotificationsSeen = false;
+
+const TOAST_TRADE_TYPES = new Set([
+  "position_opened",
+  "position_closed",
+  "position_partial_tp",
+  "tp_hit",
+  "cut_loss",
+  "kill_switch",
+  "volume_pump_detected",
+  "volume_pump_signal",
+  "signal",
+]);
+const DEFAULT_TOAST_EVENT_KEYS = [
+  "position_opened",
+  "position_closed",
+  "tp_hit",
+  "cut_loss",
+  "kill_switch",
+];
+const TOAST_MAX_VISIBLE = 5;
+const TOAST_DURATION_MS = 6000;
+let lastToastEventId = 0;
+let toastBaselineSet = false;
+let toastNotificationsEnabled = true;
+let toastEventKeys = new Set(DEFAULT_TOAST_EVENT_KEYS);
+
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function symbolFromTradeMessage(message) {
+  const match = String(message || "").match(/\b([A-Z0-9]+_USDT)\b/);
+  return match ? match[1] : "";
+}
+
+function formatToastPnl(pnl) {
+  if (pnl == null || Number.isNaN(Number(pnl))) return null;
+  const n = Number(pnl);
+  return `${n >= 0 ? "+" : ""}${n.toFixed(2)} USDT`;
+}
+
+function toastFromEvent(event) {
+  const type = (event.event_type || event.type || "").toLowerCase();
+  const payload =
+    event.payload && typeof event.payload === "object" ? event.payload : {};
+  const reason = String(payload.reason || "").toLowerCase();
+  const symbol = payload.symbol || symbolFromTradeMessage(event.message);
+  const pnlStr = formatToastPnl(payload.pnl);
+  const symbolLine = [symbol, pnlStr].filter(Boolean).join(" · ");
+
+  if (type === "kill_switch") {
+    return {
+      title: "Kill Switch",
+      message: event.message || "Trading halted",
+      tone: "danger",
+      iconType: "kill_switch",
+    };
+  }
+
+  if (type === "volume_pump_detected" || type === "volume_pump_signal") {
+    const score = payload.composite_score != null ? ` score ${Number(payload.composite_score).toFixed(1)}` : "";
+    const sym = symbol || symbolFromTradeMessage(event.message);
+    return {
+      title: "Volume Pump",
+      message: [sym, score].filter(Boolean).join(" · ") || event.message || "Volume anomaly",
+      tone: "accent",
+      iconType: type,
+    };
+  }
+
+  if (type === "signal") {
+    const sym = symbol || symbolFromTradeMessage(event.message);
+    return {
+      title: "Confluence Signal",
+      message: sym || event.message || "New setup",
+      tone: "accent",
+      iconType: "signal",
+    };
+  }
+
+  if (type === "position_opened") {
+    let side = String(payload.side || "").toUpperCase();
+    if (!side) {
+      const sideMatch = String(event.message || "").match(/Opened\s+(long|short)\s+/i);
+      if (sideMatch) side = sideMatch[1].toUpperCase();
+    }
+    const sym = symbol || symbolFromTradeMessage(event.message);
+    return {
+      title: "Position Opened",
+      message: [side, sym].filter(Boolean).join(" ") || event.message || "New trade entered",
+      tone: "success",
+      iconType: "position_opened",
+    };
+  }
+
+  if (type === "position_partial_tp" || type === "tp_hit") {
+    const level = payload.level ? `TP${payload.level}` : "Take Profit";
+    return {
+      title: `Partial ${level}`,
+      message: symbolLine || event.message,
+      tone: "success",
+      iconType: "tp_hit",
+    };
+  }
+
+  if (
+    type === "cut_loss" ||
+    (type === "position_closed" &&
+      (reason.includes("stop") || reason === "trailing_stop"))
+  ) {
+    const title = reason === "trailing_stop" ? "Trailing Stop" : "Stop Loss";
+    return {
+      title,
+      message: symbolLine || event.message,
+      tone: "danger",
+      iconType: "cut_loss",
+    };
+  }
+
+  if (type === "position_closed") {
+    if (reason.includes("take_profit") || reason === "take_profit") {
+      return {
+        title: "Take Profit",
+        message: symbolLine || event.message,
+        tone: "success",
+        iconType: "tp_hit",
+      };
+    }
+    const pnl = payload.pnl;
+    return {
+      title: "Position Closed",
+      message: symbolLine || event.message,
+      tone: pnl != null && Number(pnl) < 0 ? "warn" : "neutral",
+      iconType: "position_closed",
+    };
+  }
+
+  return null;
+}
+
+/** Map audit_log rows to the same keys used in Settings → Notify on events. */
+function toastPreferenceKey(event) {
+  const type = (event.event_type || event.type || "").toLowerCase();
+  const payload =
+    event.payload && typeof event.payload === "object" ? event.payload : {};
+  const reason = String(payload.reason || "").toLowerCase();
+  const msg = String(event.message || "").toLowerCase();
+
+  if (type === "position_partial_tp" || type === "tp_hit") return "tp_hit";
+  if (type === "cut_loss") return "cut_loss";
+  if (type === "position_closed") {
+    if (
+      reason.includes("stop") ||
+      reason === "trailing_stop" ||
+      reason.includes("cut") ||
+      msg.includes("stop_loss") ||
+      msg.includes("trailing_stop") ||
+      (msg.includes("stop") && !msg.includes("non-stop"))
+    ) {
+      return "cut_loss";
+    }
+    if (reason.includes("take_profit") || reason.includes("tp") || msg.includes(" tp")) {
+      return "tp_hit";
+    }
+    return "position_closed";
+  }
+  if (type === "kill_switch") return "kill_switch";
+  if (type === "position_opened") return "position_opened";
+  return type;
+}
+
+function applyNotificationPreferences(tg) {
+  if (!tg?.connected) {
+    toastNotificationsEnabled = true;
+    toastEventKeys = new Set(DEFAULT_TOAST_EVENT_KEYS);
+    return;
+  }
+  toastNotificationsEnabled = tg.enabled !== false;
+  const events = Array.isArray(tg.events) ? tg.events : DEFAULT_TOAST_EVENT_KEYS;
+  toastEventKeys = new Set(events.length ? events : DEFAULT_TOAST_EVENT_KEYS);
+}
+
+function isToastEventEnabled(event) {
+  if (!toastNotificationsEnabled) return false;
+  const type = (event.event_type || event.type || "").toLowerCase();
+  if (!TOAST_TRADE_TYPES.has(type)) return false;
+  const pref = toastPreferenceKey(event);
+  if (!DEFAULT_TOAST_EVENT_KEYS.includes(pref)) {
+    // Strategy signals (confluence / volume pump) — always toast when enabled globally.
+    return true;
+  }
+  return toastEventKeys.has(pref);
+}
+
+function dismissToast(el) {
+  if (!el || el.classList.contains("toast-out")) return;
+  el.classList.add("toast-out");
+  el.addEventListener("animationend", () => el.remove(), { once: true });
+}
+
+function showTradeToast({ title, message, tone = "info", iconType = "default", duration = TOAST_DURATION_MS }) {
+  const container = $("#toast-container");
+  if (!container) return;
+
+  while (container.children.length >= TOAST_MAX_VISIBLE) {
+    dismissToast(container.firstElementChild);
+  }
+
+  const toast = document.createElement("div");
+  toast.className = `toast toast-${tone}`;
+  toast.innerHTML = `
+    <div class="toast-icon">${eventIconHtml(iconType)}</div>
+    <div class="toast-body">
+      <strong class="toast-title">${escapeHtml(title)}</strong>
+      ${message ? `<p class="toast-msg">${escapeHtml(message)}</p>` : ""}
+    </div>
+    <button type="button" class="toast-close" aria-label="Dismiss">×</button>
+  `;
+
+  const closeBtn = toast.querySelector(".toast-close");
+  closeBtn?.addEventListener("click", () => dismissToast(toast));
+
+  container.appendChild(toast);
+  if (duration > 0) {
+    setTimeout(() => dismissToast(toast), duration);
+  }
+}
+
+function maybeToastNewEvents(events) {
+  const list = events || [];
+  const maxId = list.reduce((max, e) => Math.max(max, Number(e.id) || 0), 0);
+
+  if (!toastBaselineSet) {
+    // First batch with data becomes the baseline — skip historical rows, toast only newer ids.
+    if (maxId > 0) {
+      lastToastEventId = maxId;
+      toastBaselineSet = true;
+    }
+    return;
+  }
+
+  if (!list.length) return;
+
+  const fresh = list
+    .filter((e) => {
+      const id = Number(e.id) || 0;
+      return id > lastToastEventId && isToastEventEnabled(e);
+    })
+    .sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
+
+  fresh.forEach((e) => {
+    const spec = toastFromEvent(e);
+    if (spec) showTradeToast(spec);
+  });
+
+  if (maxId > lastToastEventId) lastToastEventId = maxId;
+}
 
 function isEventUnread(e) {
   return e && e.seen === false;
@@ -451,8 +739,8 @@ async function saveSettings() {
     showFeedback(
       fb,
       res.scanner_restart_recommended
-        ? "Saved. Stop and start the scanner for strategy changes to fully apply."
-        : "Settings saved to settings.yaml",
+        ? "Saved. Restart the scanner if you changed MEXC API URLs."
+        : "Settings saved and applied live.",
       true,
     );
     if (res.live_trading_enabled != null) {
@@ -509,9 +797,17 @@ function renderMetrics(snapshot) {
   hdrDaily.className = "hmetric-value mono" + pnlClass(daily);
 
   const maxPos = risk.max_positions ?? 5;
+  const openConf = risk.open_confluence_positions ?? 0;
+  const maxConf = risk.max_confluence_positions ?? 1;
+  const openPump = risk.open_volume_pump_positions ?? 0;
+  const maxPump = risk.max_volume_pump_positions ?? 1;
   const posText = `${risk.open_positions ?? 0} / ${maxPos}`;
   $("#m-positions").textContent = posText;
   $("#hdr-positions").textContent = posText;
+  const slotsEl = $("#m-positions-slots");
+  if (slotsEl) {
+    slotsEl.textContent = `Conf ${openConf}/${maxConf} · Pump ${openPump}/${maxPump}`;
+  }
 
   // Aggregate unrealized PnL across the open positions in the snapshot, plus a
   // blended ROI% (total PnL relative to total margin used).
@@ -605,6 +901,7 @@ function renderMetrics(snapshot) {
 function renderActivity(events, unreadCount) {
   window.__lastActivityEvents = events || [];
   if (unreadCount != null) activityUnreadCount = unreadCount;
+  maybeToastNewEvents(events);
   renderNotificationPanel(events);
 }
 
@@ -866,6 +1163,7 @@ function renderPositionsTable(container, positions, { clickable = false } = {}) 
           <th>Lev</th>
           <th>Paper</th>
           <th>Strategy</th>
+          <th>Entry</th>
           ${clickable ? '<th class="col-actions">Actions</th>' : ""}
         </tr>
       </thead>
@@ -881,11 +1179,17 @@ function renderPositionsTable(container, positions, { clickable = false } = {}) 
             const roiSign = roiPct > 0 ? "+" : "";
             const pnlText = `${pnl < 0 ? "-" : pnl > 0 ? "+" : ""}${fmtUsd(Math.abs(pnl))}`;
             const mark = Number(p.mark_price || p.entry_price || 0);
+            const entryMode = p.entry_mode || "market";
+            const orderStatus = p.order_status || "open";
+            const entryTitle =
+              entryMode !== "market" && p.limit_price
+                ? ` title="Limit @ ${Number(p.limit_price).toPrecision(6)}"`
+                : "";
             return `
           <tr ${data}>
             <td><strong>${p.symbol}</strong></td>
             <td><span class="badge ${badge}">${p.side}</span></td>
-            <td>${Number(p.entry_price || 0).toPrecision(6)}</td>
+            <td class="mono"${entryTitle}>${Number(p.entry_price || 0).toPrecision(6)}</td>
             <td class="mono">${mark.toPrecision(6)}</td>
             <td class="mono ${pnlClass(pnl)}">${pnlText}</td>
             <td class="mono ${pnlClass(roiPct)}" title="Price move ${movePct.toFixed(2)}%">${roiSign}${roiPct.toFixed(2)}%</td>
@@ -893,7 +1197,8 @@ function renderPositionsTable(container, positions, { clickable = false } = {}) 
             <td class="mono">${Number(p.stop_loss || 0).toPrecision(6)}</td>
             <td class="mono">${p.leverage ?? "—"}×</td>
             <td>${p.paper ? '<span class="tag">paper</span>' : '<span class="badge badge-live">live</span>'}</td>
-            <td>${p.strategy || "—"}</td>
+            <td>${fmtStrategyLabel(p.strategy)}</td>
+            <td>${fmtEntryModeBadge(entryMode, orderStatus)}</td>
             ${
               clickable
                 ? `<td class="actions-cell">
@@ -1540,6 +1845,8 @@ async function loadReadinessTab() {
         <tr><td>Execution</td><td>${liveMode ? "LIVE" : "PAPER"}</td></tr>
         <tr><td>Max risk / trade</td><td>${Number(risk.max_risk_per_trade_pct || 0).toFixed(2)}%</td></tr>
         <tr><td>Open positions</td><td>${risk.open_positions || 0}/${risk.max_positions || 0}</td></tr>
+        <tr><td>Confluence slots</td><td>${risk.open_confluence_positions ?? 0}/${risk.max_confluence_positions ?? 1}</td></tr>
+        <tr><td>Volume pump slots</td><td>${risk.open_volume_pump_positions ?? 0}/${risk.max_volume_pump_positions ?? 1}</td></tr>
       </tbody></table>`;
 
     renderModelLearning(learning.model || {});
@@ -2607,6 +2914,7 @@ const TG_EVENTS = [
 ];
 
 function renderTelegramState(tg) {
+  applyNotificationPreferences(tg);
   const connected = !!tg?.connected;
   const badge = $("#tg-status-badge");
   const connDiv = $("#tg-connected");
@@ -2707,7 +3015,7 @@ function initTelegramControls() {
     try {
       const res = await apiPut("/user/telegram", { telegram_events: events, telegram_enabled: enabled });
       if (res.error) throw new Error(res.error);
-      showFeedback(fb, "Telegram settings saved", true);
+      showFeedback(fb, "Notification preferences saved", true);
       renderTelegramState(res.telegram);
     } catch (e) {
       showFeedback(fb, e.message, false);
@@ -2739,11 +3047,13 @@ function initTelegramControls() {
   });
 
   $("#tg-toggle-enabled")?.addEventListener("change", async (ev) => {
+    toastNotificationsEnabled = ev.target.checked;
     try {
       const res = await apiPut("/user/telegram", { telegram_enabled: ev.target.checked });
       if (res.error) throw new Error(res.error);
       const label = $("#tg-enabled-label");
       if (label) label.textContent = ev.target.checked ? "Yes" : "No";
+      if (res.telegram) applyNotificationPreferences(res.telegram);
     } catch (e) {
       showFeedback(fb, e.message, false);
     }

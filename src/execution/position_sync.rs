@@ -316,6 +316,7 @@ pub async fn sync_exchange_positions(
     }
 
     let exchange_count = seen_ids.len();
+    let healed = heal_stuck_live_positions(client, db).await;
     json!({
         "exchange_count": exchange_count,
         "imported": imported,
@@ -323,11 +324,80 @@ pub async fn sync_exchange_positions(
         "linked": linked,
         "deduped": deduped,
         "closed": closed,
+        "healed": healed,
         "synced": exchange_count,
         "message": format!(
-            "Synced with MEXC — {exchange_count} on exchange, {imported} imported, {updated} updated, {closed} closed locally"
+            "Synced with MEXC — {exchange_count} on exchange, {imported} imported, {updated} updated, {closed} closed locally, {healed} healed"
         ),
     })
+}
+
+/// Close live DB rows that are still `open` but absent from MEXC (failed rollbacks,
+/// dry-run ghosts, manual exchange closes the sync pass missed).
+pub async fn heal_stuck_live_positions(client: &MexcPrivateClient, db: &Database) -> usize {
+    if !client.has_credentials() {
+        return 0;
+    }
+    let raw_positions = match client.get_open_positions().await {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+
+    let mut seen_symbol_side: HashSet<(String, String)> = HashSet::new();
+    let mut seen_ids: HashSet<i64> = HashSet::new();
+    for raw in &raw_positions {
+        let Some(ep) = parse_exchange_position(raw) else {
+            continue;
+        };
+        seen_ids.insert(ep.exchange_id);
+        seen_symbol_side.insert((ep.symbol.clone(), side_to_str(ep.side).into()));
+    }
+
+    let mut healed = 0usize;
+    let open = db.get_open_positions().await.unwrap_or_default();
+    for pos in &open {
+        if pos.get("paper").and_then(|v| v.as_bool()).unwrap_or(true) {
+            continue;
+        }
+        let symbol = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let side = pos.get("side").and_then(|v| v.as_str()).unwrap_or("long").to_string();
+        let id = pos.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        if id == 0 {
+            continue;
+        }
+
+        let on_exchange = if let Some(exchange_id) = pos.get("exchange_position_id").and_then(|v| v.as_i64()) {
+            seen_ids.contains(&exchange_id)
+        } else {
+            seen_symbol_side.contains(&(symbol.clone(), side.clone()))
+        };
+
+        if on_exchange {
+            continue;
+        }
+
+        let entry_mode = pos
+            .get("entry_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("market");
+        // Resting limit orders are not exchange positions until filled — do not heal them away.
+        if matches!(entry_mode, "limit" | "sniper") {
+            continue;
+        }
+
+        let reason = "phantom_heal";
+        if db.close_position_synced(id, reason).await.is_ok() {
+            let _ = db
+                .log_event(
+                    "exchange_position_closed",
+                    &format!("Healed stuck position not on MEXC: {symbol}"),
+                    Some(json!({ "position_id": id, "reason": reason })),
+                )
+                .await;
+            healed += 1;
+        }
+    }
+    healed
 }
 
 /// Run once at startup to reconcile the local position DB against MEXC.

@@ -13,11 +13,31 @@ impl Database {
         Ok(row.0)
     }
 
+    pub async fn count_open_positions_by_strategy(&self, strategy: &str) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM positions WHERE status IN ('open', 'partial') AND strategy = ?",
+        )
+        .bind(strategy)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(row.0)
+    }
+
+    pub async fn has_open_position_on_symbol(&self, symbol: &str) -> Result<bool> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM positions WHERE status IN ('open', 'partial') AND symbol = ?",
+        )
+        .bind(symbol)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(row.0 > 0)
+    }
+
     pub async fn get_open_positions(&self) -> Result<Vec<Value>> {
         let rows = sqlx::query(
             "SELECT id, symbol, side, entry_price, size, remaining_size, stop_loss, status, \
              opened_at, realized_pnl, paper, strategy, leverage, signal_id, \
-             exchange_position_id, source \
+             exchange_position_id, source, entry_mode, limit_price \
              FROM positions WHERE status IN ('open', 'partial') ORDER BY opened_at DESC",
         )
         .fetch_all(self.pool())
@@ -29,7 +49,7 @@ impl Database {
         let row = sqlx::query(
             "SELECT id, symbol, side, entry_price, size, remaining_size, stop_loss, status, \
              opened_at, realized_pnl, paper, strategy, leverage, signal_id, \
-             exchange_position_id, source \
+             exchange_position_id, source, entry_mode, limit_price \
              FROM positions WHERE exchange_position_id = ? AND status IN ('open', 'partial') LIMIT 1",
         )
         .bind(exchange_id)
@@ -49,7 +69,7 @@ impl Database {
                 sqlx::query(
                     "SELECT id, symbol, side, entry_price, size, remaining_size, stop_loss, status, \
                      opened_at, realized_pnl, paper, strategy, leverage, signal_id, \
-                     exchange_position_id, source \
+                     exchange_position_id, source, entry_mode, limit_price \
                      FROM positions WHERE symbol = ? AND side = ? AND source = ? \
                      AND status IN ('open', 'partial') ORDER BY id DESC LIMIT 1",
                 )
@@ -63,7 +83,7 @@ impl Database {
                 sqlx::query(
                     "SELECT id, symbol, side, entry_price, size, remaining_size, stop_loss, status, \
                      opened_at, realized_pnl, paper, strategy, leverage, signal_id, \
-                     exchange_position_id, source \
+                     exchange_position_id, source, entry_mode, limit_price \
                      FROM positions WHERE symbol = ? AND side = ? \
                      AND status IN ('open', 'partial') ORDER BY id DESC LIMIT 1",
                 )
@@ -80,7 +100,8 @@ impl Database {
         let row = sqlx::query(
             "SELECT id, symbol, side, entry_price, size, remaining_size, stop_loss, status, \
              opened_at, closed_at, realized_pnl, paper, strategy, leverage, signal_id, \
-             exchange_position_id, source, exit_price, exit_reason, take_profit_levels \
+             exchange_position_id, source, exit_price, exit_reason, take_profit_levels, \
+             entry_mode, limit_price \
              FROM positions WHERE id = ?",
         )
         .bind(position_id)
@@ -235,11 +256,13 @@ impl Database {
         strategy: &str,
         leverage: i64,
         signal_id: Option<i64>,
+        entry_mode: &str,
+        limit_price: Option<f64>,
     ) -> Result<i64> {
         let now = chrono::Utc::now().to_rfc3339();
         let result = sqlx::query(
-            "INSERT INTO positions (symbol, side, entry_price, size, remaining_size, stop_loss, status, opened_at, paper, strategy, leverage, signal_id) \
-             VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
+            "INSERT INTO positions (symbol, side, entry_price, size, remaining_size, stop_loss, status, opened_at, paper, strategy, leverage, signal_id, entry_mode, limit_price) \
+             VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(symbol)
         .bind(side)
@@ -252,6 +275,8 @@ impl Database {
         .bind(strategy)
         .bind(leverage)
         .bind(signal_id)
+        .bind(entry_mode)
+        .bind(limit_price)
         .execute(self.pool())
         .await?;
         Ok(result.last_insert_rowid())
@@ -539,6 +564,12 @@ fn position_row(row: &sqlx::sqlite::SqliteRow) -> Value {
         "unrealized_pnl": 0.0,
         "unrealized_pnl_pct": 0.0,
         "strategy": row.try_get::<String, _>("strategy").unwrap_or_else(|_| "confluence".into()),
+        "entry_mode": row
+            .try_get::<Option<String>, _>("entry_mode")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "market".into()),
+        "limit_price": row.try_get::<Option<f64>, _>("limit_price").ok().flatten(),
         "paper": row.try_get::<i64, _>("paper").unwrap_or(1) != 0,
         "leverage": row.try_get::<Option<i64>, _>("leverage").ok().flatten(),
         "signal_id": row.try_get::<Option<i64>, _>("signal_id").ok().flatten(),
