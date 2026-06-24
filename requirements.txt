@@ -1,0 +1,6 @@
+# Optional Python tooling — ONNX export from signal history (scripts/export_onnx.py).
+# Runtime trading bot is Rust-only; install only if you use the export script.
+scikit-learn>=1.4,<2
+skl2onnx>=1.16,<2
+onnx>=1.15,<2
+onnxruntime>=1.17,<2

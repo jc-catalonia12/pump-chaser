@@ -1,0 +1,14 @@
+/target/
+/data/*.db
+/data/*.db-*
+/data/secrets.json
+/release-assets/models/*
+!/release-assets/models/.gitkeep
+/dist/
+.env
+*.log
+.DS_Store
+venv/
+.venv/
+__pycache__/
+*.pyc

@@ -1,0 +1,68 @@
+[workspace]
+members = [".", "desktop/src-tauri"]
+default-members = ["desktop/src-tauri"]
+resolver = "2"
+
+[package]
+name = "mexc-trading-bot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+build = "build.rs"
+description = "MEXC Trading Bot — high-performance futures scanner, risk, and execution (Rust migration)"
+license = "MIT"
+authors = ["MEXC Trading Bot Contributors"]
+default-run = "mexc-trading-bot"
+
+[[bin]]
+name = "mexc-trading-bot"
+path = "src/main.rs"
+
+[lib]
+name = "mexc_trading_bot"
+path = "src/lib.rs"
+
+[features]
+default = ["onnx"]
+ml-python = ["pyo3"]
+onnx = ["dep:ort", "dep:ndarray"]
+
+[dependencies]
+axum = { version = "0.7", features = ["ws", "macros"] }
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls"], default-features = false }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1.35", features = ["serde-float"] }
+thiserror = "2.0"
+anyhow = "1.0"
+figment = { version = "0.10", features = ["yaml", "env"] }
+ta = "0.5"
+futures-util = "0.3"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+dirs = "6"
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"], optional = true }
+ndarray = { version = "0.17", optional = true }
+
+# Optional: Python ML training bridge (Phase 1 Step 3)
+pyo3 = { version = "0.23", features = ["auto-initialize"], optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.14"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

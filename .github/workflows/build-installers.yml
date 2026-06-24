@@ -1,0 +1,96 @@
+name: Build installers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+concurrency:
+  group: build-installers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ONNX_PATH: data/models/supervised.onnx
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore ML models from secrets
+        if: ${{ !hashFiles('data/models/supervised.onnx') }}
+        env:
+          SUPERVISED_ONNX_B64: ${{ secrets.SUPERVISED_ONNX_B64 }}
+          ONLINE_MODEL_JSON_B64: ${{ secrets.ONLINE_MODEL_JSON_B64 }}
+        run: |
+          if [ -z "$SUPERVISED_ONNX_B64" ]; then
+            echo "::error::Missing data/models/supervised.onnx in repo. Commit the file or set repository secret SUPERVISED_ONNX_B64 (base64-encoded supervised.onnx)."
+            exit 1
+          fi
+          mkdir -p data/models
+          echo "$SUPERVISED_ONNX_B64" | base64 --decode > "$ONNX_PATH"
+          if [ -n "$ONLINE_MODEL_JSON_B64" ]; then
+            echo "$ONLINE_MODEL_JSON_B64" | base64 --decode > data/models/online_model.json
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Build macOS installer
+        run: bash scripts/build_installers.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          if-no-files-found: error
+          path: dist/macos/**
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore ML models from secrets
+        if: ${{ !hashFiles('data/models/supervised.onnx') }}
+        env:
+          SUPERVISED_ONNX_B64: ${{ secrets.SUPERVISED_ONNX_B64 }}
+          ONLINE_MODEL_JSON_B64: ${{ secrets.ONLINE_MODEL_JSON_B64 }}
+        shell: pwsh
+        run: |
+          if (-not $env:SUPERVISED_ONNX_B64) {
+            Write-Error "Missing data/models/supervised.onnx in repo. Commit the file or set repository secret SUPERVISED_ONNX_B64 (base64-encoded supervised.onnx)."
+          }
+          New-Item -ItemType Directory -Force -Path "data/models" | Out-Null
+          [IO.File]::WriteAllBytes($env:ONNX_PATH, [Convert]::FromBase64String($env:SUPERVISED_ONNX_B64))
+          if ($env:ONLINE_MODEL_JSON_B64) {
+            [IO.File]::WriteAllBytes(
+              "data/models/online_model.json",
+              [Convert]::FromBase64String($env:ONLINE_MODEL_JSON_B64)
+            )
+          }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: .\scripts\build_installers.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          if-no-files-found: error
+          path: dist/windows/**

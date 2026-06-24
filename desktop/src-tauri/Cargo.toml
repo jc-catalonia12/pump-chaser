@@ -1,0 +1,18 @@
+[package]
+name = "mexc-trading-bot-desktop"
+version = "0.1.0"
+description = "MEXC Trading Bot — Tauri desktop shell"
+edition = "2021"
+rust-version = "1.85"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+mexc-trading-bot = { path = "../.." }
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[[bin]]
+name = "mexc-trading-bot-desktop"
+path = "src/main.rs"
