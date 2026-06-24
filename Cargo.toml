@@ -5,7 +5,7 @@ resolver = "2"
 
 [package]
 name = "mexc-trading-bot"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.85"
 build = "build.rs"

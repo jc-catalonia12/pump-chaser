@@ -15,6 +15,8 @@ const BUNDLED_DATA_REL: &str = "release-assets/data";
 const BUNDLED_MANIFEST_REL: &str = "release-assets/seed.manifest";
 const APPLIED_MANIFEST_NAME: &str = ".bundled_seed.json";
 const SEED_DB_NAME: &str = "mexc_trading_bot.db";
+/// Matches `config/settings.yaml` → `data/models/` (same as [`resolve_data_path`]).
+const USER_MODELS_REL: &str = "data/models";
 
 /// Tauri bundles `../../config` as `Resources/_up_/_up_/config`. Search common layouts.
 fn find_resource_root_in_dir(base: &Path) -> Option<PathBuf> {
@@ -161,7 +163,7 @@ fn setup_packaged_paths() {
     let _ = fs::create_dir_all(&data_dir);
     let _ = fs::create_dir_all(data_dir.join("config"));
     let _ = fs::create_dir_all(data_dir.join("data"));
-    let _ = fs::create_dir_all(data_dir.join("models"));
+    let _ = fs::create_dir_all(user_models_dir(&data_dir));
 
     std::env::set_var("MEXC_BOT_DATA_DIR", data_dir.display().to_string());
     std::env::set_var(
@@ -172,6 +174,7 @@ fn setup_packaged_paths() {
     if let Some(resource) = discover_resource_root() {
         std::env::set_var("MEXC_BOT_RESOURCE_DIR", resource.display().to_string());
         apply_bundled_seed(&resource, &data_dir);
+        migrate_legacy_models(&data_dir);
     }
 
     let user_config = data_dir.join(CONFIG_REL);
@@ -251,7 +254,7 @@ fn apply_bundled_seed(resource_root: &Path, data_dir: &Path) {
             != Some(bundled.supervised_onnx_sha256.as_str())
     {
         let src = resource_root.join(BUNDLED_MODELS_REL).join("supervised.onnx");
-        let dst = data_dir.join("models").join("supervised.onnx");
+        let dst = user_models_dir(data_dir).join("supervised.onnx");
         if model_should_reseed(
             &dst,
             applied.as_ref().map(|a| a.supervised_onnx_sha256.as_str()),
@@ -276,7 +279,7 @@ fn apply_bundled_seed(resource_root: &Path, data_dir: &Path) {
         let src = resource_root
             .join(BUNDLED_MODELS_REL)
             .join("online_model.json");
-        let dst = data_dir.join("models").join("online_model.json");
+        let dst = user_models_dir(data_dir).join("online_model.json");
         if model_should_reseed(
             &dst,
             applied.as_ref().map(|a| a.online_model_sha256.as_str()),
@@ -433,9 +436,38 @@ fn remove_sqlite_sidecars(db_path: &Path) {
     let _ = fs::remove_file(format!("{path}-shm"));
 }
 
+/// User-writable ML model directory — `data/models/` under the app data root.
+fn user_models_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(USER_MODELS_REL)
+}
+
+/// Move models seeded by older installers (`<app_data>/models/`) into `data/models/`.
+fn migrate_legacy_models(data_dir: &Path) {
+    let legacy = data_dir.join("models");
+    let current = user_models_dir(data_dir);
+    let _ = fs::create_dir_all(&current);
+    if !legacy.is_dir() {
+        return;
+    }
+    for name in ["supervised.onnx", "online_model.json"] {
+        let from = legacy.join(name);
+        let to = current.join(name);
+        if !from.is_file() || to.is_file() {
+            continue;
+        }
+        if fs::copy(&from, &to).is_ok() {
+            tracing::info!(
+                "Migrated legacy model {} → {}",
+                from.display(),
+                to.display()
+            );
+        }
+    }
+}
+
 /// Copy bundled ONNX / online model files when missing (legacy installers without manifest).
 fn seed_bundled_models_legacy(resource_root: &Path, data_dir: &Path) {
-    let user_models = data_dir.join("models");
+    let user_models = user_models_dir(data_dir);
     let _ = fs::create_dir_all(&user_models);
 
     let bundled = resource_root.join(BUNDLED_MODELS_REL);
