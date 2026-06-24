@@ -12,6 +12,7 @@ tauri-build = { version = "2", features = [] }
 mexc-trading-bot = { path = "../.." }
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+url = "2"
 
 [[bin]]
 name = "mexc-trading-bot-desktop"

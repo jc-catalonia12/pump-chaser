@@ -94,17 +94,45 @@ pub fn app_data_dir() -> PathBuf {
         .join(APP_DIR_NAME)
 }
 
-/// True when running from a Tauri `.app` / `resources/` install (not `cargo run` from source).
+/// Candidate folders that may contain bundled `config/settings.yaml`.
+fn packaged_resource_search_roots(exe: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let Some(parent) = exe.parent() else {
+        return roots;
+    };
+    if parent.ends_with("MacOS") {
+        if let Some(contents) = parent.parent() {
+            roots.push(contents.join("Resources"));
+        }
+    }
+    // Tauri v2 Windows: bundled files live next to the executable (`_up_/_up_/…`).
+    roots.push(parent.to_path_buf());
+    // Linux / legacy layouts.
+    roots.push(parent.join("resources"));
+    roots
+}
+
+/// Running `cargo run` / `cargo tauri dev` from the repo (not an installed bundle).
+fn is_dev_source_tree() -> bool {
+    discover_project_root()
+        .is_some_and(|root| root.join("desktop/src-tauri/Cargo.toml").is_file())
+}
+
+/// True when running from a Tauri installer (not `cargo run` from source).
 pub fn is_packaged_install() -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    let path = exe.to_string_lossy();
-    if path.contains(".app/Contents/MacOS/") {
+    if exe.to_string_lossy().contains(".app/Contents/MacOS/") {
         return true;
     }
-    if let Some(parent) = exe.parent() {
-        return find_resource_root_in_dir(&parent.join("resources")).is_some();
+    if is_dev_source_tree() {
+        return false;
+    }
+    for base in packaged_resource_search_roots(&exe) {
+        if find_resource_root_in_dir(&base).is_some() {
+            return true;
+        }
     }
     false
 }
@@ -119,24 +147,31 @@ pub fn discover_resource_root() -> Option<PathBuf> {
     }
 
     let exe = std::env::current_exe().ok()?;
-
-    // macOS: App.app/Contents/MacOS/exe → Contents/Resources/
-    if let Some(parent) = exe.parent() {
-        let macos = parent.parent()?.join("Resources");
-        if let Some(root) = find_resource_root_in_dir(&macos) {
-            return Some(root);
-        }
-    }
-
-    // Windows / Linux: resources/ next to the executable
-    if let Some(parent) = exe.parent() {
-        let win = parent.join("resources");
-        if let Some(root) = find_resource_root_in_dir(&win) {
+    for base in packaged_resource_search_roots(&exe) {
+        if let Some(root) = find_resource_root_in_dir(&base) {
             return Some(root);
         }
     }
 
     None
+}
+
+/// Append a line to `%LOCALAPPDATA%/MEXC Trading Bot/startup.log` (desktop diagnostics).
+pub fn append_startup_log(message: &str) {
+    let log_path = app_data_dir().join("startup.log");
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    let line = format!("[{ts}] {message}\n");
+    use std::io::Write;
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 /// Prepare paths before config/secrets load. Safe to call in dev and packaged builds.

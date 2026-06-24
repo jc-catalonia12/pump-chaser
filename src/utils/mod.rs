@@ -6,7 +6,7 @@ pub mod time;
 
 pub use alerts::Alerter;
 pub use paths::{
-    app_data_dir, app_icon_path, discover_project_root, init_runtime_paths,
+    append_startup_log, app_data_dir, app_icon_path, discover_project_root, init_runtime_paths,
     init_working_directory, is_packaged_install, normalize_config_paths, resolve_data_path,
     web_assets_dir,
 };

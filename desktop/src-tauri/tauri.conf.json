@@ -10,11 +10,23 @@
   "app": {
     "windows": [
       {
+        "label": "splash",
+        "title": "MEXC Trading Bot",
+        "width": 440,
+        "height": 320,
+        "center": true,
+        "resizable": false,
+        "maximizable": false,
+        "url": "splash.html",
+        "devtools": false
+      },
+      {
         "label": "main",
         "title": "MEXC Trading Bot",
         "width": 1320,
         "height": 900,
-        "url": "http://127.0.0.1:8001",
+        "visible": false,
+        "url": "about:blank",
         "devtools": false
       }
     ],
