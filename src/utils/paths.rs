@@ -3,10 +3,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
 const CONFIG_REL: &str = "config/settings.yaml";
 const APP_DIR_NAME: &str = "MEXC Trading Bot";
 /// Bundled ML models copied into the installer via `release-assets/models/`.
 const BUNDLED_MODELS_REL: &str = "release-assets/models";
+/// Bundled seed database (signals, training history) via `release-assets/data/`.
+const BUNDLED_DATA_REL: &str = "release-assets/data";
+const BUNDLED_MANIFEST_REL: &str = "release-assets/seed.manifest";
+const APPLIED_MANIFEST_NAME: &str = ".bundled_seed.json";
+const SEED_DB_NAME: &str = "mexc_trading_bot.db";
 
 /// Tauri bundles `../../config` as `Resources/_up_/_up_/config`. Search common layouts.
 fn find_resource_root_in_dir(base: &Path) -> Option<PathBuf> {
@@ -152,6 +160,7 @@ fn setup_packaged_paths() {
     let data_dir = app_data_dir();
     let _ = fs::create_dir_all(&data_dir);
     let _ = fs::create_dir_all(data_dir.join("config"));
+    let _ = fs::create_dir_all(data_dir.join("data"));
     let _ = fs::create_dir_all(data_dir.join("models"));
 
     std::env::set_var("MEXC_BOT_DATA_DIR", data_dir.display().to_string());
@@ -160,33 +169,272 @@ fn setup_packaged_paths() {
         data_dir.join("secrets.json").display().to_string(),
     );
 
+    if let Some(resource) = discover_resource_root() {
+        std::env::set_var("MEXC_BOT_RESOURCE_DIR", resource.display().to_string());
+        apply_bundled_seed(&resource, &data_dir);
+    }
+
+    let user_config = data_dir.join(CONFIG_REL);
+    std::env::set_var("MEXC_BOT_CONFIG", user_config.display().to_string());
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SeedManifest {
+    #[serde(default)]
+    settings_sha256: String,
+    #[serde(default)]
+    db_sha256: String,
+    #[serde(default)]
+    supervised_onnx_sha256: String,
+    #[serde(default)]
+    online_model_sha256: String,
+}
+
+/// Sync bundled dev settings, training DB, and models when the installer seed manifest changes.
+fn apply_bundled_seed(resource_root: &Path, data_dir: &Path) {
+    let manifest_path = resource_root.join(BUNDLED_MANIFEST_REL);
+    let Some(bundled) = load_seed_manifest(&manifest_path) else {
+        apply_bundled_seed_legacy(resource_root, data_dir);
+        return;
+    };
+
+    let applied = load_applied_manifest(data_dir);
+    let mut next_applied = bundled.clone();
+
+    // Settings — always refresh when the installer ships a new dev config.
+    if applied
+        .as_ref()
+        .map(|a| a.settings_sha256.as_str())
+        != Some(bundled.settings_sha256.as_str())
+    {
+        let src = resource_root.join(CONFIG_REL);
+        let dst = data_dir.join(CONFIG_REL);
+        if copy_seed_file(&src, &dst) {
+            tracing::info!("Seeded bundled settings → {}", dst.display());
+        } else {
+            next_applied.settings_sha256 = applied
+                .as_ref()
+                .map(|a| a.settings_sha256.clone())
+                .unwrap_or_default();
+        }
+    }
+
+    // Training database — seed on first install, replace placeholders, or refresh our last seed.
+    if !bundled.db_sha256.is_empty()
+        && applied.as_ref().map(|a| a.db_sha256.as_str()) != Some(bundled.db_sha256.as_str())
+    {
+        let src = resource_root.join(BUNDLED_DATA_REL).join(SEED_DB_NAME);
+        let dst = data_dir.join("data").join(SEED_DB_NAME);
+        if database_should_reseed(&dst, &src, applied.as_ref(), &bundled) {
+            remove_sqlite_sidecars(&dst);
+            if copy_seed_file(&src, &dst) {
+                tracing::info!("Seeded bundled database → {}", dst.display());
+            } else {
+                next_applied.db_sha256 = applied
+                    .as_ref()
+                    .map(|a| a.db_sha256.clone())
+                    .unwrap_or_default();
+            }
+        } else {
+            next_applied.db_sha256 = applied
+                .as_ref()
+                .map(|a| a.db_sha256.clone())
+                .unwrap_or_default();
+        }
+    }
+
+    // ML models — refresh when the installer ships new weights.
+    if !bundled.supervised_onnx_sha256.is_empty()
+        && applied
+            .as_ref()
+            .map(|a| a.supervised_onnx_sha256.as_str())
+            != Some(bundled.supervised_onnx_sha256.as_str())
+    {
+        let src = resource_root.join(BUNDLED_MODELS_REL).join("supervised.onnx");
+        let dst = data_dir.join("models").join("supervised.onnx");
+        if model_should_reseed(
+            &dst,
+            applied.as_ref().map(|a| a.supervised_onnx_sha256.as_str()),
+            &bundled.supervised_onnx_sha256,
+        ) && copy_seed_file(&src, &dst)
+        {
+            tracing::info!("Seeded bundled model → {}", dst.display());
+        } else {
+            next_applied.supervised_onnx_sha256 = applied
+                .as_ref()
+                .map(|a| a.supervised_onnx_sha256.clone())
+                .unwrap_or_default();
+        }
+    }
+
+    if !bundled.online_model_sha256.is_empty()
+        && applied
+            .as_ref()
+            .map(|a| a.online_model_sha256.as_str())
+            != Some(bundled.online_model_sha256.as_str())
+    {
+        let src = resource_root
+            .join(BUNDLED_MODELS_REL)
+            .join("online_model.json");
+        let dst = data_dir.join("models").join("online_model.json");
+        if model_should_reseed(
+            &dst,
+            applied.as_ref().map(|a| a.online_model_sha256.as_str()),
+            &bundled.online_model_sha256,
+        ) && copy_seed_file(&src, &dst)
+        {
+            tracing::info!("Seeded bundled model → {}", dst.display());
+        } else {
+            next_applied.online_model_sha256 = applied
+                .as_ref()
+                .map(|a| a.online_model_sha256.clone())
+                .unwrap_or_default();
+        }
+    }
+
+    let _ = save_applied_manifest(data_dir, &next_applied);
+}
+
+fn apply_bundled_seed_legacy(resource_root: &Path, data_dir: &Path) {
     let user_config = data_dir.join(CONFIG_REL);
     if !user_config.is_file() {
-        if let Some(resource) = discover_resource_root() {
-            std::env::set_var("MEXC_BOT_RESOURCE_DIR", resource.display().to_string());
-            let bundled = resource.join(CONFIG_REL);
-            if bundled.is_file() {
-                let _ = fs::copy(&bundled, &user_config);
-            }
-        }
+        let bundled = resource_root.join(CONFIG_REL);
+        let _ = copy_seed_file(&bundled, &user_config);
+    }
+    seed_bundled_database(resource_root, data_dir, None, None);
+    seed_bundled_models_legacy(resource_root, data_dir);
+}
+
+fn load_seed_manifest(path: &Path) -> Option<SeedManifest> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn load_applied_manifest(data_dir: &Path) -> Option<SeedManifest> {
+    load_seed_manifest(&data_dir.join(APPLIED_MANIFEST_NAME))
+}
+
+fn save_applied_manifest(data_dir: &Path, manifest: &SeedManifest) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(manifest).unwrap_or_default();
+    fs::write(data_dir.join(APPLIED_MANIFEST_NAME), json)
+}
+
+fn file_sha256(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(hex::encode(Sha256::digest(bytes)))
+}
+
+fn copy_seed_file(src: &Path, dst: &Path) -> bool {
+    if !src.is_file() {
+        return false;
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::copy(src, dst).is_ok()
+}
+
+fn model_should_reseed(dst: &Path, applied_hash: Option<&str>, bundled_hash: &str) -> bool {
+    if !dst.is_file() {
+        return true;
+    }
+    let Some(dst_hash) = file_sha256(dst) else {
+        return false;
+    };
+    if dst_hash == bundled_hash {
+        return false;
+    }
+    applied_hash.is_none_or(|hash| dst_hash == hash)
+}
+
+fn database_should_reseed(
+    dst: &Path,
+    src: &Path,
+    applied: Option<&SeedManifest>,
+    bundled: &SeedManifest,
+) -> bool {
+    if !src.is_file() {
+        return false;
+    }
+    if !dst.is_file() {
+        return true;
+    }
+    if database_needs_seed(dst, src) {
+        return true;
+    }
+    let Some(dst_hash) = file_sha256(dst) else {
+        return false;
+    };
+    if dst_hash == bundled.db_sha256 {
+        return false;
+    }
+    if let Some(applied) = applied {
+        return dst_hash == applied.db_sha256;
+    }
+    false
+}
+
+/// Copy bundled seed SQLite into the user data folder on first launch.
+fn seed_bundled_database(
+    resource_root: &Path,
+    data_dir: &Path,
+    applied: Option<&SeedManifest>,
+    bundled: Option<&SeedManifest>,
+) {
+    let user_data = data_dir.join("data");
+    let _ = fs::create_dir_all(&user_data);
+    let dst = user_data.join(SEED_DB_NAME);
+
+    let src = resource_root.join(BUNDLED_DATA_REL).join(SEED_DB_NAME);
+    if !src.is_file() {
+        return;
     }
 
-    std::env::set_var("MEXC_BOT_CONFIG", user_config.display().to_string());
+    let should_seed = if let Some(bundled) = bundled {
+        database_should_reseed(&dst, &src, applied, bundled)
+    } else if dst.is_file() {
+        database_needs_seed(&dst, &src)
+    } else {
+        true
+    };
 
-    if std::env::var("MEXC_BOT_RESOURCE_DIR").is_err() {
-        if let Some(resource) = discover_resource_root() {
-            std::env::set_var("MEXC_BOT_RESOURCE_DIR", resource.display().to_string());
-        }
+    if !should_seed {
+        return;
     }
 
-    if let Some(resource) = discover_resource_root() {
-        seed_bundled_models(&resource, &data_dir);
+    remove_sqlite_sidecars(&dst);
+    if copy_seed_file(&src, &dst) {
+        tracing::info!(
+            "Seeded bundled database {} → {}",
+            src.display(),
+            dst.display()
+        );
     }
 }
 
-/// Copy bundled ONNX / online model files into the user data folder on first launch.
-/// Skips files that already exist so user-trained models are never overwritten.
-fn seed_bundled_models(resource_root: &Path, data_dir: &Path) {
+/// True when the destination is missing or still the empty shell from a prior install.
+fn database_needs_seed(dst: &Path, src: &Path) -> bool {
+    if !dst.is_file() {
+        return true;
+    }
+    let Ok(dst_len) = fs::metadata(dst).map(|m| m.len()) else {
+        return false;
+    };
+    let Ok(src_len) = fs::metadata(src).map(|m| m.len()) else {
+        return false;
+    };
+    // Placeholder DB from a fresh/empty install is tiny; bundled training DB is much larger.
+    src_len > 100_000 && dst_len < 65_536
+}
+
+fn remove_sqlite_sidecars(db_path: &Path) {
+    let path = db_path.to_string_lossy();
+    let _ = fs::remove_file(format!("{path}-wal"));
+    let _ = fs::remove_file(format!("{path}-shm"));
+}
+
+/// Copy bundled ONNX / online model files when missing (legacy installers without manifest).
+fn seed_bundled_models_legacy(resource_root: &Path, data_dir: &Path) {
     let user_models = data_dir.join("models");
     let _ = fs::create_dir_all(&user_models);
 

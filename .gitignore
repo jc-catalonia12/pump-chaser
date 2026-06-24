@@ -4,6 +4,9 @@
 /data/secrets.json
 /release-assets/models/*
 !/release-assets/models/.gitkeep
+/release-assets/data/*
+!/release-assets/data/.gitkeep
+/release-assets/seed.manifest
 /dist/
 .env
 *.log

@@ -1,0 +1,10 @@
+/Users/jccatalonia/Documents/backup/web/projects/mexc-trading-bot-rust/desktop/src-tauri/target/release/deps/litemap-01fb86a99bf31103.d: /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/lib.rs /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/map.rs /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/store/mod.rs /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/store/slice_impl.rs
+
+/Users/jccatalonia/Documents/backup/web/projects/mexc-trading-bot-rust/desktop/src-tauri/target/release/deps/liblitemap-01fb86a99bf31103.rlib: /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/lib.rs /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/map.rs /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/store/mod.rs /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/store/slice_impl.rs
+
+/Users/jccatalonia/Documents/backup/web/projects/mexc-trading-bot-rust/desktop/src-tauri/target/release/deps/liblitemap-01fb86a99bf31103.rmeta: /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/lib.rs /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/map.rs /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/store/mod.rs /Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/store/slice_impl.rs
+
+/Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/lib.rs:
+/Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/map.rs:
+/Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/store/mod.rs:
+/Users/jccatalonia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.2/src/store/slice_impl.rs:

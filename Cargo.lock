@@ -2230,7 +2230,7 @@ dependencies = [
 
 [[package]]
 name = "mexc-trading-bot"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -2265,7 +2265,7 @@ dependencies = [
 
 [[package]]
 name = "mexc-trading-bot-desktop"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "mexc-trading-bot",
  "tauri",

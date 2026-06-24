@@ -1,0 +1,6 @@
+{
+  "settings_sha256": "da8232c0d4fdbf5332a71bcff2993d1f2bab182c566ca2981005c5885bb14a75",
+  "db_sha256": "1cf114d6c5bbfd8f2e41539e0b719d1337a6927c6426d26cc2dce486ddc3a0bc",
+  "supervised_onnx_sha256": "f03b674d3521d83ec79042c21ef355eb9367f2c56e4c515ddb0f7ba8cef4048f",
+  "online_model_sha256": "c475ed62612b1e38fcc9b202bf16b3f0a87d4814edee91734973dbc404780975"
+}
