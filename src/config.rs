@@ -778,14 +778,54 @@ pub struct PumpConfig {
     pub min_profit_usdt: f64,
     #[serde(default = "default_pump_risk_pct")]
     pub max_risk_per_trade: f64,
+    /// Two-phase flow: volume surge arms setup, confirmation gates fire entry.
+    #[serde(default = "default_true")]
+    pub confirmation_enabled: bool,
+    #[serde(default = "default_pump_confirm_ttl")]
+    pub confirmation_ttl_sec: u64,
+    #[serde(default = "default_true")]
+    pub require_breakout_or_shift: bool,
+    #[serde(default = "default_pump_breakout_lookback")]
+    pub breakout_lookback_bars: u32,
+    #[serde(default = "default_pump_breakout_min_pct")]
+    pub breakout_min_pct: f64,
+    #[serde(default = "default_pump_breakout_vol_mult")]
+    pub breakout_vol_mult: f64,
+    #[serde(default = "default_true")]
+    pub require_structure: bool,
+    #[serde(default = "default_true")]
+    pub require_market_structure_bias: bool,
+    #[serde(default = "default_pump_ms_lookback")]
+    pub market_structure_lookback_bars: u32,
+    #[serde(default = "default_true")]
+    pub htf_enabled: bool,
+    #[serde(default = "default_htf_interval")]
+    pub htf_interval: String,
+    #[serde(default = "default_htf_lookback")]
+    pub htf_lookback_bars: u32,
+    #[serde(default = "default_true")]
+    pub macro_filter_enabled: bool,
+    #[serde(default = "default_htf_interval")]
+    pub macro_htf_interval: String,
+    #[serde(default = "default_pump_macro_lookback")]
+    pub macro_htf_lookback_bars: u32,
+    #[serde(default = "default_pump_macro_min_move")]
+    pub macro_min_move_pct: f64,
 }
 
-fn default_pump_vol_surge() -> f64 { 3.5 }
+fn default_pump_vol_surge() -> f64 { 4.0 }
 fn default_pump_vol_z() -> f64 { 2.5 }
 fn default_pump_price_min() -> f64 { 0.8 }
 fn default_pump_price_max() -> f64 { 8.0 }
 fn default_pump_ewma_span() -> u32 { 20 }
-fn default_pump_min_score() -> f64 { 62.0 }
+fn default_pump_min_score() -> f64 { 68.0 }
+fn default_pump_confirm_ttl() -> u64 { 180 }
+fn default_pump_breakout_lookback() -> u32 { 20 }
+fn default_pump_breakout_min_pct() -> f64 { 0.0005 }
+fn default_pump_breakout_vol_mult() -> f64 { 1.5 }
+fn default_pump_ms_lookback() -> u32 { 48 }
+fn default_pump_macro_lookback() -> u32 { 48 }
+fn default_pump_macro_min_move() -> f64 { 0.5 }
 fn default_pump_universe_rank() -> u32 { 5 }
 fn default_pump_min_turnover() -> f64 { 500_000.0 }
 fn default_pump_max_turnover() -> f64 { 50_000_000.0 }

@@ -141,3 +141,46 @@ pub fn market_structure_supports(klines: &[KlineBar], side: Side, lookback: usiz
         Side::Short => second_avg <= first_avg * 1.002,
     }
 }
+
+/// True when the latest bar closes beyond the prior `lookback` range with volume confirmation.
+pub fn breakout_confirmed(
+    klines: &[KlineBar],
+    side: Side,
+    lookback: usize,
+    min_pct: f64,
+    vol_mult: f64,
+    ewma_span: usize,
+) -> bool {
+    let n = lookback.max(3);
+    if klines.len() < n + 1 {
+        return false;
+    }
+    let prior = &klines[klines.len() - n - 1..klines.len() - 1];
+    let last = &klines[klines.len() - 1];
+    let volumes: Vec<f64> = klines.iter().map(|b| b.volume).collect();
+    let baseline = if volumes.len() > 1 {
+        crate::signals::indicators::ewma(&volumes[..volumes.len() - 1], ewma_span.max(2))
+    } else {
+        last.volume
+    };
+    if last.volume < baseline * vol_mult {
+        return false;
+    }
+    match side {
+        Side::Long => {
+            let range_high = prior.iter().map(|b| b.high).fold(f64::NEG_INFINITY, f64::max);
+            let threshold = range_high * (1.0 + min_pct);
+            last.close > threshold
+        }
+        Side::Short => {
+            let range_low = prior.iter().map(|b| b.low).fold(f64::INFINITY, f64::min);
+            let threshold = range_low * (1.0 - min_pct);
+            last.close < threshold
+        }
+    }
+}
+
+/// 1m structure aligned plus directional half-window bias (market shift).
+pub fn market_shift_confirmed(klines: &[KlineBar], side: Side, lookback: usize) -> bool {
+    structure_aligned(klines, side) && market_structure_supports(klines, side, lookback)
+}

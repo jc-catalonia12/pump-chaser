@@ -13,6 +13,18 @@ pub enum Side {
     Short,
 }
 
+/// Volume surge armed — waiting for breakout / bias confirmation before entry.
+#[derive(Debug, Clone)]
+pub struct PendingPumpSetup {
+    pub side: Side,
+    pub armed_at: DateTime<Utc>,
+    pub composite_score: f64,
+    pub price_change_pct: f64,
+    pub volume_surge_ratio: f64,
+    pub vol_z: f64,
+    pub universe_rank: Option<u32>,
+}
+
 pub struct SymbolState {
     pub symbol: String,
     pub prices: Vec<f64>,
@@ -26,6 +38,8 @@ pub struct SymbolState {
     pub last_pump_at: Option<DateTime<Utc>>,
     /// HTF setup waiting for a 1m sniper trigger before firing.
     pub pending_setup: Option<PendingSetup>,
+    /// Volume surge armed — waiting for breakout / bias confirmation.
+    pub pending_pump: Option<PendingPumpSetup>,
 }
 
 impl SymbolState {
@@ -41,6 +55,7 @@ impl SymbolState {
             last_scanned_at: None,
             last_pump_at: None,
             pending_setup: None,
+            pending_pump: None,
         }
     }
 

@@ -18,7 +18,7 @@ use crate::ml::features::{normalize_feature_vector, TechnicalFeatureBuilder, FEA
 use crate::ml::{EnhanceOutcome, MlPipeline};
 use crate::risk::RiskManager;
 use crate::signals::confluence::{ConfluenceEngine, ScanDiagnosis};
-use crate::signals::pump::{turnover_velocity, VolumePumpEngine};
+use crate::signals::pump::{MacroHtfState, PumpConfirmResult, turnover_velocity, VolumePumpEngine};
 use crate::signals::sniper::{self, TriggerResult};
 use crate::signals::{PumpSignal, SymbolState, SymbolStates};
 use crate::utils::{Alerter, UserSecrets};
@@ -110,6 +110,8 @@ struct ScannerInner {
     volume_pump: VolumePumpEngine,
     /// Universe turnover-velocity rank (1 = hottest), refreshed each ticker batch.
     pump_ranks: RwLock<HashMap<String, u32>>,
+    /// BTC + ETH HTF bars for volume-pump macro gate.
+    macro_htf: RwLock<MacroHtfState>,
     paper: Mutex<PaperTrader>,
     live: Mutex<LiveTrader>,
     live_monitor: Mutex<LivePositionMonitor>,
@@ -165,6 +167,7 @@ impl ScannerService {
             confluence: ConfluenceEngine::new(config.clone()),
             volume_pump: VolumePumpEngine::new(config.clone()),
             pump_ranks: RwLock::new(HashMap::new()),
+            macro_htf: RwLock::new(MacroHtfState::default()),
             paper: Mutex::new(PaperTrader::new(config.clone(), db)),
             live: Mutex::new(live),
             live_monitor: Mutex::new(live_monitor),
@@ -939,6 +942,23 @@ impl ScannerInner {
             let htf_enabled = cfg.confluence.htf_enabled;
             let htf_interval = cfg.confluence.htf_interval.clone();
             let htf_lookback = cfg.confluence.htf_lookback_bars;
+            let pump_htf_enabled = cfg.pump.htf_enabled;
+            let pump_htf_interval = cfg.pump.htf_interval.clone();
+            let pump_htf_lookback = cfg.pump.htf_lookback_bars;
+            let sym_htf_enabled = htf_enabled || pump_htf_enabled;
+            let sym_htf_interval = if htf_enabled {
+                htf_interval.clone()
+            } else {
+                pump_htf_interval.clone()
+            };
+            let sym_htf_lookback = if htf_enabled {
+                htf_lookback
+            } else {
+                pump_htf_lookback
+            };
+            let macro_enabled = cfg.pump.macro_filter_enabled;
+            let macro_interval = cfg.pump.macro_htf_interval.clone();
+            let macro_lookback = cfg.pump.macro_htf_lookback_bars;
             let refresh_sec = cfg.scanner.kline_refresh_sec;
             let symbols = self.tracked_symbols.read().await.clone();
             for symbol in symbols {
@@ -959,12 +979,12 @@ impl ScannerInner {
                     }
                     Err(exc) => debug!("Kline refresh {symbol} skipped: {exc}"),
                 }
-                // Higher-timeframe klines for structural bias (15m/30m)
-                if htf_enabled {
-                    match self.exchange.get_klines(&symbol, &htf_interval).await {
+                // Higher-timeframe klines for structural bias (confluence and/or pump)
+                if sym_htf_enabled {
+                    match self.exchange.get_klines(&symbol, &sym_htf_interval).await {
                         Ok(mut bars) => {
-                            if bars.len() > htf_lookback as usize {
-                                bars = bars[bars.len() - htf_lookback as usize..].to_vec();
+                            if bars.len() > sym_htf_lookback as usize {
+                                bars = bars[bars.len() - sym_htf_lookback as usize..].to_vec();
                             }
                             let mut states = self.states.write().await;
                             if let Some(state) = states.get_mut(&symbol) {
@@ -974,6 +994,9 @@ impl ScannerInner {
                         Err(exc) => debug!("HTF kline refresh {symbol} skipped: {exc}"),
                     }
                 }
+            }
+            if macro_enabled {
+                self.refresh_macro_htf(&macro_interval, macro_lookback).await;
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(refresh_sec))
                 .await;
@@ -1461,6 +1484,33 @@ impl ScannerInner {
         *self.pump_ranks.write().await = ranks;
     }
 
+    async fn refresh_macro_htf(&self, interval: &str, lookback: u32) {
+        let mut btc_klines = Vec::new();
+        match self.exchange.get_klines("BTC_USDT", interval).await {
+            Ok(mut bars) => {
+                if bars.len() > lookback as usize {
+                    bars = bars[bars.len() - lookback as usize..].to_vec();
+                }
+                btc_klines = bars;
+            }
+            Err(exc) => debug!("Macro HTF refresh BTC_USDT skipped: {exc}"),
+        }
+        let mut eth_klines = Vec::new();
+        match self.exchange.get_klines("ETH_USDT", interval).await {
+            Ok(mut bars) => {
+                if bars.len() > lookback as usize {
+                    bars = bars[bars.len() - lookback as usize..].to_vec();
+                }
+                eth_klines = bars;
+            }
+            Err(exc) => debug!("Macro HTF refresh ETH_USDT skipped: {exc}"),
+        }
+        *self.macro_htf.write().await = MacroHtfState {
+            btc_klines,
+            eth_klines,
+        };
+    }
+
     async fn process_volume_pump_symbol(&self, symbol: &str, ticker: &TickerSnapshot) {
         let pump_on = matches!(
             self.cfg().trading.mode.as_str(),
@@ -1471,50 +1521,74 @@ impl ScannerInner {
         }
 
         let rank = self.pump_ranks.read().await.get(symbol).copied();
-        let states = self.states.write().await;
-        let state = match states.get(symbol) {
-            Some(s) => s,
-            None => return,
-        };
+        let confirmation_enabled = self.cfg().pump.confirmation_enabled;
+        let macro_htf = self.macro_htf.read().await.clone();
 
-        if self.volume_pump.in_cooldown(state) {
-            drop(states);
-            return;
-        }
+        let mut signal_to_emit: Option<PumpSignal> = None;
+        let klines;
 
-        if state.klines.len() < 10 || state.prices.len() < 6 {
-            drop(states);
-            return;
-        }
+        {
+            let mut states = self.states.write().await;
+            let state = match states.get_mut(symbol) {
+                Some(s) => s,
+                None => return,
+            };
 
-        let evaluated = self.volume_pump.evaluate(state, rank, None);
-        let klines = state.klines.clone();
-        drop(states);
-
-        if let Some(signal) = evaluated {
-            let _ = self
-                .db
-                .log_event(
-                    "volume_pump_detected",
-                    &format!("Volume pump setup: {}", signal.symbol),
-                    Some(signal.to_payload()),
-                )
-                .await;
-            let mut ml = self.ml.lock().await;
-            match ml.enhance_signal_outcome(signal, Some(&klines)) {
-                EnhanceOutcome::Tradable(enhanced) => {
-                    drop(ml);
-                    self.emit_signal(enhanced).await;
-                    let mut states = self.states.write().await;
-                    if let Some(s) = states.get_mut(symbol) {
-                        s.last_pump_at = Some(Utc::now());
-                    }
-                }
-                EnhanceOutcome::MlRejected(rejected) => {
-                    drop(ml);
-                    self.save_shadow_signal(rejected, "ml_gate").await;
-                }
+            if self.volume_pump.in_cooldown(state) {
+                return;
             }
+
+            if state.klines.len() < 10 || state.prices.len() < 6 {
+                return;
+            }
+
+            klines = state.klines.clone();
+
+            if confirmation_enabled {
+                if let Some(pending) = state.pending_pump.clone() {
+                    match self
+                        .volume_pump
+                        .check_confirmation(state, &pending, None, &macro_htf)
+                    {
+                        PumpConfirmResult::Fire(signal) => {
+                            state.pending_pump = None;
+                            signal_to_emit = Some(signal);
+                        }
+                        PumpConfirmResult::Expired => {
+                            state.pending_pump = None;
+                            let _ = self
+                                .db
+                                .log_event(
+                                    "volume_pump_expired",
+                                    &format!("Pump confirmation expired for {symbol}"),
+                                    None,
+                                )
+                                .await;
+                        }
+                        PumpConfirmResult::Waiting => {}
+                    }
+                } else if let Some(armed) = self.volume_pump.try_arm(state, rank, None) {
+                    let _ = self
+                        .db
+                        .log_event(
+                            "volume_pump_armed",
+                            &format!("Volume pump armed for {symbol} — awaiting confirmation"),
+                            Some(json!({
+                                "symbol": symbol,
+                                "side": if armed.side == crate::signals::state::Side::Long { "long" } else { "short" },
+                                "composite_score": armed.composite_score,
+                            })),
+                        )
+                        .await;
+                    state.pending_pump = Some(armed);
+                }
+            } else if let Some(signal) = self.volume_pump.evaluate(state, rank, None, &macro_htf) {
+                signal_to_emit = Some(signal);
+            }
+        }
+
+        if let Some(signal) = signal_to_emit {
+            self.emit_volume_pump_signal(symbol, signal, &klines).await;
             return;
         }
 
@@ -1522,7 +1596,7 @@ impl ScannerInner {
             let states = self.states.read().await;
             states
                 .get(symbol)
-                .map(|s| self.volume_pump.diagnose(s, rank, None))
+                .map(|s| self.volume_pump.diagnose(s, rank, None, &macro_htf))
                 .unwrap_or(ScanDiagnosis {
                     action: "skipped".into(),
                     message: "State unavailable".into(),
@@ -1542,6 +1616,38 @@ impl ScannerInner {
                 ticker,
             )
             .await;
+        }
+    }
+
+    async fn emit_volume_pump_signal(
+        &self,
+        symbol: &str,
+        signal: PumpSignal,
+        klines: &[crate::exchange::KlineBar],
+    ) {
+        let _ = self
+            .db
+            .log_event(
+                "volume_pump_detected",
+                &format!("Volume pump setup: {}", signal.symbol),
+                Some(signal.to_payload()),
+            )
+            .await;
+        let mut ml = self.ml.lock().await;
+        match ml.enhance_signal_outcome(signal, Some(klines)) {
+            EnhanceOutcome::Tradable(enhanced) => {
+                drop(ml);
+                self.emit_signal(enhanced).await;
+                let mut states = self.states.write().await;
+                if let Some(s) = states.get_mut(symbol) {
+                    s.last_pump_at = Some(Utc::now());
+                    s.pending_pump = None;
+                }
+            }
+            EnhanceOutcome::MlRejected(rejected) => {
+                drop(ml);
+                self.save_shadow_signal(rejected, "ml_gate").await;
+            }
         }
     }
 

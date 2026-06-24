@@ -26,6 +26,8 @@ pub const NOTIFICATION_EVENT_TYPES: &[&str] = &[
     "signal",
     "volume_pump_detected",
     "volume_pump_signal",
+    "volume_pump_armed",
+    "volume_pump_expired",
     "scan",
     "kill_switch",
     "shadow_signal_saved",

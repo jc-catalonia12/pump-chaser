@@ -141,6 +141,18 @@ export const EVENT_LABELS = {
     tone: "accent",
     icon: "signal",
   },
+  volume_pump_armed: {
+    label: "Pump Armed",
+    description: "Volume surge armed — waiting for breakout confirmation",
+    tone: "info",
+    icon: "signal",
+  },
+  volume_pump_expired: {
+    label: "Pump Expired",
+    description: "Pump confirmation window expired without entry",
+    tone: "neutral",
+    icon: "scan",
+  },
   scan: {
     label: "Scan",
     description: "Symbol scan activity",

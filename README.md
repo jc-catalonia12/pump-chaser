@@ -1,10 +1,11 @@
 # MEXC Trading Bot (Rust)
 
-High-performance **MEXC USDT-M perpetual futures** trading bot — Rust migration of the Python Pump Chaser stack. Includes a built-in web dashboard, native desktop app (Tauri), confluence scanner, live/paper execution, ONNX + online ML gating, shadow learning, and optional Telegram alerts.
+High-performance **MEXC USDT-M perpetual futures** trading bot — Rust migration of the Python Pump Chaser stack. Includes a built-in web dashboard, native desktop app (Tauri), **confluence** and **volume pump** strategies, live/paper execution, ONNX + online ML gating, shadow learning, settings hot-reload, and optional Telegram alerts.
 
 ## Contents
 
 - [Architecture](#architecture)
+- [Trading strategies](#trading-strategies)
 - [First-time setup](#first-time-setup)
 - [Dashboard tabs](#dashboard-tabs)
 - [Configuration & data locations](#configuration)
@@ -31,6 +32,47 @@ Desktop app (Tauri) or browser  →  http://127.0.0.1:8001
 **User data** (API keys, SQLite, trade history) lives outside the installer in a local data folder and is never bundled in builds.
 
 **Trained ML models** (`supervised.onnx`, optional `online_model.json`) are bundled in release installers and copied into the user data folder on first launch (existing user models are not overwritten).
+
+---
+
+## Trading strategies
+
+The bot can run one or both strategies in parallel. Set `trading.mode` in **Settings** or `config/settings.yaml`:
+
+| Mode | Strategies active |
+|------|-------------------|
+| `confluence` | Confluence only |
+| `pump` / `volume_pump` | Volume pump only |
+| `both` | Confluence + volume pump |
+| `all` | Confluence + volume pump (default) |
+| `scalp` | Scalp stub (disabled unless `scalp.enabled: true`) |
+
+Each strategy has **separate position slots** (`risk.max_confluence_positions`, `risk.max_volume_pump_positions`) so a full confluence book does not block pump entries and vice versa.
+
+### Confluence
+
+15m-style multi-factor setups on 1m data: volume, supply/demand zones, structure, market bias, optional HTF alignment (15m/30m), and liquidity-grab detection. Entries can use **sniper** (1m pin-bar trigger after HTF setup), **limit**, or **market** via `sniper.entry_mode`.
+
+### Volume pump
+
+Fast 1m **volume-anomaly** scanner ranked by universe turnover velocity. Designed for short holds with limit or market entry (`pump.entry_mode`).
+
+**Two-phase confirmation** (`pump.confirmation_enabled`, default `true`) reduces fake pumps:
+
+1. **Arm** — abnormal volume surge + score gates set a pending setup (TTL: `pump.confirmation_ttl_sec`, default 180s).
+2. **Confirm** — entry fires only when gates pass:
+   - **Breakout** (close beyond prior range + volume) **or** **market shift** (1m structure + bias)
+   - **1m structure** and **market bias** (when enabled)
+   - **Symbol HTF bias** (15m default, `pump.htf_enabled`)
+   - **BTC/ETH macro** — blocks long pumps if either major is clearly dumping on HTF; blocks shorts if either is clearly pumping (`pump.macro_filter_enabled`)
+
+Tune under **Settings → Volume Pump Strategy** or in `config/settings.yaml` under `pump:`.
+
+### Live execution notes
+
+- MEXC `vol` is **contracts**, not coin quantity — the bot converts using per-symbol `contractSize` and clamps to `maxVol`.
+- Open positions show **strategy**, **entry type** (market / limit / sniper), and **pending** for unfilled limit orders.
+- **Settings saved in the UI apply immediately** (scanner, risk, execution) without restarting the app. MEXC WebSocket URL changes still require a scanner stop/start.
 
 ---
 
@@ -120,7 +162,7 @@ Use **Re-anchor from MEXC wallet** on the Account tab to sync paper/live equity 
 1. Go to the **Trading** tab.
 2. Click **Start trading** (or `POST /trading/start`).
 
-The scanner polls USDT-M symbols, scores confluence setups, applies the ML gate, and opens positions when risk checks pass. Status appears on Trading (live snapshot) and **Signals** (paginated history).
+The scanner polls USDT-M symbols, scores **confluence** and/or **volume pump** setups (per `trading.mode`), applies the ML gate, and opens positions when risk checks pass. Status appears on Trading (live snapshot) and **Signals** (paginated history). Volume pump scan messages use `[pump]` prefixes (e.g. armed, waiting breakout, macro block).
 
 ### 6. (Optional) Bootstrap the ML model
 
@@ -163,7 +205,9 @@ Get trade alerts and query bot status from Telegram.
 3. On **Account → Telegram Notifications**, paste token + chat ID → **Connect Telegram**.
 4. Open Telegram, chat with your bot, and press **Start** (required before messages can be delivered).
 5. Click **Send test message** to confirm.
-6. Toggle which events to receive (open, close, TP, SL, kill switch).
+6. Toggle which events to receive (open, close, TP, SL, kill switch, volume pump armed/detected).
+
+Trade alerts include the **strategy** label (Confluence, Volume Pump, etc.).
 
 **Bot commands** (only from your configured chat):
 
@@ -179,10 +223,14 @@ Telegram credentials are stored in `secrets.json` alongside MEXC keys — not in
 
 Use the **Settings** tab (or edit `config/settings.yaml`) for:
 
-- Confluence thresholds (`min_composite_score`, `max_concurrent_positions`)
+- **Trading mode** (`trading.mode`) and per-strategy position caps
+- Confluence thresholds (`min_composite_score`, HTF filter, liquidity grab)
+- Volume pump confirmation gates (`pump.confirmation_enabled`, breakout/macro/HTF filters)
 - Circuit breakers (`max_consecutive_losses`, `loss_streak_cooldown_sec`, `max_drawdown_halt_pct`)
-- Max hold time (`confluence.max_hold_sec`) — signals that never hit TP or SL within this window are labeled **expired**
+- Max hold time (`confluence.max_hold_sec`, `pump.max_hold_sec`) — signals that never hit TP or SL within this window are labeled **expired**
 - Kill switch — Trading tab or `POST /kill-switch/activate`
+
+Changes saved from the Settings tab are written to `settings.yaml` and **reloaded live** by the scanner, risk manager, and execution layer.
 
 ---
 
@@ -192,7 +240,7 @@ Use the **Settings** tab (or edit `config/settings.yaml`) for:
 |-----|---------|
 | **Trading** | Start/stop bot, live snapshot, recent signals preview, activity feed |
 | **Signals** | Full signal history (server-side pagination, 25 per page), chart overlay |
-| **Positions** | Open positions, **History** (closed trades, All/Live/Paper filter), manual close, P&amp;L chart |
+| **Positions** | Open positions (strategy, entry type, pending limits), **History** (closed trades, All/Live/Paper filter), manual close, P&amp;L chart |
 | **Training** | ML stack status, outcome trends, shadow learning stats, win rate by side |
 | **Account** | Paper/live mode, wallet, MEXC keys, Telegram |
 | **Settings** | Edit `settings.yaml` fields from the UI |
@@ -392,8 +440,8 @@ mexc-trading-bot-rust/           # this repo (standalone)
 ├── release-assets/models/       # staged for installer (gitignored binaries)
 ├── src/
 │   ├── main.rs                  # Axum server entry
-│   ├── scanner/                 # kline poll + signal loop
-│   ├── signals/                 # confluence engine
+│   ├── scanner/                 # kline poll, confluence + pump loops
+│   ├── signals/                 # confluence, volume pump, sniper, zones
 │   ├── risk/                    # RiskManager, circuit breakers
 │   ├── execution/               # paper + live traders
 │   ├── ml/                      # ONNX inference + online learner
@@ -412,17 +460,20 @@ See [MIGRATION.md](./MIGRATION.md) for the full tracker.
 | Area | Status |
 |------|--------|
 | Config + SQLite | ✓ |
-| Confluence scanner + signals | ✓ |
-| Paper + live execution | ✓ |
+| Confluence scanner + sniper entry | ✓ |
+| Volume pump (two-phase confirmation, BTC/ETH macro) | ✓ |
+| Per-strategy position slots | ✓ |
+| Paper + live execution (contract-aware sizing) | ✓ |
 | Built-in web UI + Tauri desktop | ✓ |
-| ONNX inference + hard ML gate | ✓ |
+| Settings hot-reload from UI | ✓ |
+| ONNX inference + ML gate | ✓ |
 | Online ML (Rust, no Python at runtime) | ✓ |
 | Shadow learning + outcome resolution | ✓ |
-| Telegram trade alerts + `/info` bot | ✓ |
+| Telegram trade alerts + strategy labels + `/info` bot | ✓ |
 | Server-side signals pagination | ✓ |
-| Position history (closed trades) | ✓ |
+| Position history + entry mode on open positions | ✓ |
 | Builtin backtest API | ✓ |
-| Pump / scalp strategies | Stubs (`scalp.enabled: false`) |
+| Scalp strategy | Stub (`scalp.enabled: false`) |
 | In-process sklearn training | Use `scripts/export_onnx.py` + `requirements.txt` or online learner |
 
 ---

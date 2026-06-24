@@ -72,7 +72,7 @@ trading:
 risk:
   max_risk_per_trade: 0.03
   max_leverage: 200
-  max_concurrent_positions: 4
+  max_concurrent_positions: 2
   daily_loss_limit: 0.1
   min_position_margin_usdt: 5.0
   use_live_wallet_equity: true
@@ -80,7 +80,7 @@ risk:
   max_funding_rate_abs: 0.001
   max_atr_pct: 12.0
   default_sl_pct: 0.03
-  trailing_stop_pct: 0.02
+  trailing_stop_pct: 0.035
   allow_hedge: false
   max_consecutive_losses: 3
   loss_streak_cooldown_sec: 1800
@@ -88,8 +88,8 @@ risk:
   symbol_loss_cooldown_sec: 1200
   ws_stale_sec: 30
   min_profit_usdt: 2.5
-  max_confluence_positions: 2
-  max_volume_pump_positions: 2
+  max_confluence_positions: 1
+  max_volume_pump_positions: 1
 execution:
   live_trading_enabled: true
   dry_run: false
