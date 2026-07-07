@@ -252,6 +252,103 @@ fn _install_for_os(progress: impl Fn(&str)) -> Result<PathBuf, String> {
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
+/// Ensure at most one `llama-server` process is running before we start Ollama.
+/// Ollama spawns `llama-server` workers; orphaned duplicates from prior runs can
+/// pile up and waste RAM. Keeps the oldest PID and terminates the rest.
+pub fn dedupe_llama_servers(on_status: impl Fn(&str)) -> usize {
+    let mut pids = list_llama_server_pids();
+    if pids.len() <= 1 {
+        return 0;
+    }
+    pids.sort_unstable();
+    let keep = pids[0];
+    let mut killed = 0usize;
+    for pid in pids.into_iter().skip(1) {
+        if kill_process(pid) {
+            killed += 1;
+        }
+    }
+    if killed > 0 {
+        on_status(&format!(
+            "Stopped {killed} duplicate llama-server process(es); kept PID {keep}"
+        ));
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    killed
+}
+
+#[cfg(unix)]
+fn list_llama_server_pids() -> Vec<u32> {
+    let Ok(out) = Command::new("pgrep").args(["-x", "llama-server"]).output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    parse_pid_lines(&out.stdout)
+}
+
+#[cfg(windows)]
+fn list_llama_server_pids() -> Vec<u32> {
+    let Ok(out) = Command::new("tasklist")
+        .args([
+            "/FI",
+            "IMAGENAME eq llama-server.exe",
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut pids = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("INFO:") {
+            continue;
+        }
+        // "llama-server.exe","1234","Console",...
+        let pid_str = line
+            .split(',')
+            .nth(1)
+            .and_then(|s| s.trim_matches('"').parse::<u32>().ok());
+        if let Some(pid) = pid_str {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+fn parse_pid_lines(stdout: &[u8]) -> Vec<u32> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect()
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) -> bool {
+    Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn kill_process(pid: u32) -> bool {
+    Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Spawn `ollama serve` in the background.
 /// Returns the child process on success.  Stdout/stderr are discarded so the
 /// process runs silently without keeping a console window open.
@@ -359,6 +456,18 @@ impl OllamaHandle {
 impl Default for OllamaHandle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::parse_pid_lines;
+
+    #[test]
+    fn parse_pid_lines_reads_pgrep_output() {
+        assert_eq!(parse_pid_lines(b"42\n1001\n"), vec![42, 1001]);
+        assert_eq!(parse_pid_lines(b""), Vec::<u32>::new());
+        assert_eq!(parse_pid_lines(b"  99 \n"), vec![99]);
     }
 }
 

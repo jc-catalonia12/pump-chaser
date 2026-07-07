@@ -105,11 +105,38 @@ fn packaged_resource_search_roots(exe: &Path) -> Vec<PathBuf> {
             roots.push(contents.join("Resources"));
         }
     }
-    // Tauri v2 Windows: bundled files live next to the executable (`_up_/_up_/…`).
-    roots.push(parent.to_path_buf());
-    // Linux / legacy layouts.
+    // Tauri v2 Windows / Linux: `resources/` next to the executable.
     roots.push(parent.join("resources"));
+    // Tauri v2 also mirrors `../../` bundle paths as `_up_/_up_/` beside the exe.
+    roots.push(parent.to_path_buf());
+    // NSIS installs sometimes nest the exe one level deeper.
+    if let Some(grandparent) = parent.parent() {
+        roots.push(grandparent.join("resources"));
+        roots.push(grandparent.to_path_buf());
+    }
     roots
+}
+
+/// Walk *base* (depth-first, up to *max_depth*) looking for `config/settings.yaml`.
+fn find_resource_root_recursive(base: &Path, max_depth: u32) -> Option<PathBuf> {
+    if base.join(CONFIG_REL).is_file() {
+        return Some(base.to_path_buf());
+    }
+    if max_depth == 0 {
+        return None;
+    }
+    let Ok(entries) = fs::read_dir(base) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_resource_root_recursive(&path, max_depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 /// Running `cargo run` / `cargo tauri dev` from the repo (not an installed bundle).
@@ -118,8 +145,28 @@ fn is_dev_source_tree() -> bool {
         .is_some_and(|root| root.join("desktop/src-tauri/Cargo.toml").is_file())
 }
 
+/// Called from the Tauri desktop shell before [`init_runtime_paths`].
+/// Resolves the installer bundle root via Tauri's `resource_dir()` so Windows
+/// NSIS layouts are found reliably (exe-adjacent `_up_/_up_/` or `resources/`).
+pub fn prime_packaged_install(resource_dir: &Path) {
+    std::env::set_var("MEXC_BOT_PACKAGED", "1");
+    if std::env::var("MEXC_BOT_RESOURCE_DIR").is_ok() {
+        return;
+    }
+    if let Some(root) = find_resource_root_in_dir(resource_dir) {
+        std::env::set_var("MEXC_BOT_RESOURCE_DIR", root.display().to_string());
+        return;
+    }
+    if let Some(root) = find_resource_root_recursive(resource_dir, 6) {
+        std::env::set_var("MEXC_BOT_RESOURCE_DIR", root.display().to_string());
+    }
+}
+
 /// True when running from a Tauri installer (not `cargo run` from source).
 pub fn is_packaged_install() -> bool {
+    if std::env::var("MEXC_BOT_PACKAGED").is_ok() {
+        return true;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
@@ -213,6 +260,14 @@ fn setup_packaged_paths() {
     }
 
     let user_config = data_dir.join(CONFIG_REL);
+    if !user_config.is_file() {
+        if let Some(resource) = discover_resource_root() {
+            let bundled = resource.join(CONFIG_REL);
+            if copy_seed_file(&bundled, &user_config) {
+                tracing::info!("Seeded settings on first launch → {}", user_config.display());
+            }
+        }
+    }
     std::env::set_var("MEXC_BOT_CONFIG", user_config.display().to_string());
 }
 

@@ -21,6 +21,7 @@ let wsReconnectTimer = null;
 let wsLiveConnected = false;
 let pollTimer = null;
 let marketPollTimer = null;
+let botAssistantStatusTimer = null;
 let dashboardNewsItems = [];
 let dashboardNewsPage = 0;
 let dashboardNewsAutoTimer = null;
@@ -1702,6 +1703,11 @@ function startPolling() {
     if (document.hidden) return;
     if ($("#panel-trading")?.classList.contains("active")) loadDashboardMarket();
   }, 60000);
+  if (botAssistantStatusTimer) clearInterval(botAssistantStatusTimer);
+  botAssistantStatusTimer = setInterval(() => {
+    if (document.hidden) return;
+    refreshBotAssistantStatus();
+  }, 8000);
 }
 
 // When the window is restored after being minimised/hidden for a while,
@@ -2466,6 +2472,29 @@ function renderDashboardRegime(llm = {}) {
   el.textContent = label;
   el.className = "sentiment-pill" + cls;
   el.title = title;
+  updateBotAssistantOnlineState(llm);
+}
+
+function updateBotAssistantOnlineState(llm = {}) {
+  const fab = $("#bot-assistant-fab");
+  if (!fab) return;
+  // `available` only flips after the scanner's first regime classification.
+  // The assistant FAB should reflect live Ollama reachability instead.
+  const offline = llm.enabled !== false && !llm.ollama_reachable;
+  fab.classList.toggle("offline", offline);
+  fab.setAttribute(
+    "aria-label",
+    offline ? "Bot assistant offline — Ollama unavailable" : "Open bot assistant",
+  );
+}
+
+async function refreshBotAssistantStatus() {
+  try {
+    const llm = await apiGet("/llm/status");
+    updateBotAssistantOnlineState(llm);
+  } catch {
+    updateBotAssistantOnlineState({ enabled: true, ollama_reachable: false });
+  }
 }
 
 function renderNewsFeedRow(item) {
@@ -4427,6 +4456,7 @@ async function init() {
   initDashboardMarketControls();
   initUpdateBanner();
   initBotAssistant();
+  refreshBotAssistantStatus();
   await loadUserProfile();
   await refreshSnapshotHttp();
   await loadBalanceHistory();
