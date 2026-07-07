@@ -324,6 +324,7 @@ fn list_llama_server_pids() -> Vec<u32> {
     pids
 }
 
+#[cfg(unix)]
 fn parse_pid_lines(stdout: &[u8]) -> Vec<u32> {
     String::from_utf8_lossy(stdout)
         .lines()
@@ -459,7 +460,7 @@ impl Default for OllamaHandle {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod dedupe_tests {
     use super::parse_pid_lines;
 
