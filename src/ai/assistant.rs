@@ -34,8 +34,8 @@ pub struct AssistantChatResponse {
 
 /// Plain-text snapshot of current bot state for the LLM system prompt.
 pub async fn build_bot_context(state: &AppState) -> String {
-    let scanner = state.scanner.read().await;
-    let secrets = state.secrets.read().await;
+    let scanner = { state.scanner.read().await.clone() };
+    let secrets = state.secrets.read().await.clone();
     let cfg = state.config.read().unwrap().clone();
 
     let status = scanner.get_status().await;
@@ -221,9 +221,10 @@ Do not invent trades or prices not in the snapshot.\n\n\
 SETTINGS: When the user asks to change, enable, disable, or tune a bot setting, you MAY apply it. \
 Use the editable settings list below for exact JSON keys and valid ranges. \
 Percent fields use decimals (0.03 = 3%). \
-If you apply a change, end your reply with a single line (no markdown): \
+If you apply a change, you MUST include a short confirmation sentence for the user, \
+then end with a single line (no markdown): \
 SETTINGS_PATCH: {{\"section\":{{\"field\":value}}}} using only keys being changed. \
-Confirm what changed in plain English before that line. \
+Never reply with only SETTINGS_PATCH — always explain what you changed first. \
 If the request is unclear, unsafe, or outside the editable list, explain and do NOT emit SETTINGS_PATCH. \
 Never enable live trading unless the user explicitly asks.\n\n\
 --- LIVE SNAPSHOT ---\n{context}\n--- END ---\n\n\
@@ -251,11 +252,15 @@ Never enable live trading unless the user explicitly asks.\n\n\
         match call_ollama(&llm_cfg, &messages).await {
             Ok(text) => text,
             Err(exc) => {
-                warn!("Assistant Ollama unreachable: {exc}");
-                format!(
-                    "Ollama is offline ({exc}). {}",
+                warn!("Assistant Ollama: {exc}");
+                if exc == "empty reply" {
                     offline_fallback(&context, message)
-                )
+                } else {
+                    format!(
+                        "Ollama is offline ({exc}). {}",
+                        offline_fallback(&context, message)
+                    )
+                }
             }
         }
     };
@@ -290,8 +295,10 @@ Never enable live trading unless the user explicitly asks.\n\n\
         }
     }
 
+    let reply = ensure_nonempty_reply(reply, llm_cfg.enabled, &context, message);
+
     AssistantChatResponse {
-        reply: reply.trim().to_string(),
+        reply,
         ollama_available,
         settings_applied,
     }
@@ -323,12 +330,67 @@ async fn call_ollama(
     }
 
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
-    v.get("message")
+    parse_ollama_content(&v).ok_or_else(|| "empty reply".into())
+}
+
+/// Extract assistant text from Ollama `/api/chat` JSON (handles minor schema differences).
+fn parse_ollama_content(body: &Value) -> Option<String> {
+    if let Some(text) = body
+        .get("message")
         .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "empty reply".into())
+        .and_then(content_as_str)
+    {
+        return Some(text);
+    }
+    if let Some(text) = body.get("response").and_then(content_as_str) {
+        return Some(text);
+    }
+    None
+}
+
+fn content_as_str(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        Value::Array(parts) => {
+            let joined: String = parts
+                .iter()
+                .filter_map(|p| p.get("text").or(Some(p)).and_then(|x| x.as_str()))
+                .collect::<Vec<_>>()
+                .join("");
+            let t = joined.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn ensure_nonempty_reply(
+    reply: String,
+    llm_enabled: bool,
+    context: &str,
+    question: &str,
+) -> String {
+    let trimmed = reply.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    if llm_enabled {
+        "I couldn't produce a visible reply. Try rephrasing, or confirm Ollama is running and the model is pulled."
+            .into()
+    } else {
+        offline_fallback(context, question)
+    }
 }
 
 /// Parse `SETTINGS_PATCH: {...}` from the model reply.
@@ -530,5 +592,12 @@ mod tests {
     fn infers_max_positions_offline() {
         let patch = infer_settings_patch_from_message("please set max positions to 7").unwrap();
         assert_eq!(patch["risk"]["max_concurrent_positions"], 7);
+    }
+
+    #[test]
+    fn strip_settings_patch_leaves_fallback_text() {
+        let text = "SETTINGS_PATCH: {\"risk\":{\"max_concurrent_positions\":5}}";
+        assert!(strip_settings_patch(text).is_empty());
+        assert!(ensure_nonempty_reply(strip_settings_patch(text), true, "ctx", "hi").len() > 10);
     }
 }

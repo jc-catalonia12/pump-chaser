@@ -4289,6 +4289,15 @@ function setBotAssistantOpen(open) {
   }
 }
 
+function setAssistantMessageBody(pendingEl, text) {
+  if (!pendingEl) return;
+  const body = pendingEl.querySelector(".bot-assistant-msg-body");
+  const display = String(text || "").trim() || "No reply — check Ollama in Settings or try again.";
+  if (body) body.textContent = display;
+  const list = $("#bot-assistant-messages");
+  if (list) list.scrollTop = list.scrollHeight;
+}
+
 async function sendBotAssistantMessage(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed || botAssistantBusy) return;
@@ -4307,11 +4316,10 @@ async function sendBotAssistantMessage(text) {
       message: trimmed,
       history: botAssistantHistory.slice(-10),
     });
-    const reply = res.reply || "No reply.";
+    const reply = (res.reply && String(res.reply).trim()) || "No reply — check Ollama in Settings or try again.";
     if (pending) {
       pending.classList.remove("pending");
-      const body = pending.querySelector(".bot-assistant-msg-body");
-      if (body) body.textContent = reply;
+      setAssistantMessageBody(pending, reply);
     }
     botAssistantHistory.push({ role: "assistant", content: reply });
     if (botAssistantHistory.length > 20) botAssistantHistory = botAssistantHistory.slice(-20);
@@ -4323,8 +4331,7 @@ async function sendBotAssistantMessage(text) {
   } catch (e) {
     if (pending) {
       pending.classList.remove("pending");
-      const body = pending.querySelector(".bot-assistant-msg-body");
-      if (body) body.textContent = e.message || "Request failed.";
+      setAssistantMessageBody(pending, e.message || "Request failed.");
     }
   } finally {
     botAssistantBusy = false;
