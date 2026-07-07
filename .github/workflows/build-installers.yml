@@ -23,6 +23,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   ONNX_PATH: data/models/supervised.onnx
+  # Keep Tauri bundle output in a stable path (workspace builds otherwise land in ./target).
+  CARGO_TARGET_DIR: desktop/src-tauri/target
 
 jobs:
   version:
@@ -120,20 +122,23 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/release-macos
-          TARGET_ROOT="desktop/src-tauri/target"
-          echo "Searching for bundle artifacts under ${TARGET_ROOT} ..."
+          TARGET_ROOTS=(desktop/src-tauri/target target)
           count=0
-          while IFS= read -r -d '' f; do
-            cp -f "$f" dist/release-macos/
-            echo "  + $(basename "$f")"
-            count=$((count + 1))
-          done < <(find "$TARGET_ROOT" \
-            \( -name "*.dmg" -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \) \
-            -path "*/release/bundle/*" -print0 2>/dev/null || true)
+          for TARGET_ROOT in "${TARGET_ROOTS[@]}"; do
+            [ -d "$TARGET_ROOT" ] || continue
+            echo "Searching for bundle artifacts under ${TARGET_ROOT} ..."
+            while IFS= read -r -d '' f; do
+              cp -f "$f" dist/release-macos/
+              echo "  + $(basename "$f")"
+              count=$((count + 1))
+            done < <(find "$TARGET_ROOT" \
+              \( -name "*.dmg" -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \) \
+              -path "*/release/bundle/*" -print0 2>/dev/null || true)
+          done
           if [ "$count" -eq 0 ]; then
-            echo "::error::No macOS installer artifacts found under ${TARGET_ROOT}"
+            echo "::error::No macOS installer artifacts found under desktop/src-tauri/target or target"
             echo "Bundle tree (first 80 files):"
-            find "$TARGET_ROOT" -type f 2>/dev/null | head -80 || true
+            find desktop/src-tauri/target target -type f 2>/dev/null | head -80 || true
             exit 1
           fi
           echo "=== macOS artifacts (${count}) ==="
@@ -215,17 +220,25 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path "dist/release-windows" | Out-Null
-          $targetRoot = "desktop/src-tauri/target"
-          Write-Host "Searching for bundle artifacts under $targetRoot ..."
-          $patterns = @("*.msi", "*.msi.zip", "*.msi.zip.sig", "*setup*.exe", "*.exe.sig")
+          $targetRoots = @("desktop/src-tauri/target", "target")
+          if ($env:CARGO_TARGET_DIR) { $targetRoots = @($env:CARGO_TARGET_DIR) + $targetRoots }
+          $targetRoots = $targetRoots | Select-Object -Unique | Where-Object { Test-Path $_ }
+          $patterns = @("*.msi", "*.msi.zip", "*.sig", "*setup*.exe")
           $files = @()
-          foreach ($pat in $patterns) {
-            $files += Get-ChildItem -Path $targetRoot -Recurse -Filter $pat -File -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match "[\\/]release[\\/]bundle[\\/]" }
+          foreach ($root in $targetRoots) {
+            Write-Host "Searching for bundle artifacts under $root ..."
+            foreach ($pat in $patterns) {
+              $files += Get-ChildItem -Path $root -Recurse -Filter $pat -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match "[\\/]release[\\/]bundle[\\/]" }
+            }
           }
           $files = $files | Sort-Object FullName -Unique
           if (-not $files) {
-            Write-Error "No Windows installer artifacts found under $targetRoot"
+            Write-Host "Bundle tree (first 80 files):"
+            foreach ($root in $targetRoots) {
+              Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 80 | ForEach-Object { $_.FullName }
+            }
+            Write-Error "No Windows installer artifacts found under desktop/src-tauri/target or target"
           }
           foreach ($f in $files) {
             Write-Host "  + $($f.Name)"
