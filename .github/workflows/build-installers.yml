@@ -118,13 +118,26 @@ jobs:
 
       - name: Collect macOS release artifacts
         run: |
+          set -euo pipefail
           mkdir -p dist/release-macos
-          BUNDLE="desktop/src-tauri/target/release/bundle"
-          find "$BUNDLE" \
+          TARGET_ROOT="desktop/src-tauri/target"
+          echo "Searching for bundle artifacts under ${TARGET_ROOT} ..."
+          count=0
+          while IFS= read -r -d '' f; do
+            cp -f "$f" dist/release-macos/
+            echo "  + $(basename "$f")"
+            count=$((count + 1))
+          done < <(find "$TARGET_ROOT" \
             \( -name "*.dmg" -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \) \
-            -exec cp {} dist/release-macos/ \; 2>/dev/null || true
-          echo "=== macOS artifacts ==="
-          ls -lh dist/release-macos/ || true
+            -path "*/release/bundle/*" -print0 2>/dev/null || true)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No macOS installer artifacts found under ${TARGET_ROOT}"
+            echo "Bundle tree (first 80 files):"
+            find "$TARGET_ROOT" -type f 2>/dev/null | head -80 || true
+            exit 1
+          fi
+          echo "=== macOS artifacts (${count}) ==="
+          ls -lh dist/release-macos/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -200,15 +213,25 @@ jobs:
       - name: Collect Windows release artifacts
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path "dist/release-windows" | Out-Null
-          $bundle = "desktop/src-tauri/target/release/bundle"
-          Get-ChildItem "$bundle/msi" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in ".msi",".sig",".zip" } |
-            Copy-Item -Destination "dist/release-windows" -Force
-          Get-ChildItem "$bundle/nsis" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in ".exe",".sig",".zip" -or $_.Name -like "*setup*" } |
-            Copy-Item -Destination "dist/release-windows" -Force
-          Write-Host "=== Windows artifacts ==="
+          $targetRoot = "desktop/src-tauri/target"
+          Write-Host "Searching for bundle artifacts under $targetRoot ..."
+          $patterns = @("*.msi", "*.msi.zip", "*.msi.zip.sig", "*setup*.exe", "*.exe.sig")
+          $files = @()
+          foreach ($pat in $patterns) {
+            $files += Get-ChildItem -Path $targetRoot -Recurse -Filter $pat -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match "[\\/]release[\\/]bundle[\\/]" }
+          }
+          $files = $files | Sort-Object FullName -Unique
+          if (-not $files) {
+            Write-Error "No Windows installer artifacts found under $targetRoot"
+          }
+          foreach ($f in $files) {
+            Write-Host "  + $($f.Name)"
+            Copy-Item $f.FullName -Destination "dist/release-windows" -Force
+          }
+          Write-Host "=== Windows artifacts ($($files.Count)) ==="
           Get-ChildItem "dist/release-windows" | Format-Table Name, Length -AutoSize
 
       - uses: actions/upload-artifact@v4
