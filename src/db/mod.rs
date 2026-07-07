@@ -38,7 +38,7 @@ impl Database {
             .log_statements(LevelFilter::Off);
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(10)
             .connect_with(options)
             .await?;
 

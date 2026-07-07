@@ -662,6 +662,14 @@ pub async fn llm_regime_status(State(state): State<Arc<AppState>>) -> Json<Value
     Json(scanner.llm_regime_status().await)
 }
 
+pub async fn assistant_chat(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<crate::ai::AssistantChatRequest>,
+) -> Json<crate::ai::AssistantChatResponse> {
+    let config = state.config.clone();
+    Json(crate::ai::assistant::chat(state, config, body).await)
+}
+
 pub async fn sentiment_news(State(state): State<Arc<AppState>>, Query(q): Query<LimitQuery>) -> Json<Value> {
     let items = state.db.get_recent_news(q.limit).await.unwrap_or_default();
     Json(json!({ "items": items }))
@@ -706,17 +714,15 @@ pub async fn optimization(State(state): State<Arc<AppState>>, Query(q): Query<Op
 // --- Trading control ---
 
 pub async fn trading_start(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let scanner = state.scanner.read().await;
+    let scanner = { state.scanner.read().await.clone() };
     let _ = scanner.deactivate_kill_switch().await;
     let start_result = scanner.start().await;
-    drop(scanner);
 
     // Sync exchange positions in the background — it's a network round-trip and
     // must not delay the Start button's response.
-    let scanner_arc = state.scanner.clone();
+    let scanner_bg = scanner.clone();
     tokio::spawn(async move {
-        let s = scanner_arc.read().await;
-        let _ = s.sync_exchange_positions().await;
+        let _ = scanner_bg.sync_exchange_positions().await;
     });
 
     match start_result {
@@ -742,17 +748,17 @@ pub async fn trading_start(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 pub async fn trading_stop(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let scanner = state.scanner.read().await;
+    let scanner = { state.scanner.read().await.clone() };
     Json(scanner.stop().await)
 }
 
 pub async fn kill_switch_activate(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let scanner = state.scanner.read().await;
+    let scanner = { state.scanner.read().await.clone() };
     Json(scanner.activate_kill_switch().await)
 }
 
 pub async fn kill_switch_deactivate(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let scanner = state.scanner.read().await;
+    let scanner = { state.scanner.read().await.clone() };
     Json(scanner.deactivate_kill_switch().await)
 }
 
@@ -1246,22 +1252,26 @@ pub async fn exchanges_health(State(state): State<Arc<AppState>>) -> Json<Value>
 }
 
 pub async fn live_snapshot(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let scanner = state.scanner.read().await;
+    Json(state.snapshot_cache.read().await.clone())
+}
+
+/// Build a full live dashboard snapshot (expensive — used by the cache refresher).
+pub async fn build_live_snapshot(state: Arc<AppState>) -> Value {
+    let scanner = { state.scanner.read().await.clone() };
     let risk = scanner.get_risk_metrics().await;
     let secrets = state.secrets.read().await;
     let cfg = state.config.read().unwrap().clone();
-    let risk_guard = state.risk.read().await;
-    let open = state.db.count_open_positions().await.unwrap_or(0);
-    let m = risk_guard.metrics(open);
+    let paper_mode = secrets.paper_trading || !cfg.execution.live_trading_enabled;
     let mut wallet = json!({
         "currency": "USDT",
-        "equity": m.equity,
-        "available": m.equity,
-        "source": m.equity_source,
+        "equity": risk.get("equity").cloned().unwrap_or(json!(0)),
+        "available": risk.get("equity").cloned().unwrap_or(json!(0)),
+        "source": risk.get("equity_source").cloned().unwrap_or(json!("paper")),
         "paper_trading": secrets.paper_trading,
         "live_trading": secrets.live_trading && cfg.execution.live_trading_enabled,
     });
-    if secrets.has_credentials() {
+    // Live wallet fetch is slow (REST) — skip in paper mode to keep snapshots fast.
+    if !paper_mode && secrets.has_credentials() {
         let live = crate::execution::LiveTrader::new(
             cfg_arc(&state).await,
             state.db.clone(),
@@ -1277,9 +1287,22 @@ pub async fn live_snapshot(State(state): State<Arc<AppState>>) -> Json<Value> {
         }
     }
     let positions = scanner.get_open_positions_live().await;
-    let activity = state.db.get_trade_activity(15).await.unwrap_or_default();
+    let activity: Vec<Value> = state
+        .db
+        .get_trade_activity(10)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut row| {
+            if let Value::Object(ref mut m) = row {
+                m.remove("payload");
+            }
+            row
+        })
+        .collect();
     let activity_unread = state.db.count_unread_activity().await.unwrap_or(0);
-    let signals = state.db.get_recent_signals(30).await.unwrap_or_default();
+    // Use scanner memory buffer — avoids a DB query on every 3 s UI snapshot tick.
+    let signals = scanner.get_latest_signals(30).await;
     let scan_events = scanner.get_latest_scans(40).await;
     let status = scanner.get_status().await;
     let mut health = json!({
@@ -1296,7 +1319,7 @@ pub async fn live_snapshot(State(state): State<Arc<AppState>>) -> Json<Value> {
     if let (Some(h), Some(m)) = (health.as_object_mut(), crate::version::build_metadata().as_object()) {
         h.extend(m.clone());
     }
-    Json(json!({
+    json!({
         "type": "snapshot",
         "ts": chrono::Utc::now().to_rfc3339(),
         "health": health,
@@ -1307,7 +1330,7 @@ pub async fn live_snapshot(State(state): State<Arc<AppState>>) -> Json<Value> {
         "activity_unread": activity_unread,
         "signals": signals,
         "scan_events": scan_events,
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -107,6 +107,7 @@ fn resolve_signal_outcome(
     }
 }
 
+#[derive(Clone)]
 pub struct ScannerService {
     inner: Arc<ScannerInner>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -135,12 +136,21 @@ struct ScannerInner {
     scan_log_gate: RwLock<HashMap<String, (i64, String)>>,
     ticker_map: RwLock<HashMap<String, TickerSnapshot>>,
     started_at: RwLock<Option<DateTime<Utc>>>,
-    /// Throttle automatic phantom-position healing (unix sec).
-    position_heal_at: AtomicI64,
+    /// Throttle DB PnL reconciliation for UI snapshots (unix sec).
+    last_risk_sync_at: AtomicI64,
+    /// Throttle open-position monitoring work (unix sec).
+    last_pos_monitor_at: AtomicI64,
     alerter: Arc<Alerter>,
     sentiment: Arc<SentimentService>,
     llm_regime: Arc<LlmRegimeService>,
     last_tune_at: AtomicI64,
+    /// Serializes signal routing + execution so concurrent ticker candidates
+    /// cannot race past max-position checks or hammer SQLite with parallel writes.
+    signal_exec: Arc<Semaphore>,
+    /// Cached open-position count — refreshed at most once per second on the ticker
+    /// path so we can skip the ML pipeline when the book is full (-1 = unknown).
+    cached_open_positions: AtomicI64,
+    last_open_count_at: AtomicI64,
 }
 
 impl ScannerService {
@@ -191,11 +201,15 @@ impl ScannerService {
             scan_log_gate: RwLock::new(HashMap::new()),
             ticker_map: RwLock::new(HashMap::new()),
             started_at: RwLock::new(None),
-            position_heal_at: AtomicI64::new(0),
+            last_risk_sync_at: AtomicI64::new(0),
+            last_pos_monitor_at: AtomicI64::new(0),
             alerter,
             sentiment,
             llm_regime,
             last_tune_at: AtomicI64::new(0),
+            signal_exec: Arc::new(Semaphore::new(1)),
+            cached_open_positions: AtomicI64::new(-1),
+            last_open_count_at: AtomicI64::new(0),
         });
         Ok(Self {
             inner,
@@ -273,6 +287,12 @@ impl ScannerService {
         scans.iter().take(limit).cloned().collect()
     }
 
+    /// Recent signals from the in-memory ring buffer (no DB hit).
+    pub async fn get_latest_signals(&self, limit: usize) -> Vec<Value> {
+        let latest = self.inner.latest_signals.read().await;
+        latest.iter().take(limit).cloned().collect()
+    }
+
     pub async fn get_tracked_symbols(&self) -> Value {
         let order = self.inner.tracked_symbols.read().await.clone();
         let states = self.inner.states.read().await;
@@ -341,34 +361,28 @@ impl ScannerService {
 
     /// Open positions enriched with the live mark price and unrealized PnL.
     pub async fn get_open_positions_live(&self) -> Vec<Value> {
-        let now = Utc::now().timestamp();
-        let last = self.inner.position_heal_at.load(Ordering::Relaxed);
-        if now.saturating_sub(last) >= 45 {
-            self.inner.position_heal_at.store(now, Ordering::Relaxed);
-            let live = self.inner.live.lock().await;
-            if live.has_credentials() {
-                let healed = live.heal_phantom_open_positions().await;
-                if healed > 0 {
-                    info!("Auto-healed {healed} phantom live position(s) not on MEXC");
-                    drop(live);
-                    let mut risk = self.inner.risk.write().await;
-                    let _ = risk.reconcile_pnl_from_db().await;
-                }
-            }
-        }
-
         let mut positions = self.inner.db.get_open_positions().await.unwrap_or_default();
         let tickers = self.inner.ticker_map.read().await;
         // MEXC stores exchange-sourced position size as `holdVol` (number of
         // contracts), so the USDT PnL must be scaled by the contract size of the
         // symbol. Paper positions are sized directly in coins, so they use 1.0.
-        let contract_sizes: std::collections::HashMap<String, f64> = {
-            let live = self.inner.live.lock().await;
-            positions
-                .iter()
-                .filter_map(|p| p.get("symbol").and_then(|v| v.as_str()))
-                .map(|s| (s.to_string(), live.contract_size(s)))
-                .collect()
+        // IMPORTANT: snapshot path must never block on live-trader mutex while an
+        // order is being opened/closed. Use try_lock and fall back to 1.0 if busy.
+        let has_live_positions = positions
+            .iter()
+            .any(|p| !p.get("paper").and_then(|v| v.as_bool()).unwrap_or(true));
+        let contract_sizes: std::collections::HashMap<String, f64> = if has_live_positions {
+            if let Ok(live) = self.inner.live.try_lock() {
+                positions
+                    .iter()
+                    .filter_map(|p| p.get("symbol").and_then(|v| v.as_str()))
+                    .map(|s| (s.to_string(), live.contract_size(s)))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            }
+        } else {
+            std::collections::HashMap::new()
         };
         for p in positions.iter_mut() {
             let symbol = p.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -465,9 +479,11 @@ impl ScannerService {
         let leverage = pos.get("leverage").and_then(|v| v.as_f64()).unwrap_or(1.0);
         let contract_size = if paper {
             1.0
-        } else {
-            let live = self.inner.live.lock().await;
+        } else if let Ok(live) = self.inner.live.try_lock() {
             live.contract_size(&symbol)
+        } else {
+            // Keep chart responsive when live-trader mutex is busy.
+            1.0
         };
         let qty = size * contract_size;
         let tickers = self.inner.ticker_map.read().await;
@@ -532,9 +548,35 @@ impl ScannerService {
         } else {
             Utc::now().timestamp() - last_tick > stale_threshold
         };
-        let mut risk = self.inner.risk.write().await;
-        let _ = risk.sync_pnl_totals_from_db().await;
-        risk.metrics_json(open_n, ws_stale)
+        // UI snapshots fire every 2 s — avoid a write lock + DB reconcile on each
+        // tick; that contended with position monitoring and could freeze the app.
+        let now = Utc::now().timestamp();
+        let last_sync = self.inner.last_risk_sync_at.load(Ordering::Relaxed);
+        if now.saturating_sub(last_sync) >= 30 {
+            if let Ok(mut risk) = self.inner.risk.try_write() {
+                self.inner.last_risk_sync_at.store(now, Ordering::Relaxed);
+                let _ = risk.sync_pnl_totals_from_db().await;
+                return risk.metrics_json(open_n, ws_stale);
+            }
+        }
+        if let Ok(risk) = self.inner.risk.try_read() {
+            return risk.metrics_json(open_n, ws_stale);
+        }
+        // Risk lock busy (signal execution) — return lightweight metrics so the
+        // snapshot cache never blocks the UI thread.
+        json!({
+            "equity": 0,
+            "peak_equity": 0,
+            "daily_pnl": 0,
+            "daily_pnl_pct": 0,
+            "weekly_pnl": 0,
+            "equity_source": "busy",
+            "open_positions": open_n,
+            "trading_paused": false,
+            "kill_switch": false,
+            "max_risk_per_trade_pct": self.inner_cfg().risk.max_risk_per_trade * 100.0,
+            "ws_stale": ws_stale,
+        })
     }
 
     pub async fn get_symbol_klines(&self, symbol: &str) -> Vec<crate::exchange::KlineBar> {
@@ -869,8 +911,10 @@ impl ScannerService {
             .await
         {
             Ok(pnl) => {
+                self.inner.note_position_closed();
                 let mut risk = self.inner.risk.write().await;
                 let _ = risk.update_pnl(pnl).await;
+                drop(risk);
                 let _ = self
                     .inner
                     .db
@@ -997,7 +1041,9 @@ impl ScannerInner {
         let ticker_inner = self.clone();
         let ticker_task = tokio::spawn(async move {
             while let Some(batch) = ticker_rx.recv().await {
-                ticker_inner.process_tickers(batch).await;
+                // Pass Arc<Self> so process_tickers can spawn signal-execution tasks
+                // without blocking the receive loop.
+                Arc::clone(&ticker_inner).process_tickers(batch).await;
             }
         });
 
@@ -1977,18 +2023,98 @@ impl ScannerInner {
         };
     }
 
-    async fn process_tickers(&self, tickers: Vec<TickerSnapshot>) {
+    /// Open-position count for capacity gating (DB hit at most once per second).
+    async fn current_open_positions(&self) -> i64 {
+        let now = Utc::now().timestamp();
+        let last = self.last_open_count_at.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 1 {
+            let cached = self.cached_open_positions.load(Ordering::Relaxed);
+            if cached >= 0 {
+                return cached;
+            }
+        }
+        let n = self.db.count_open_positions().await.unwrap_or(0);
+        self.cached_open_positions.store(n, Ordering::Relaxed);
+        self.last_open_count_at.store(now, Ordering::Relaxed);
+        n
+    }
+
+    async fn at_position_capacity(&self) -> bool {
+        let n = self.current_open_positions().await;
+        n >= self.cfg().risk.max_concurrent_positions as i64
+    }
+
+    fn note_position_opened(&self) {
+        let cached = self.cached_open_positions.load(Ordering::Relaxed);
+        if cached >= 0 {
+            self.cached_open_positions
+                .store(cached + 1, Ordering::Relaxed);
+        }
+    }
+
+    fn note_position_closed(&self) {
+        let cached = self.cached_open_positions.load(Ordering::Relaxed);
+        if cached > 0 {
+            self.cached_open_positions
+                .store(cached - 1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether live trading is active — never blocks on live-trader mutex.
+    fn trading_is_live(&self) -> bool {
+        if let Ok(live) = self.live.try_lock() {
+            return live.is_live();
+        }
+        // Live trader busy (order in flight) — treat as paper to avoid queueing.
+        false
+    }
+
+    /// Lightweight scan entry when the position book is full — skips ML/DB signal work.
+    async fn record_capacity_reject(&self, signal: &PumpSignal, ticker: &TickerSnapshot) {
+        let max = self.cfg().risk.max_concurrent_positions;
+        let side = if signal.price_change_pct >= 0.0 {
+            "long"
+        } else {
+            "short"
+        };
+        self.maybe_record_scan(
+            &signal.symbol,
+            "rejected",
+            &format!("Max positions ({max}) reached"),
+            Some(signal.composite_score),
+            Some(signal.confluence_count),
+            Some(side),
+            ticker,
+        )
+        .await;
+    }
+
+    /// Process a batch of WebSocket ticker updates.
+    ///
+    /// Takes `Arc<Self>` so that signal-execution tasks can be spawned without
+    /// blocking the ticker-receive loop. This is the primary fix for the freeze:
+    /// previously this function was awaited inline, meaning any slow REST call
+    /// (order placement, SL/TP setup, leverage change) would stall all ticker
+    /// processing until it completed.
+    async fn process_tickers(self: Arc<Self>, tickers: Vec<TickerSnapshot>) {
         // Stamp the last time we received live ticker data for WS-staleness detection.
         self.last_tick_at.store(Utc::now().timestamp(), Ordering::Relaxed);
 
         let tracked: Vec<String> = self.tracked_symbols.read().await.clone();
         let cfg = self.cfg();
 
+        // Batch-update ticker_map with all tickers in a single write lock rather
+        // than acquiring and releasing it once per ticker in the batch.
+        {
+            let mut tmap = self.ticker_map.write().await;
+            for ticker in &tickers {
+                tmap.insert(ticker.symbol.clone(), ticker.clone());
+            }
+        }
+
+        let at_capacity = self.at_position_capacity().await;
+
         for ticker in tickers {
-            self.ticker_map
-                .write()
-                .await
-                .insert(ticker.symbol.clone(), ticker.clone());
             if !tracked.contains(&ticker.symbol) {
                 continue;
             }
@@ -2014,14 +2140,73 @@ impl ScannerInner {
             };
 
             if let Some((signal, klines)) = candidate {
-                self.process_ai_candidate(signal, klines, &ticker).await;
+                if at_capacity {
+                    self.record_capacity_reject(&signal, &ticker).await;
+                    continue;
+                }
+                // Serialize signal execution so concurrent candidates cannot race
+                // past max-position checks (SQLite read-then-write) or block the UI
+                // snapshot path with dozens of parallel DB writes.
+                let inner = Arc::clone(&self);
+                let ticker_clone = ticker.clone();
+                let exec_sem = Arc::clone(&self.signal_exec);
+                tokio::spawn(async move {
+                    let _permit = exec_sem.acquire().await.ok();
+                    inner
+                        .process_ai_candidate(signal, klines, &ticker_clone)
+                        .await;
+                });
             }
         }
 
-        let map = self.ticker_map.read().await.clone();
-        let mut risk = self.risk.write().await;
-        let _ = self.paper.lock().await.monitor_positions(&map, &mut risk).await;
-        let _ = self.live_monitor.lock().await.monitor(&map, &mut risk).await;
+        // Exit monitoring with 10 open positions can mean 10+ DB round-trips per
+        // second — never run it on the ticker hot-path; spawn and use try_write.
+        let now = Utc::now().timestamp();
+        let last = self.last_pos_monitor_at.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 1 {
+            self.last_pos_monitor_at.store(now, Ordering::Relaxed);
+            let inner = Arc::clone(&self);
+            tokio::spawn(async move {
+                let map = inner.monitor_ticker_map().await;
+                if map.is_empty() {
+                    return;
+                }
+                if let Ok(mut risk) = inner.risk.try_write() {
+                    let _ = inner.paper.lock().await.monitor_positions(&map, &mut risk).await;
+                    let _ = inner
+                        .live_monitor
+                        .lock()
+                        .await
+                        .monitor(&map, &mut risk)
+                        .await;
+                }
+                // Positions may have closed during monitoring — force a fresh count
+                // on the next capacity check so freed slots are available promptly.
+                inner
+                    .cached_open_positions
+                    .store(-1, Ordering::Relaxed);
+            });
+        }
+    }
+
+    /// Build a minimal ticker map for open-position monitoring only.
+    /// Avoids cloning the full tracked-symbol ticker map on every WS batch.
+    async fn monitor_ticker_map(&self) -> HashMap<String, TickerSnapshot> {
+        let positions = self.db.get_open_positions().await.unwrap_or_default();
+        if positions.is_empty() {
+            return HashMap::new();
+        }
+        let tickers = self.ticker_map.read().await;
+        let mut map = HashMap::with_capacity(positions.len());
+        for pos in positions {
+            let Some(symbol) = pos.get("symbol").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Some(ticker) = tickers.get(symbol) {
+                map.insert(symbol.to_string(), ticker.clone());
+            }
+        }
+        map
     }
 
     /// Route a fresh AI candidate through the ML/sentiment pipeline and emit
@@ -2033,6 +2218,11 @@ impl ScannerInner {
         klines: Vec<crate::exchange::KlineBar>,
         ticker: &TickerSnapshot,
     ) {
+        if self.at_position_capacity().await {
+            self.record_capacity_reject(&signal, ticker).await;
+            return;
+        }
+
         let side = if signal.price_change_pct >= 0.0 { "long" } else { "short" };
         self.maybe_record_scan(
             &signal.symbol,
@@ -2111,6 +2301,15 @@ impl ScannerInner {
     }
 
     async fn emit_signal(&self, mut signal: PumpSignal) {
+        if self.at_position_capacity().await {
+            debug!(
+                "Skipping signal for {} — max positions ({}) reached",
+                signal.symbol,
+                self.cfg().risk.max_concurrent_positions
+            );
+            return;
+        }
+
         let id = match self.db.insert_signal(&signal).await {
             Ok(id) => id,
             Err(exc) => {
@@ -2137,14 +2336,9 @@ impl ScannerInner {
             )
             .await;
         }
-        let event_msg = format!(
-            "Signal: {} score={:.1}",
-            signal.symbol, signal.composite_score
-        );
-        let _ = self
-            .db
-            .log_event("signal", &event_msg, Some(payload))
-            .await;
+        // Scan feed + in-memory buffer already surface new signals. Skip the
+        // audit_log "signal" row here — it duplicated trade_blocked toasts and
+        // bloated every WS snapshot with heavy JSON payloads.
 
         // Gate execution when the WS feed is stale — prices may be stale too.
         let stale_threshold = self.cfg().risk.ws_stale_sec as i64;
@@ -2168,18 +2362,167 @@ impl ScannerInner {
             return;
         }
 
-        let mut risk = self.risk.write().await;
-        let live = self.live.lock().await;
-        match live.open_from_signal(&signal, &mut risk).await {
+        // Execute signal: paper path is fast (no REST calls), live path splits
+        // risk.prepare / exchange REST calls / risk.commit to minimize lock
+        // contention. Neither path blocks the ticker loop because emit_signal
+        // is always called from a spawned background task (see process_tickers).
+        let is_live = self.trading_is_live();
+        let mode = if is_live { "live" } else { "paper" };
+
+        let open_result = if !is_live {
+            // Paper: only risk.write() — no live-trader mutex (contract lookup is best-effort).
+            let mut risk = match self.risk.try_write() {
+                Ok(r) => r,
+                Err(_) => {
+                    debug!("Skipping paper open for {} — risk lock busy", signal.symbol);
+                    if let Some(id) = signal.signal_id {
+                        let _ = self.db.set_signal_reject_reason(id, "risk_busy").await;
+                    }
+                    return;
+                }
+            };
+            match risk.try_open_from_signal(&signal, true).await {
+                Ok(Some(id)) => {
+                    let contract_max = if let Ok(live) = self.live.try_lock() {
+                        live.max_leverage_for_symbol(&signal.symbol)
+                    } else {
+                        signal.suggested_leverage as i32
+                    };
+                    let corrected =
+                        signal.suggested_leverage.min(contract_max as u32).max(1) as i32;
+                    let _ = self.db.update_position_leverage(id, corrected).await;
+                    Ok(Some(id))
+                }
+                Ok(None) => Ok(None),
+                Err(exc) => Err(exc),
+            }
+        } else {
+            // Live: split locks so risk.write() is never held during REST calls.
+            // Step 1 — prepare (brief risk.write(), DB ops only).
+            let mut prepared = {
+                let mut risk = match self.risk.try_write() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        debug!("Skipping live open for {} — risk lock busy", signal.symbol);
+                        if let Some(id) = signal.signal_id {
+                            let _ = self.db.set_signal_reject_reason(id, "risk_busy").await;
+                        }
+                        return;
+                    }
+                };
+                match risk.prepare_open_from_signal(&signal).await {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        if let Some(id) = signal.signal_id {
+                            let _ = self.db.set_signal_reject_reason(id, "trade_blocked").await;
+                        }
+                        return;
+                    }
+                    Err(exc) => {
+                        warn!("Risk prepare failed for {}: {exc}", signal.symbol);
+                        return;
+                    }
+                }
+            }; // risk.write() released here
+
+            // Step 2 — submit order to exchange (live.lock(), REST calls).
+            // risk lock is NOT held during this step.
+            let (success, limit_order_id) = {
+                let live = self.live.lock().await;
+                match live.execute_live_order(&signal, &mut prepared).await {
+                    Ok(v) => v,
+                    Err(exc) => {
+                        warn!("Live order execution failed for {}: {exc}", signal.symbol);
+                        return;
+                    }
+                }
+            }; // live.lock() released here
+
+            if !success {
+                if let Some(id) = signal.signal_id {
+                    let _ = self.db.set_signal_reject_reason(id, "trade_blocked").await;
+                }
+                return;
+            }
+
+            // Step 3 — commit position to DB (brief risk.write(), fast).
+            let commit_result = {
+                let mut risk = match self.risk.try_write() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!(
+                            "Risk lock busy after live fill for {} — position may need manual reconcile",
+                            signal.symbol
+                        );
+                        return;
+                    }
+                };
+                risk.commit_open_from_signal(&signal, false, &prepared).await
+            };
+
+            // Step 4 — schedule limit-order TTL cancel now that we have the pos_id.
+            if let (Ok(Some(pos_id)), Some(order_id)) = (&commit_result, limit_order_id) {
+                let cancel_client = self.live.lock().await.client().clone();
+                let cancel_symbol = signal.symbol.clone();
+                let limit_ttl = self.cfg().execution.limit_ttl_sec;
+                let db_clone = self.db.clone();
+                let pending_pos_id = *pos_id;
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(limit_ttl)).await;
+                    match cancel_client.cancel_order(&cancel_symbol, &order_id).await {
+                        Ok(_) => {
+                            let _ = db_clone.log_event(
+                                "limit_order_cancelled",
+                                &format!("Limit TTL expired for {} — cancelled {}", cancel_symbol, order_id),
+                                None,
+                            ).await;
+                            if let Ok(Some(p)) = db_clone.get_position_by_id(pending_pos_id).await {
+                                let filled = p
+                                    .get("exchange_position_id")
+                                    .and_then(|v| v.as_i64())
+                                    .is_some();
+                                if !filled {
+                                    let entry = p
+                                        .get("entry_price")
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0);
+                                    let _ = db_clone
+                                        .close_position_synced(
+                                            pending_pos_id,
+                                            "limit_ttl_expired",
+                                            1.0,
+                                            0.0,
+                                            entry,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Limit cancel for {}: {e}", cancel_symbol);
+                        }
+                    }
+                });
+            }
+
+            commit_result
+        };
+
+        let contract_size = if let Ok(live) = self.live.try_lock() {
+            live.contract_size(&signal.symbol)
+        } else {
+            1.0
+        };
+
+        match open_result {
             Ok(Some(pos_id)) => {
-                let mode = if live.is_live() { "live" } else { "paper" };
+                self.note_position_opened();
                 info!("{mode} position opened id={pos_id} {}", signal.symbol);
                 let side_str = if signal.price_change_pct >= 0.0 {
                     "LONG"
                 } else {
                     "SHORT"
                 };
-                let contract_size = live.contract_size(&signal.symbol);
                 let (size, entry, leverage) = self
                     .db
                     .get_position_by_id(pos_id)

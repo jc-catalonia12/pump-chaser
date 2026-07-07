@@ -7,7 +7,24 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/styles.css" />
+  <script type="importmap" id="asset-importmap"></script>
+  <script>
+    (function () {
+      var t = Date.now();
+      window.__ASSET_T = t;
+      document.getElementById("asset-importmap").textContent = JSON.stringify({
+        imports: {
+          "/charts.js": "/charts.js?t=" + t,
+          "/event-labels.js": "/event-labels.js?t=" + t,
+          "/time.js": "/time.js?t=" + t
+        }
+      });
+      var link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = "/styles.css?t=" + t;
+      document.head.appendChild(link);
+    })();
+  </script>
   <script src="/desktop-guard.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://unpkg.com/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
@@ -418,13 +435,26 @@
               </div>
               <div id="training-promotion-stats" class="insight-panel-body">Loading…</div>
             </div>
-            <div class="card">
+            <div class="card training-sentiment-card">
               <div class="card-head">
                 <h2>Market Sentiment</h2>
                 <span id="training-sentiment-score" class="tag">—</span>
               </div>
-              <div id="training-sentiment-stats" class="insight-panel-body">Loading…</div>
-              <div id="training-sentiment-headlines" class="training-headlines-list">—</div>
+              <div id="training-sentiment-stats" class="table-wrap">Loading…</div>
+              <div class="training-sentiment-section">
+                <div class="training-sentiment-section-head">
+                  <h3>Symbol scores</h3>
+                  <span id="training-sentiment-symbol-count" class="hint">—</span>
+                </div>
+                <div id="training-sentiment-symbols" class="table-wrap">—</div>
+              </div>
+              <div class="training-sentiment-section">
+                <div class="training-sentiment-section-head">
+                  <h3>Latest headlines</h3>
+                  <span id="training-sentiment-headline-count" class="hint">—</span>
+                </div>
+                <div id="training-sentiment-headlines" class="table-wrap">—</div>
+              </div>
             </div>
           </div>
 
@@ -712,7 +742,46 @@
 
   <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="false"></div>
 
-  <script src="/charts.js" type="module"></script>
-  <script src="/app.js?v=11" type="module"></script>
+  <!-- Bot assistant -->
+  <button id="bot-assistant-fab" class="bot-assistant-fab" type="button" aria-label="Open bot assistant" aria-expanded="false" aria-controls="bot-assistant-panel">
+    <span class="bot-assistant-fab-glow" aria-hidden="true"></span>
+    <svg class="bot-assistant-robot" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+      <rect class="bot-assistant-antenna" x="30" y="4" width="4" height="10" rx="2" fill="currentColor"/>
+      <circle class="bot-assistant-antenna-tip" cx="32" cy="4" r="4" fill="var(--accent)"/>
+      <rect x="14" y="16" width="36" height="32" rx="10" fill="currentColor" opacity="0.95"/>
+      <rect x="18" y="22" width="10" height="10" rx="3" fill="var(--bg)"/>
+      <rect x="36" y="22" width="10" height="10" rx="3" fill="var(--bg)"/>
+      <circle cx="23" cy="27" r="2.5" fill="var(--accent)"/>
+      <circle cx="41" cy="27" r="2.5" fill="var(--accent)"/>
+      <path d="M24 38h16" stroke="var(--bg)" stroke-width="3" stroke-linecap="round"/>
+      <rect class="bot-assistant-arm bot-assistant-arm-l" x="6" y="26" width="8" height="16" rx="4" fill="currentColor"/>
+      <rect class="bot-assistant-arm bot-assistant-arm-r" x="50" y="26" width="8" height="16" rx="4" fill="currentColor"/>
+      <rect x="22" y="48" width="8" height="10" rx="3" fill="currentColor"/>
+      <rect x="34" y="48" width="8" height="10" rx="3" fill="currentColor"/>
+    </svg>
+  </button>
+
+  <div id="bot-assistant-panel" class="bot-assistant-panel hidden" role="dialog" aria-label="Bot assistant chat" aria-hidden="true">
+    <div class="bot-assistant-head">
+      <div class="bot-assistant-head-title">
+        <span class="bot-assistant-head-icon" aria-hidden="true">🤖</span>
+        <div>
+          <strong>Pump Chaser Assistant</strong>
+          <span class="hint">Ask about status, risk, positions &amp; training</span>
+        </div>
+      </div>
+      <button id="bot-assistant-close" class="icon-btn" type="button" aria-label="Close assistant">×</button>
+    </div>
+    <div id="bot-assistant-messages" class="bot-assistant-messages" tabindex="0"></div>
+    <form id="bot-assistant-form" class="bot-assistant-form">
+      <input id="bot-assistant-input" type="text" placeholder="Ask about bot progress…" autocomplete="off" maxlength="2000" />
+      <button id="bot-assistant-send" class="btn btn-primary btn-sm" type="submit">Send</button>
+    </form>
+  </div>
+
+  <script type="module">
+    const t = window.__ASSET_T || Date.now();
+    await import(`/app.js?t=${t}`);
+  </script>
 </body>
 </html>

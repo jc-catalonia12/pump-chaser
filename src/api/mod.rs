@@ -47,6 +47,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sentiment/status", get(handlers::sentiment_status))
         .route("/sentiment/news", get(handlers::sentiment_news))
         .route("/llm/status", get(handlers::llm_regime_status))
+        .route("/assistant/chat", post(handlers::assistant_chat))
         .route("/tuner/history", get(handlers::tuner_history))
         .route("/promotion/status", get(handlers::promotion_status))
         .route("/audit", get(handlers::audit))

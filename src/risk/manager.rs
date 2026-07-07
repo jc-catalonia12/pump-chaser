@@ -55,6 +55,8 @@ pub struct RiskManager {
     /// Persisted implicitly through the cooldown window; not stored in DB (lost
     /// on restart, which is acceptable — a restart is a fresh session).
     symbol_cooldowns: HashMap<String, i64>,
+    /// Throttle duplicate trade_blocked audit rows (symbol|reason → unix sec).
+    blocked_log_gate: HashMap<String, i64>,
 }
 
 impl RiskManager {
@@ -66,6 +68,7 @@ impl RiskManager {
             db: db.clone(),
             state,
             symbol_cooldowns: HashMap::new(),
+            blocked_log_gate: HashMap::new(),
         };
         let reset_on_start = rm.config.read().unwrap().execution.paper_reset_on_start;
         let equity_zero = rm.state.equity < 1.0;
@@ -446,6 +449,22 @@ impl RiskManager {
         self.db.save_portfolio_state(&self.state).await
     }
 
+    /// Log a trade_blocked audit row at most once per symbol+reason every 30 s.
+    async fn log_trade_blocked_throttled(&mut self, signal: &PumpSignal, message: &str) {
+        let now = Utc::now().timestamp();
+        let key = format!("{}|{}", signal.symbol, message);
+        if let Some(last) = self.blocked_log_gate.get(&key) {
+            if now.saturating_sub(*last) < 30 {
+                return;
+            }
+        }
+        self.blocked_log_gate.insert(key, now);
+        let _ = self
+            .db
+            .log_event("trade_blocked", message, Some(signal.to_payload()))
+            .await;
+    }
+
     /// Validate risk gates and compute size without writing to the positions table.
     pub async fn prepare_open_from_signal(
         &mut self,
@@ -453,42 +472,31 @@ impl RiskManager {
     ) -> Result<Option<PreparedOpen>> {
         let open_count = self.db.count_open_positions().await?;
         if let Err(BotError::RiskBlocked(msg)) = self.can_open_position(open_count).await {
-            let _ = self
-                .db
-                .log_event("trade_blocked", &msg, Some(signal.to_payload()))
-                .await;
+            // Scanner records a lightweight scan reject when the book is full;
+            // skip audit_log spam that floods the notification panel and SQLite.
+            if !msg.contains("Max positions") {
+                self.log_trade_blocked_throttled(signal, &msg).await;
+            }
             return Ok(None);
         }
 
         let cfg = self.config.read().unwrap().clone();
         if self.db.has_open_position_on_symbol(&signal.symbol).await? {
-            let _ = self
-                .db
-                .log_event(
-                    "trade_blocked",
-                    &format!("{} already has an open position", signal.symbol),
-                    Some(signal.to_payload()),
-                )
-                .await;
+            self.log_trade_blocked_throttled(
+                signal,
+                &format!("{} already has an open position", signal.symbol),
+            )
+            .await;
             return Ok(None);
         }
 
         if let Err(BotError::RiskBlocked(msg)) = self.can_open_symbol(&signal.symbol) {
-            let _ = self
-                .db
-                .log_event("trade_blocked", &msg, Some(signal.to_payload()))
-                .await;
+            self.log_trade_blocked_throttled(signal, &msg).await;
             return Ok(None);
         }
 
         if signal.suggested_risk_pct / 100.0 > cfg.risk.max_risk_per_trade {
-            let _ = self
-                .db
-                .log_event(
-                    "trade_blocked",
-                    "Signal risk exceeds max",
-                    Some(signal.to_payload()),
-                )
+            self.log_trade_blocked_throttled(signal, "Signal risk exceeds max")
                 .await;
             return Ok(None);
         }
@@ -506,17 +514,14 @@ impl RiskManager {
                 .get_open_position_by_symbol_side(&signal.symbol, opposite, None)
                 .await
             {
-                let _ = self
-                    .db
-                    .log_event(
-                        "trade_blocked",
-                        &format!(
-                            "Hedge blocked: {} already has an open {opposite} position",
-                            signal.symbol
-                        ),
-                        Some(signal.to_payload()),
-                    )
-                    .await;
+                self.log_trade_blocked_throttled(
+                    signal,
+                    &format!(
+                        "Hedge blocked: {} already has an open {opposite} position",
+                        signal.symbol
+                    ),
+                )
+                .await;
                 return Ok(None);
             }
         }
@@ -552,16 +557,14 @@ impl RiskManager {
                 .map(|(tp, frac)| (tp - entry).abs() * size * frac)
                 .sum();
             if total_projected < min_profit {
-                let _ = self
-                    .db
-                    .log_event(
-                        "trade_blocked",
-                        &format!(
-                            "Expected profit {total_projected:.2} USDT < min {min_profit:.2} USDT — size too small for {}", signal.symbol
-                        ),
-                        Some(signal.to_payload()),
-                    )
-                    .await;
+                self.log_trade_blocked_throttled(
+                    signal,
+                    &format!(
+                        "Expected profit {total_projected:.2} USDT < min {min_profit:.2} USDT — size too small for {}",
+                        signal.symbol
+                    ),
+                )
+                .await;
                 return Ok(None);
             }
         }

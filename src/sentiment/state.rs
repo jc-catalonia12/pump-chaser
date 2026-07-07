@@ -108,6 +108,22 @@ impl SentimentService {
             }));
         }
 
+        stored.sort_by(|a, b| {
+            let ta = a
+                .get("published_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.timestamp())
+                .unwrap_or(0);
+            let tb = b
+                .get("published_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.timestamp())
+                .unwrap_or(0);
+            tb.cmp(&ta)
+        });
+
         let global_score = if global_w > 0.0 {
             (global / global_w).clamp(-1.0, 1.0)
         } else {
