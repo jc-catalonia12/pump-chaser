@@ -73,12 +73,14 @@ impl LlmRegimeService {
     pub async fn status_json(&self) -> Value {
         let cfg = self.config.read().unwrap().llm.clone();
         let s = self.state.read().await;
+        let ollama_reachable = self.probe_reachable(&cfg).await;
         json!({
             "enabled": cfg.enabled,
             "base_url": cfg.base_url,
             "model": cfg.model,
             "poll_interval_sec": cfg.poll_interval_sec,
             "available": s.available,
+            "ollama_reachable": ollama_reachable,
             "consecutive_failures": s.consecutive_failures,
             "last_error": s.last_error,
             "updated_at": s.updated_at,
@@ -92,6 +94,22 @@ impl LlmRegimeService {
             },
             "last_raw": s.last_raw,
         })
+    }
+
+    /// Whether the Ollama HTTP API is reachable right now (independent of whether
+    /// the scanner has completed a regime classification yet).
+    async fn probe_reachable(&self, cfg: &crate::config::LlmConfig) -> bool {
+        if !cfg.enabled {
+            return false;
+        }
+        let url = format!("{}/api/tags", cfg.base_url.trim_end_matches('/'));
+        self.client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
     }
 
     /// Run one classification against Ollama and update the cached regime.

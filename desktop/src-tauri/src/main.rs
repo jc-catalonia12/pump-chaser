@@ -254,6 +254,8 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
 /// This is intentionally resilient — any failure is logged and the bot
 /// continues without the regime-filter layer.
 fn setup_ollama(app: &tauri::AppHandle, handle: Arc<ollama::OllamaHandle>) {
+    ollama::dedupe_llama_servers(|msg| log_startup(&format!("[ollama] {msg}")));
+
     // If the API is already reachable (externally started service, OS autostart,
     // etc.) we do not manage its lifecycle at all.
     if ollama::is_api_reachable() {
@@ -396,8 +398,23 @@ fn run_startup_sequence(app: tauri::AppHandle, ollama_handle: Arc<ollama::Ollama
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
-fn main() {
+fn configure_packaged_paths(app: &tauri::AppHandle) {
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        log_startup(&format!("Tauri resource dir: {}", resource_dir.display()));
+        mexc_trading_bot::utils::prime_packaged_install(&resource_dir);
+    } else {
+        log_startup("Tauri resource dir unavailable — using exe-path discovery");
+    }
     mexc_trading_bot::utils::init_runtime_paths();
+    if let Ok(config_path) = std::env::var("MEXC_BOT_CONFIG") {
+        log_startup(&format!("Config path: {config_path}"));
+    }
+    if let Ok(resource_path) = std::env::var("MEXC_BOT_RESOURCE_DIR") {
+        log_startup(&format!("Bundled resources: {resource_path}"));
+    }
+}
+
+fn main() {
     log_startup("MEXC Trading Bot desktop process started");
 
     // Shared Ollama process handle — registered as Tauri managed state so the
@@ -411,6 +428,7 @@ fn main() {
         .manage(ollama_handle)
         .invoke_handler(tauri::generate_handler![install_update])
         .setup(move |app| {
+            configure_packaged_paths(app.handle());
             splash_status(app.handle(), "Starting…", 1);
             run_startup_sequence(app.handle().clone(), Arc::clone(&handle_for_setup));
             Ok(())

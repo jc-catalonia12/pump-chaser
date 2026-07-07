@@ -2,6 +2,14 @@ name: Build installers
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish a GitHub Release with latest.json (for in-app updater)"
+        type: boolean
+        default: true
+      tag:
+        description: "Release tag override (default: v + VERSION file, e.g. v0.1.8)"
+        required: false
   push:
     branches: [main, master]
     paths-ignore:
@@ -17,7 +25,39 @@ env:
   ONNX_PATH: data/models/supervised.onnx
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+      publish: ${{ steps.read.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and tag
+        id: read
+        shell: bash
+        run: |
+          VERSION="$(tr -d ' \n\r' < VERSION)"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v${VERSION}"
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.publish_release }}" != "false" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-macos:
+    needs: version
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +78,24 @@ jobs:
             echo "$ONLINE_MODEL_JSON_B64" | base64 --decode > data/models/online_model.json
           fi
 
+      - name: Inject updater pubkey + endpoint into tauri.conf.json
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+          TAURI_UPDATE_ENDPOINT: ${{ secrets.TAURI_UPDATE_ENDPOINT }}
+        run: |
+          if [ -n "$TAURI_UPDATER_PUBKEY" ]; then
+            python3 -c "
+          import json, os
+          conf = json.load(open('desktop/src-tauri/tauri.conf.json'))
+          conf.setdefault('plugins', {}).setdefault('updater', {})
+          conf['plugins']['updater']['pubkey'] = os.environ['TAURI_UPDATER_PUBKEY']
+          if os.environ.get('TAURI_UPDATE_ENDPOINT'):
+              conf['plugins']['updater']['endpoints'] = [os.environ['TAURI_UPDATE_ENDPOINT']]
+          json.dump(conf, open('desktop/src-tauri/tauri.conf.json', 'w'), indent=2)
+          "
+            echo "Injected updater pubkey and endpoint"
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: swatinem/rust-cache@v2
@@ -45,16 +103,37 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0.0" --locked
 
+      - name: Stage release assets
+        run: bash scripts/prepare_release_assets.sh
+
+      - name: Sync version from VERSION file
+        run: bash scripts/sync_version.sh
+
       - name: Build macOS installer
-        run: bash scripts/build_installers.sh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        working-directory: desktop
+        run: cargo tauri build
+
+      - name: Collect macOS release artifacts
+        run: |
+          mkdir -p dist/release-macos
+          BUNDLE="desktop/src-tauri/target/release/bundle"
+          find "$BUNDLE" \
+            \( -name "*.dmg" -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \) \
+            -exec cp {} dist/release-macos/ \; 2>/dev/null || true
+          echo "=== macOS artifacts ==="
+          ls -lh dist/release-macos/ || true
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-installer
+          name: macos-release
           if-no-files-found: error
-          path: dist/macos/**
+          path: dist/release-macos/**
 
   build-windows:
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,6 +157,24 @@ jobs:
             )
           }
 
+      - name: Inject updater pubkey + endpoint into tauri.conf.json
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+          TAURI_UPDATE_ENDPOINT: ${{ secrets.TAURI_UPDATE_ENDPOINT }}
+        shell: pwsh
+        run: |
+          if ($env:TAURI_UPDATER_PUBKEY) {
+            $conf = Get-Content "desktop/src-tauri/tauri.conf.json" | ConvertFrom-Json
+            if (-not $conf.plugins) { $conf | Add-Member -MemberType NoteProperty -Name plugins -Value @{} }
+            if (-not $conf.plugins.updater) { $conf.plugins | Add-Member -MemberType NoteProperty -Name updater -Value @{} }
+            $conf.plugins.updater.pubkey = $env:TAURI_UPDATER_PUBKEY
+            if ($env:TAURI_UPDATE_ENDPOINT) {
+              $conf.plugins.updater.endpoints = @($env:TAURI_UPDATE_ENDPOINT)
+            }
+            $conf | ConvertTo-Json -Depth 10 | Set-Content "desktop/src-tauri/tauri.conf.json"
+            Write-Host "Injected updater pubkey and endpoint"
+          }
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: swatinem/rust-cache@v2
@@ -85,12 +182,100 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0.0" --locked
 
+      - name: Stage release assets (bash)
+        shell: bash
+        run: bash scripts/prepare_release_assets.sh
+
+      - name: Sync version from VERSION file
+        shell: bash
+        run: bash scripts/sync_version.sh
+
       - name: Build Windows installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        working-directory: desktop
+        run: cargo tauri build
+
+      - name: Collect Windows release artifacts
         shell: pwsh
-        run: .\scripts\build_installers.ps1
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/release-windows" | Out-Null
+          $bundle = "desktop/src-tauri/target/release/bundle"
+          Get-ChildItem "$bundle/msi" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in ".msi",".sig",".zip" } |
+            Copy-Item -Destination "dist/release-windows" -Force
+          Get-ChildItem "$bundle/nsis" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in ".exe",".sig",".zip" -or $_.Name -like "*setup*" } |
+            Copy-Item -Destination "dist/release-windows" -Force
+          Write-Host "=== Windows artifacts ==="
+          Get-ChildItem "dist/release-windows" | Format-Table Name, Length -AutoSize
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-installer
+          name: windows-release
           if-no-files-found: error
-          path: dist/windows/**
+          path: dist/release-windows/**
+
+  publish:
+    needs: [version, build-macos, build-windows]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-release
+          path: dist/release-macos
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: dist/release-windows
+
+      - name: Generate latest.json (auto-updater manifest)
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          python3 scripts/gen_update_manifest.py \
+            --version "$VERSION" \
+            --tag     "$TAG" \
+            --repo    "$GITHUB_REPOSITORY" \
+            --macos   dist/release-macos \
+            --windows dist/release-windows \
+            --out     dist/latest.json
+          echo "=== latest.json ===" && cat dist/latest.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: "MEXC Trading Bot v${{ needs.version.outputs.version }}"
+          body: |
+            ## MEXC Trading Bot v${{ needs.version.outputs.version }}
+
+            Automated release from the **Build installers** workflow.
+
+            ### Installation
+            - **macOS**: download the `.dmg` and drag to Applications
+            - **Windows**: download the `.msi` installer (or `*setup*.exe`) and run it
+
+            The in-app updater reads `latest.json` from this release.
+          draft: false
+          prerelease: ${{ contains(needs.version.outputs.tag, '-') }}
+          files: |
+            dist/release-macos/*.dmg
+            dist/release-macos/*.app.tar.gz
+            dist/release-macos/*.app.tar.gz.sig
+            dist/release-windows/*.msi
+            dist/release-windows/*.msi.zip
+            dist/release-windows/*.msi.zip.sig
+            dist/release-windows/*setup*.exe
+            dist/latest.json
