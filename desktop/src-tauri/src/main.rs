@@ -59,6 +59,47 @@ fn splash_error(app: &tauri::AppHandle, message: &str) {
     }
 }
 
+// ── Bundled resources (Tauri $RESOURCE) ────────────────────────────────────
+
+/// Resolve the installer resource root using Tauri's `$RESOURCE` path.
+/// On Windows the bundled `web/` and `config/` folders live here, not always
+/// beside the `.exe` in a way [`discover_resource_root`] can find pre-startup.
+fn resolve_tauri_resource_root(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let resource = app.path().resource_dir().ok()?;
+    let mut candidates = vec![
+        resource.join("_up_").join("_up_"),
+        resource.join("_up_"),
+        resource.clone(),
+    ];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("_up_").join("_up_"));
+            candidates.push(parent.to_path_buf());
+        }
+    }
+    if let Some(found) = mexc_trading_bot::utils::discover_resource_root() {
+        candidates.push(found);
+    }
+    for candidate in candidates {
+        let has_web = candidate.join("web/index.html").is_file();
+        let has_cfg = candidate.join("config/settings.yaml").is_file();
+        if has_web || has_cfg {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn init_desktop_paths(app: &tauri::AppHandle) {
+    let resource = resolve_tauri_resource_root(app);
+    if let Some(ref root) = resource {
+        log_startup(&format!("Bundled resource root: {}", root.display()));
+    } else {
+        log_startup("Bundled resource root not found — using dev/fallback paths");
+    }
+    mexc_trading_bot::utils::init_runtime_paths_with_resource(resource);
+}
+
 // ── API server ─────────────────────────────────────────────────────────────
 
 fn spawn_api_server_if_needed() {
@@ -346,14 +387,7 @@ fn run_startup_sequence(app: tauri::AppHandle, ollama_handle: Arc<ollama::Ollama
     std::thread::spawn(move || {
         splash_status(&app, "Preparing application data…", 1);
         log_startup("Desktop startup sequence began");
-
-        // Tauri's resource_dir is authoritative on Windows (exe-adjacent `_up_/_up_/web`).
-        if let Ok(resource_dir) = app.path().resource_dir() {
-            log_startup(&format!("Tauri resource_dir: {}", resource_dir.display()));
-            mexc_trading_bot::utils::configure_from_resource_dir(&resource_dir);
-        } else {
-            mexc_trading_bot::utils::init_runtime_paths();
-        }
+        init_desktop_paths(&app);
 
         splash_status(&app, "Copying settings and models (first launch)…", 2);
         std::thread::sleep(Duration::from_millis(150));
@@ -373,41 +407,15 @@ fn run_startup_sequence(app: tauri::AppHandle, ollama_handle: Arc<ollama::Ollama
                 .display()
                 .to_string();
             log_startup("API server did not become reachable within 60 seconds");
-            let err_app = app.clone();
+            let err_handle = app.clone();
             let _ = app.run_on_main_thread(move || {
                 splash_error(
-                    &err_app,
+                    &err_handle,
                     &format!(
                         "The local API server did not start.\n\n\
                          • Close any other copy of this app or `cargo run`\n\
                          • Restart the app\n\
                          • Check log: {log_hint}"
-                    ),
-                );
-            });
-            return;
-        }
-
-        let web_dir = mexc_trading_bot::utils::web_assets_dir();
-        if !web_dir.join("index.html").is_file() {
-            let log_hint = mexc_trading_bot::utils::app_data_dir()
-                .join("startup.log")
-                .display()
-                .to_string();
-            log_startup(&format!(
-                "Dashboard UI missing at {} — reinstall the app",
-                web_dir.display()
-            ));
-            let err_app = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                splash_error(
-                    &err_app,
-                    &format!(
-                        "Dashboard files were not found in the installer bundle.\n\n\
-                         Web path: {}\n\
-                         Log: {log_hint}\n\n\
-                         Reinstall from a fresh GitHub Release build.",
-                        web_dir.display()
                     ),
                 );
             });
@@ -431,7 +439,6 @@ fn run_startup_sequence(app: tauri::AppHandle, ollama_handle: Arc<ollama::Ollama
 // ── Entry point ────────────────────────────────────────────────────────────
 
 fn main() {
-    mexc_trading_bot::utils::init_runtime_paths();
     log_startup("MEXC Trading Bot desktop process started");
 
     // Shared Ollama process handle — registered as Tauri managed state so the

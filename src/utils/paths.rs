@@ -20,12 +20,12 @@ const USER_MODELS_REL: &str = "data/models";
 
 /// Tauri bundles `../../config` as `Resources/_up_/_up_/config`. Search common layouts.
 fn find_resource_root_in_dir(base: &Path) -> Option<PathBuf> {
-    if base.join(CONFIG_REL).is_file() {
+    if is_bundled_resource_root(base) {
         return Some(base.to_path_buf());
     }
     for rel in ["_up_/_up_", "_up_"] {
         let nested = base.join(rel);
-        if nested.join(CONFIG_REL).is_file() {
+        if is_bundled_resource_root(&nested) {
             return Some(nested);
         }
     }
@@ -35,13 +35,13 @@ fn find_resource_root_in_dir(base: &Path) -> Option<PathBuf> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if path.join(CONFIG_REL).is_file() {
+            if is_bundled_resource_root(&path) {
                 return Some(path);
             }
             if let Ok(sub) = fs::read_dir(&path) {
                 for sub_entry in sub.flatten() {
                     let sub_path = sub_entry.path();
-                    if sub_path.is_dir() && sub_path.join(CONFIG_REL).is_file() {
+                    if sub_path.is_dir() && is_bundled_resource_root(&sub_path) {
                         return Some(sub_path);
                     }
                 }
@@ -105,11 +105,20 @@ fn packaged_resource_search_roots(exe: &Path) -> Vec<PathBuf> {
             roots.push(contents.join("Resources"));
         }
     }
-    // Tauri v2 Windows: bundled files live next to the executable (`_up_/_up_/…`).
+    // Tauri v2 Windows / Linux: bundled files live next to the executable (`_up_/_up_/…`).
     roots.push(parent.to_path_buf());
-    // Linux / legacy layouts.
+    // WiX / NSIS layouts that nest under `resources/`.
     roots.push(parent.join("resources"));
+    // Installed under Program Files with a version subfolder.
+    if let Some(grandparent) = parent.parent() {
+        roots.push(grandparent.to_path_buf());
+        roots.push(grandparent.join("resources"));
+    }
     roots
+}
+
+fn is_bundled_resource_root(path: &Path) -> bool {
+    path.join(CONFIG_REL).is_file() || path.join("web/index.html").is_file()
 }
 
 /// Running `cargo run` / `cargo tauri dev` from the repo (not an installed bundle).
@@ -131,6 +140,9 @@ pub fn is_packaged_install() -> bool {
     }
     for base in packaged_resource_search_roots(&exe) {
         if find_resource_root_in_dir(&base).is_some() {
+            return true;
+        }
+        if base.join("_up_/_up_/web/index.html").is_file() || base.join("web/index.html").is_file() {
             return true;
         }
     }
@@ -176,7 +188,19 @@ pub fn append_startup_log(message: &str) {
 
 /// Prepare paths before config/secrets load. Safe to call in dev and packaged builds.
 pub fn init_runtime_paths() {
+    init_runtime_paths_with_resource(None);
+}
+
+/// Like [`init_runtime_paths`], but the desktop shell can pass Tauri's `$RESOURCE`
+/// root (required on Windows where bundled files are not always next to the `.exe`).
+pub fn init_runtime_paths_with_resource(resource_override: Option<PathBuf>) {
     if std::env::var("MEXC_BOT_CONFIG").is_ok() {
+        return;
+    }
+
+    if let Some(root) = resource_override {
+        std::env::set_var("MEXC_BOT_RESOURCE_DIR", root.display().to_string());
+        setup_packaged_paths();
         return;
     }
 
@@ -206,18 +230,10 @@ fn setup_packaged_paths() {
         data_dir.join("secrets.json").display().to_string(),
     );
 
-    let resource = std::env::var("MEXC_BOT_RESOURCE_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(discover_resource_root);
-    if let Some(resource) = resource {
-        if std::env::var("MEXC_BOT_RESOURCE_DIR").is_err() {
-            std::env::set_var("MEXC_BOT_RESOURCE_DIR", resource.display().to_string());
-        }
+    if let Some(resource) = discover_resource_root() {
+        std::env::set_var("MEXC_BOT_RESOURCE_DIR", resource.display().to_string());
         apply_bundled_seed(&resource, &data_dir);
         migrate_legacy_models(&data_dir);
-    } else {
-        append_startup_log("WARNING: bundled config/web not found — seeding may be incomplete");
     }
 
     let user_config = data_dir.join(CONFIG_REL);
@@ -550,103 +566,40 @@ pub fn init_working_directory() {
 
 /// Directory served as the dashboard static files.
 pub fn web_assets_dir() -> PathBuf {
-    if let Ok(w) = std::env::var("MEXC_BOT_WEB_DIR") {
-        let p = PathBuf::from(&w);
-        if p.join("index.html").is_file() {
-            return p;
-        }
-    }
-    if let Ok(r) = std::env::var("MEXC_BOT_RESOURCE_DIR") {
-        let web = PathBuf::from(&r).join("web");
-        if web.join("index.html").is_file() {
+    for web in candidate_web_dirs() {
+        if web.is_dir() {
             return web;
         }
-    }
-    if let Some(root) = discover_resource_root() {
-        let web = root.join("web");
-        if web.join("index.html").is_file() {
-            return web;
-        }
-    }
-    if let Some(web) = discover_web_near_exe() {
-        return web;
-    }
-    if let Some(root) = discover_project_root() {
-        let web = root.join("web");
-        if web.join("index.html").is_file() {
-            return web;
-        }
-    }
-    // Never use compile-time paths in a packaged install — that path does not exist on the user's machine.
-    if is_packaged_install() {
-        tracing::error!(
-            "Packaged install: web UI not found near executable — dashboard will 404. \
-             Check startup.log in {}",
-            app_data_dir().display()
-        );
-        return app_data_dir().join("web");
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web")
 }
 
-/// Resolve bundled `config/` + `web/` using Tauri's resource directory (authoritative on Windows).
-pub fn configure_from_resource_dir(resource_dir: &Path) {
-    for root in resource_roots_under(resource_dir) {
-        if !root.join(CONFIG_REL).is_file() {
-            continue;
-        }
-        std::env::set_var("MEXC_BOT_RESOURCE_DIR", root.display().to_string());
-        let web = root.join("web");
-        if web.join("index.html").is_file() {
-            std::env::set_var("MEXC_BOT_WEB_DIR", web.display().to_string());
-        }
-        append_startup_log(&format!(
-            "Bundled resources: root={} web={}",
-            root.display(),
-            web.display()
-        ));
-        break;
+/// Candidate `web/` folders for the embedded Axum UI (packaged + dev).
+pub fn candidate_web_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(r) = std::env::var("MEXC_BOT_RESOURCE_DIR") {
+        out.push(PathBuf::from(&r).join("web"));
     }
-    setup_packaged_paths();
-}
-
-fn resource_roots_under(resource_dir: &Path) -> Vec<PathBuf> {
-    vec![
-        resource_dir.join("_up_").join("_up_"),
-        resource_dir.join("_up_"),
-        resource_dir.to_path_buf(),
-    ]
-}
-
-fn discover_web_near_exe() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let parent = exe.parent()?;
-    let mut candidates = vec![
-        parent.join("web"),
-        parent.join("_up_").join("_up_").join("web"),
-        parent.join("_up_").join("web"),
-        parent.join("resources").join("web"),
-        parent.join("resources")
-            .join("_up_")
-            .join("_up_")
-            .join("web"),
-    ];
-    if let Some(grand) = parent.parent() {
-        candidates.push(grand.join("web"));
-        candidates.push(grand.join("_up_").join("_up_").join("web"));
+    if let Some(root) = discover_resource_root() {
+        out.push(root.join("web"));
     }
-    for web in candidates {
-        if web.join("index.html").is_file() {
-            if let Some(root) = web.parent() {
-                if root.join(CONFIG_REL).is_file() {
-                    std::env::set_var("MEXC_BOT_RESOURCE_DIR", root.display().to_string());
+    if let Some(root) = discover_project_root() {
+        out.push(root.join("web"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for base in packaged_resource_search_roots(&exe) {
+                for rel in ["web", "_up_/_up_/web", "_up_/web"] {
+                    out.push(base.join(rel));
                 }
             }
-            std::env::set_var("MEXC_BOT_WEB_DIR", web.display().to_string());
-            return Some(web);
+            for rel in ["web", "_up_/_up_/web", "_up_/web"] {
+                out.push(parent.join(rel));
+            }
         }
     }
-    None
+    out.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web"));
+    out
 }
 
 /// App icon for `/icon.png` (packaged resource or dev fallback).

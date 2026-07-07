@@ -70,17 +70,25 @@ pub async fn run() -> Result<()> {
 
     spawn_command_poller(Arc::new(state.clone()));
 
+    let web_dir = crate::utils::web_assets_dir();
     let app = router(state);
     let addr: SocketAddr = format!("{}:{}", config_snap.server.host, config_snap.server.port)
         .parse()
         .expect("valid listen address");
 
+    if !web_dir.join("index.html").is_file() {
+        tracing::error!(
+            "Dashboard web assets not found at {} (candidates: {:?})",
+            web_dir.display(),
+            crate::utils::candidate_web_dirs()
+        );
+    } else {
+        info!("Serving dashboard from {}", web_dir.display());
+    }
+
     info!(
-        "MEXC Trading Bot API listening on http://{} (UI: http://{}/ , web_dir={}, trading.mode={})",
-        addr,
-        addr,
-        crate::utils::web_assets_dir().display(),
-        config_snap.trading.mode
+        "MEXC Trading Bot API listening on http://{} (UI: http://{}/ , trading.mode={})",
+        addr, addr, config_snap.trading.mode
     );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
