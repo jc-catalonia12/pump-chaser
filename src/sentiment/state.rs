@@ -1,6 +1,7 @@
 //! In-memory sentiment state with exponential decay.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -80,8 +81,14 @@ impl SentimentService {
         let mut global_w = 0.0f64;
         let mut per_symbol: HashMap<String, (f64, f64)> = HashMap::new();
         let mut stored: Vec<Value> = Vec::new();
+        let mut seen_headlines: HashSet<String> = HashSet::new();
 
         for h in &headlines {
+            let dedup_key = headline_dedup_key(&h.url, &h.source, &h.title);
+            if !seen_headlines.insert(dedup_key) {
+                continue;
+            }
+
             let age_sec = parse_age_sec(&h.published_at, now);
             let weight = (-ln2 * age_sec / half_life).exp();
             global += h.score * weight;
@@ -170,4 +177,13 @@ fn parse_age_sec(published_at: &str, now: chrono::DateTime<Utc>) -> f64 {
     chrono::DateTime::parse_from_rfc3339(published_at)
         .map(|d| now.signed_duration_since(d.with_timezone(&Utc)).num_seconds().max(0) as f64)
         .unwrap_or(0.0)
+}
+
+fn headline_dedup_key(url: &str, source: &str, title: &str) -> String {
+    let trimmed = url.trim();
+    if !trimmed.is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("{source}::{title}")
+    }
 }

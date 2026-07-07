@@ -287,10 +287,28 @@ impl ScannerService {
         scans.iter().take(limit).cloned().collect()
     }
 
-    /// Recent signals from the in-memory ring buffer (no DB hit).
+    /// Recent signals from the in-memory ring buffer, falling back to SQLite when
+    /// the buffer is empty (e.g. after restart before the next signal fires).
     pub async fn get_latest_signals(&self, limit: usize) -> Vec<Value> {
-        let latest = self.inner.latest_signals.read().await;
-        latest.iter().take(limit).cloned().collect()
+        {
+            let latest = self.inner.latest_signals.read().await;
+            if !latest.is_empty() {
+                return latest.iter().take(limit).cloned().collect();
+            }
+        }
+        let from_db = self
+            .inner
+            .db
+            .get_recent_signals(limit as i64)
+            .await
+            .unwrap_or_default();
+        if !from_db.is_empty() {
+            let mut latest = self.inner.latest_signals.write().await;
+            if latest.is_empty() {
+                *latest = from_db.clone();
+            }
+        }
+        from_db
     }
 
     pub async fn get_tracked_symbols(&self) -> Value {
@@ -2318,7 +2336,11 @@ impl ScannerInner {
             }
         };
         signal.signal_id = Some(id);
-        let payload = signal.to_payload();
+        let mut payload = signal.to_payload();
+        if let Value::Object(ref mut m) = payload {
+            m.insert("id".into(), json!(id));
+            m.insert("outcome".into(), json!("pending"));
+        }
         {
             let mut latest = self.latest_signals.write().await;
             latest.insert(0, payload.clone());
