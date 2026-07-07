@@ -4153,7 +4153,7 @@ let botAssistantDidDrag = false;
 let botAssistantDrag = null;
 
 const BOT_ASSISTANT_WELCOME =
-  "Hi! I'm your Pump Chaser co-pilot. Ask me about scanner status, open positions, why trades are blocked, risk/pause state, sentiment, or training progress.";
+  "Hi! I'm your Pump Chaser co-pilot. Ask about scanner status, positions, risk, sentiment, training — or tell me to change settings (e.g. \"set max positions to 5\").";
 const BOT_ASSISTANT_POS_KEY = "bot-assistant-fab-left";
 const BOT_ASSISTANT_DRAG_THRESHOLD = 8;
 const BOT_ASSISTANT_EDGE_MARGIN = 12;
@@ -4315,6 +4315,11 @@ async function sendBotAssistantMessage(text) {
     }
     botAssistantHistory.push({ role: "assistant", content: reply });
     if (botAssistantHistory.length > 20) botAssistantHistory = botAssistantHistory.slice(-20);
+    if (res.settings_applied?.ok) {
+      settingsValues = res.settings_applied.values || settingsValues;
+      if ($("#panel-settings")?.classList.contains("active")) loadSettingsTab();
+      syncTradingModeUI();
+    }
   } catch (e) {
     if (pending) {
       pending.classList.remove("pending");

@@ -94,3 +94,45 @@ jobs:
           name: windows-installer
           if-no-files-found: error
           path: dist/windows/**
+
+  publish:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-installer
+          path: dist/macos
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/windows
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}-ci.${{ github.run_number }}
+          name: MEXC Trading Bot v${{ steps.ver.outputs.version }} (CI build ${{ github.run_number }})
+          body: |
+            Automated CI build from `${{ github.sha }}` on `${{ github.ref_name }}`.
+
+            **Install**
+            - **macOS**: `.dmg` from assets below
+            - **Windows**: `*setup*.exe` or `.msi` from assets below
+
+            For signed auto-update releases, push a version tag (`git tag vX.Y.Z && git push --tags`) to run the Release workflow.
+          prerelease: true
+          files: |
+            dist/macos/**
+            dist/windows/**

@@ -76,8 +76,11 @@ pub async fn run() -> Result<()> {
         .expect("valid listen address");
 
     info!(
-        "MEXC Trading Bot API listening on http://{} (UI: http://{}/ , trading.mode={})",
-        addr, addr, config_snap.trading.mode
+        "MEXC Trading Bot API listening on http://{} (UI: http://{}/ , web_dir={}, trading.mode={})",
+        addr,
+        addr,
+        crate::utils::web_assets_dir().display(),
+        config_snap.trading.mode
     );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

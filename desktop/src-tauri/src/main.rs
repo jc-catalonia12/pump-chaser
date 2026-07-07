@@ -347,6 +347,14 @@ fn run_startup_sequence(app: tauri::AppHandle, ollama_handle: Arc<ollama::Ollama
         splash_status(&app, "Preparing application data…", 1);
         log_startup("Desktop startup sequence began");
 
+        // Tauri's resource_dir is authoritative on Windows (exe-adjacent `_up_/_up_/web`).
+        if let Ok(resource_dir) = app.path().resource_dir() {
+            log_startup(&format!("Tauri resource_dir: {}", resource_dir.display()));
+            mexc_trading_bot::utils::configure_from_resource_dir(&resource_dir);
+        } else {
+            mexc_trading_bot::utils::init_runtime_paths();
+        }
+
         splash_status(&app, "Copying settings and models (first launch)…", 2);
         std::thread::sleep(Duration::from_millis(150));
 
@@ -365,15 +373,41 @@ fn run_startup_sequence(app: tauri::AppHandle, ollama_handle: Arc<ollama::Ollama
                 .display()
                 .to_string();
             log_startup("API server did not become reachable within 60 seconds");
-            let err_handle = app.clone();
+            let err_app = app.clone();
             let _ = app.run_on_main_thread(move || {
                 splash_error(
-                    &err_handle,
+                    &err_app,
                     &format!(
                         "The local API server did not start.\n\n\
                          • Close any other copy of this app or `cargo run`\n\
                          • Restart the app\n\
                          • Check log: {log_hint}"
+                    ),
+                );
+            });
+            return;
+        }
+
+        let web_dir = mexc_trading_bot::utils::web_assets_dir();
+        if !web_dir.join("index.html").is_file() {
+            let log_hint = mexc_trading_bot::utils::app_data_dir()
+                .join("startup.log")
+                .display()
+                .to_string();
+            log_startup(&format!(
+                "Dashboard UI missing at {} — reinstall the app",
+                web_dir.display()
+            ));
+            let err_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                splash_error(
+                    &err_app,
+                    &format!(
+                        "Dashboard files were not found in the installer bundle.\n\n\
+                         Web path: {}\n\
+                         Log: {log_hint}\n\n\
+                         Reinstall from a fresh GitHub Release build.",
+                        web_dir.display()
                     ),
                 );
             });

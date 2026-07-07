@@ -11,6 +11,7 @@ use crate::config::{
 };
 use crate::error::{BotError, Result};
 use crate::utils::discover_project_root;
+use crate::AppState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingsField {
@@ -91,6 +92,37 @@ pub fn user_settings_values(cfg: &AppConfig) -> Value {
         "learning": cfg.learning,
         "watchlist": cfg.watchlist,
     })
+}
+
+/// Compact settings reference for the in-app LLM assistant (editable keys + current values).
+pub fn settings_prompt_block(cfg: &AppConfig) -> String {
+    let values = user_settings_values(cfg);
+    let mut lines = vec![
+        "Editable settings (use dotted keys in SETTINGS_PATCH JSON):".to_string(),
+    ];
+    for section in settings_schema() {
+        lines.push(format!("\n[{}] {}", section.id, section.title));
+        for field in &section.fields {
+            let current = values
+                .pointer(&field.key.replace('.', "/"))
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "—".into());
+            let bounds = match (field.min, field.max) {
+                (Some(min), Some(max)) => format!(" (range {min}–{max})"),
+                _ => String::new(),
+            };
+            let opts = field
+                .options
+                .as_ref()
+                .map(|o| format!(" options: {}", o.join("|")))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  - {} = {} | key: {}{}{}",
+                field.label, current, field.key, bounds, opts
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 pub fn settings_schema() -> Vec<SettingsSection> {
@@ -333,6 +365,70 @@ pub fn apply_user_settings(cfg: &mut AppConfig, patch: &Value) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Apply a partial settings patch, persist to disk, and refresh in-memory config.
+pub async fn apply_config_patch(state: &AppState, patch: Value) -> Value {
+    let (prev_mexc, prev_paper_equity) = {
+        let cfg = state.config.read().unwrap().clone();
+        (cfg.mexc.clone(), cfg.execution.paper_initial_equity)
+    };
+    let mut updated = state.config.read().unwrap().clone();
+    if let Err(exc) = apply_user_settings(&mut updated, &patch) {
+        return json!({ "error": exc.to_string() });
+    }
+    if let Err(exc) = save_app_config(&updated) {
+        return json!({ "error": exc.to_string() });
+    }
+    {
+        let mut cfg = state.config.write().unwrap();
+        *cfg = updated.clone();
+    }
+    {
+        let scanner = state.scanner.read().await;
+        scanner.on_config_updated(prev_mexc).await;
+    }
+
+    let new_paper_equity = updated.execution.paper_initial_equity;
+    let paper_equity_applied = if (new_paper_equity - prev_paper_equity).abs() > 0.001 {
+        let secrets = state.secrets.read().await;
+        let paper_mode = secrets.paper_trading || !updated.execution.live_trading_enabled;
+        drop(secrets);
+        if paper_mode {
+            let open = state.db.count_open_positions().await.unwrap_or(0);
+            if open == 0 {
+                let mut risk = state.risk.write().await;
+                match risk.reset_paper_equity(new_paper_equity).await {
+                    Ok(()) => true,
+                    Err(exc) => {
+                        tracing::warn!(error = %exc, "failed to apply paper starting equity after settings save");
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    json!({
+        "ok": true,
+        "config_path": settings_file_path().display().to_string(),
+        "values": user_settings_values(&updated),
+        "live_trading_enabled": updated.execution.live_trading_enabled,
+        "applied_live": true,
+        "paper_equity_applied": paper_equity_applied,
+        "paper_equity_blocked_open_positions": !paper_equity_applied
+            && (new_paper_equity - prev_paper_equity).abs() > 0.001,
+        "scanner_restart_recommended": patch
+            .pointer("/mexc/rest_base_url")
+            .is_some()
+            || patch.pointer("/mexc/ws_url").is_some(),
+    })
 }
 
 fn deep_merge(base: &mut Value, patch: &Value) {

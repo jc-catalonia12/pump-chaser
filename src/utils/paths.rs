@@ -206,10 +206,18 @@ fn setup_packaged_paths() {
         data_dir.join("secrets.json").display().to_string(),
     );
 
-    if let Some(resource) = discover_resource_root() {
-        std::env::set_var("MEXC_BOT_RESOURCE_DIR", resource.display().to_string());
+    let resource = std::env::var("MEXC_BOT_RESOURCE_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(discover_resource_root);
+    if let Some(resource) = resource {
+        if std::env::var("MEXC_BOT_RESOURCE_DIR").is_err() {
+            std::env::set_var("MEXC_BOT_RESOURCE_DIR", resource.display().to_string());
+        }
         apply_bundled_seed(&resource, &data_dir);
         migrate_legacy_models(&data_dir);
+    } else {
+        append_startup_log("WARNING: bundled config/web not found — seeding may be incomplete");
     }
 
     let user_config = data_dir.join(CONFIG_REL);
@@ -542,19 +550,103 @@ pub fn init_working_directory() {
 
 /// Directory served as the dashboard static files.
 pub fn web_assets_dir() -> PathBuf {
+    if let Ok(w) = std::env::var("MEXC_BOT_WEB_DIR") {
+        let p = PathBuf::from(&w);
+        if p.join("index.html").is_file() {
+            return p;
+        }
+    }
     if let Ok(r) = std::env::var("MEXC_BOT_RESOURCE_DIR") {
-        let web = PathBuf::from(r).join("web");
-        if web.is_dir() {
+        let web = PathBuf::from(&r).join("web");
+        if web.join("index.html").is_file() {
             return web;
         }
+    }
+    if let Some(root) = discover_resource_root() {
+        let web = root.join("web");
+        if web.join("index.html").is_file() {
+            return web;
+        }
+    }
+    if let Some(web) = discover_web_near_exe() {
+        return web;
     }
     if let Some(root) = discover_project_root() {
         let web = root.join("web");
-        if web.is_dir() {
+        if web.join("index.html").is_file() {
             return web;
         }
     }
+    // Never use compile-time paths in a packaged install — that path does not exist on the user's machine.
+    if is_packaged_install() {
+        tracing::error!(
+            "Packaged install: web UI not found near executable — dashboard will 404. \
+             Check startup.log in {}",
+            app_data_dir().display()
+        );
+        return app_data_dir().join("web");
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web")
+}
+
+/// Resolve bundled `config/` + `web/` using Tauri's resource directory (authoritative on Windows).
+pub fn configure_from_resource_dir(resource_dir: &Path) {
+    for root in resource_roots_under(resource_dir) {
+        if !root.join(CONFIG_REL).is_file() {
+            continue;
+        }
+        std::env::set_var("MEXC_BOT_RESOURCE_DIR", root.display().to_string());
+        let web = root.join("web");
+        if web.join("index.html").is_file() {
+            std::env::set_var("MEXC_BOT_WEB_DIR", web.display().to_string());
+        }
+        append_startup_log(&format!(
+            "Bundled resources: root={} web={}",
+            root.display(),
+            web.display()
+        ));
+        break;
+    }
+    setup_packaged_paths();
+}
+
+fn resource_roots_under(resource_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        resource_dir.join("_up_").join("_up_"),
+        resource_dir.join("_up_"),
+        resource_dir.to_path_buf(),
+    ]
+}
+
+fn discover_web_near_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let parent = exe.parent()?;
+    let mut candidates = vec![
+        parent.join("web"),
+        parent.join("_up_").join("_up_").join("web"),
+        parent.join("_up_").join("web"),
+        parent.join("resources").join("web"),
+        parent.join("resources")
+            .join("_up_")
+            .join("_up_")
+            .join("web"),
+    ];
+    if let Some(grand) = parent.parent() {
+        candidates.push(grand.join("web"));
+        candidates.push(grand.join("_up_").join("_up_").join("web"));
+    }
+    for web in candidates {
+        if web.join("index.html").is_file() {
+            if let Some(root) = web.parent() {
+                if root.join(CONFIG_REL).is_file() {
+                    std::env::set_var("MEXC_BOT_RESOURCE_DIR", root.display().to_string());
+                }
+            }
+            std::env::set_var("MEXC_BOT_WEB_DIR", web.display().to_string());
+            return Some(web);
+        }
+    }
+    None
 }
 
 /// App icon for `/icon.png` (packaged resource or dev fallback).
