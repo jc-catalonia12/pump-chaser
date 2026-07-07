@@ -1,12 +1,17 @@
 # MEXC Trading Bot (Rust)
 
-High-performance **MEXC USDT-M perpetual futures** trading bot — Rust migration of the Python Pump Chaser stack. Includes a built-in web dashboard, native desktop app (Tauri), **confluence** and **volume pump** strategies, live/paper execution, ONNX + online ML gating, shadow learning, settings hot-reload, and optional Telegram alerts.
+High-performance **MEXC USDT-M perpetual futures** trading bot with an **AI-first pipeline**: a 33-dimension feature engine, an online + ONNX ensemble classifier with Kelly-based sizing, an optional local-LLM (Ollama) market-regime layer, and a unified decision engine that gates every trade on expected value. Includes a built-in web dashboard, native desktop app (Tauri), live/paper execution, R-based backtesting with go-live acceptance gates, settings hot-reload, and optional Telegram alerts.
+
+Everything runs **on localhost** — no cloud APIs are required for trading, learning, or regime classification.
 
 ## Contents
 
 - [Architecture](#architecture)
-- [Trading strategies](#trading-strategies)
+- [The AI pipeline](#the-ai-pipeline)
 - [First-time setup](#first-time-setup)
+- [Auto-updates](#auto-updates)
+- [Local LLM regime layer (optional)](#local-llm-regime-layer-optional)
+- [Validation & going live](#validation--going-live)
 - [Dashboard tabs](#dashboard-tabs)
 - [Configuration & data locations](#configuration)
 - [Desktop app & installers](#desktop-app--installers)
@@ -24,7 +29,9 @@ Desktop app (Tauri) or browser  →  http://127.0.0.1:8001
                     ↓ HTTP + WebSocket
          Axum API (this project)
                     ↓
-    Scanner · Signals · Risk · Execution · ML
+  Scanner → Features → ML Ensemble → Decision Engine → Risk → Execution
+                ↑                         ↑
+        Ollama regime (optional)   Sentiment / macro HTF
                     ↓
     MEXC REST + WebSocket (public + private API)
 ```
@@ -35,44 +42,39 @@ Desktop app (Tauri) or browser  →  http://127.0.0.1:8001
 
 ---
 
-## Trading strategies
+## The AI pipeline
 
-The bot can run one or both strategies in parallel. Set `trading.mode` in **Settings** or `config/settings.yaml`:
+The bot runs a **single AI-driven strategy** (`trading.mode: ai`). Legacy confluence / volume-pump engines were retired in the v1.0.0 upgrade. Each candidate trade flows through five stages:
 
-| Mode | Strategies active |
-|------|-------------------|
-| `confluence` | Confluence only |
-| `pump` / `volume_pump` | Volume pump only |
-| `both` | Confluence + volume pump |
-| `all` | Confluence + volume pump (default) |
-| `scalp` | Scalp stub (disabled unless `scalp.enabled: true`) |
+### 1. Feature engine (33 features)
 
-Each strategy has **separate position slots** (`risk.max_confluence_positions`, `risk.max_volume_pump_positions`) so a full confluence book does not block pump entries and vice versa.
+Every signal is encoded as a 33-dimension vector: price/volume momentum across multiple timeframes, volatility regime, order-flow proxies (body ratio, volume imbalance), relative strength vs BTC, funding rate, BTC/ETH higher-timeframe macro state, symbol-specific news sentiment, and the LLM regime one-hots. See `src/ml/features.rs` (`FEATURE_COLUMNS`).
 
-### Confluence
+### 2. ML ensemble
 
-15m-style multi-factor setups on 1m data: volume, supply/demand zones, structure, market bias, optional HTF alignment (15m/30m), and liquidity-grab detection. Entries can use **sniper** (1m pin-bar trigger after HTF setup), **limit**, or **market** via `sniper.entry_mode`.
+Two native classifiers are blended per prediction:
 
-### Volume pump
+- **Online logistic regression** (pure Rust) — trains on every resolved outcome, no Python at runtime.
+- **ONNX gradient-boosting model** — optional cold-start / backup model, hot-reloadable.
 
-Fast 1m **volume-anomaly** scanner ranked by universe turnover velocity. Designed for short holds with limit or market entry (`pump.entry_mode`).
+The blend weight shifts toward the online model as it matures. The bot can also **auto-retrain the ONNX model** in the background (`ml.auto_retrain_enabled`) by invoking `scripts/export_onnx.py` against the local DB and hot-swapping the new model without a restart.
 
-**Two-phase confirmation** (`pump.confirmation_enabled`, default `true`) reduces fake pumps:
+### 3. Local LLM regime (optional, Ollama)
 
-1. **Arm** — abnormal volume surge + score gates set a pending setup (TTL: `pump.confirmation_ttl_sec`, default 180s).
-2. **Confirm** — entry fires only when gates pass:
-   - **Breakout** (close beyond prior range + volume) **or** **market shift** (1m structure + bias)
-   - **1m structure** and **market bias** (when enabled)
-   - **Symbol HTF bias** (15m default, `pump.htf_enabled`)
-   - **BTC/ETH macro** — blocks long pumps if either major is clearly dumping on HTF; blocks shorts if either is clearly pumping (`pump.macro_filter_enabled`)
+A background loop periodically asks a local Ollama model to classify the market regime (trending / chop / high-vol / risk-off + BTC bias + confidence) from BTC/ETH HTF data, breadth, and sentiment. The regime feeds the feature vector and the decision engine. **If Ollama is offline the regime stays neutral and the bot trades on ML alone — nothing blocks.**
 
-Tune under **Settings → Volume Pump Strategy** or in `config/settings.yaml` under `pump:`.
+### 4. Decision engine (single go/no-go authority)
 
-### Live execution notes
+Combines ML win probability, expected value in R (`EV = p·RR − (1−p)`), reward:risk, regime alignment, and sentiment:
 
-- MEXC `vol` is **contracts**, not coin quantity — the bot converts using per-symbol `contractSize` and clamps to `maxVol`.
-- Open positions show **strategy**, **entry type** (market / limit / sniper), and **pending** for unfilled limit orders.
-- **Settings saved in the UI apply immediately** (scanner, risk, execution) without restarting the app. MEXC WebSocket URL changes still require a scanner stop/start.
+- **Hard gates:** minimum reward:risk, minimum EV, confident-regime veto.
+- **Conviction sizing:** approved trades get a size/leverage multiplier (clamped to `decision.min_size_scale`..`max_size_scale`), plus Kelly-fraction risk scaling from realized win/loss R.
+
+Every signal carries its `expected_value_r`, `reward_risk`, and a human-readable `decision_reason` (visible in the Signals tab).
+
+### 5. Risk manager (safety net)
+
+Unchanged, deliberately boring: daily loss limit, max drawdown halt, circuit breaker, kill switch, per-symbol and concurrent-position caps, min profit filter.
 
 ---
 
@@ -88,7 +90,7 @@ Follow these steps to go from zero to a running bot. All commands below assume y
 | **macOS:** Xcode Command Line Tools | `xcode-select --install` |
 | **Windows:** [VS C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) | Required only for building desktop installers |
 
-Optional (only for exporting a bootstrap ONNX model via `scripts/export_onnx.py`):
+Optional (only for ONNX retraining/export via `scripts/export_onnx.py`):
 
 ```bash
 python3 -m venv venv
@@ -97,6 +99,20 @@ pip install -r requirements.txt
 ```
 
 Packages: `scikit-learn`, `skl2onnx`, `onnx`, `onnxruntime` (see `requirements.txt`).
+
+**Ollama (LLM regime layer) — handled automatically by the desktop app.**
+The installer / first launch detects whether Ollama is present on your machine.
+If it is missing it downloads and silently installs it (macOS: Homebrew / install.sh;
+Windows: `OllamaSetup.exe /S` — no UAC prompt required).
+Ollama starts automatically when the bot opens and stops cleanly when you close it
+so it never keeps running in the background.
+The default model (`llama3.2`, ~2 GB) is pulled on first launch in the background;
+trading continues immediately while the download completes.
+
+> **Headless / `cargo run` mode:** Ollama is managed separately. Install it from
+> https://ollama.com, run `ollama serve` in a terminal, and the bot's LLM regime
+> layer will pick it up automatically. If it is not running, the regime stays neutral
+> and the bot trades on ML alone — nothing blocks.
 
 ### 2. Run the app
 
@@ -142,9 +158,9 @@ Still on **Account → Execution Mode**:
 | Mode | Behavior |
 |------|----------|
 | **Paper** | Simulated fills against live market data. Default for new installs. |
-| **Live** | Real orders on MEXC. Requires valid API keys and `execution.live_trading_enabled: true` in config. |
+| **Live** | Real orders on MEXC. Requires valid API keys, `execution.live_trading_enabled: true`, and a **passing acceptance gate** (see [Validation](#validation--going-live)). |
 
-Start with **Paper** until signals, risk limits, and wallet sync look correct.
+Start with **Paper** until the acceptance gate passes.
 
 For live trading, also review in `config/settings.yaml`:
 
@@ -159,18 +175,15 @@ Use **Re-anchor from MEXC wallet** on the Account tab to sync paper/live equity 
 
 ### 5. Start the scanner
 
-1. Go to the **Trading** tab.
-2. Click **Start trading** (or `POST /trading/start`).
+1. Click **Start** in the sidebar (or `POST /trading/start`).
+2. The scanner polls USDT-M symbols, builds features, runs the ML ensemble and decision engine, and opens positions when risk checks pass.
+3. Watch the **Dashboard** (live scan + regime + sentiment) and **Signals** tab (per-signal ML %, EV, R:R, and decision reason).
 
-The scanner polls USDT-M symbols, scores **confluence** and/or **volume pump** setups (per `trading.mode`), applies the ML gate, and opens positions when risk checks pass. Status appears on Trading (live snapshot) and **Signals** (paginated history). Volume pump scan messages use `[pump]` prefixes (e.g. armed, waiting breakout, macro block).
+### 6. Let the model learn
 
-### 6. (Optional) Bootstrap the ML model
+The online model trains automatically on every resolved outcome (win / loss / expired) — check progress on the **Training** tab (ensemble blend, Kelly sizing, gate accuracy, win rate by side).
 
-The bot uses a **supervised setup classifier** (ONNX) plus an **online learner** that improves from every resolved outcome.
-
-**Automatic:** Once enough signals resolve (win / loss / expired), the online model trains in Rust — no Python required. Check progress on the **Training** tab.
-
-**Optional cold start** — export an ONNX model from historical signal data:
+**Optional ONNX cold start / retrain:**
 
 ```bash
 # With venv active (pip install -r requirements.txt):
@@ -179,7 +192,7 @@ python scripts/export_onnx.py
 python scripts/export_onnx.py --db data/mexc_trading_bot.db --out data/models/supervised.onnx
 ```
 
-Output goes to `data/models/supervised.onnx` (path set by `ml.onnx_model_path` in config). Restart the bot after placing the file.
+With `ml.auto_retrain_enabled: true` the bot runs this itself on a schedule and hot-reloads the result — no restart needed.
 
 Key ML settings in `config/settings.yaml`:
 
@@ -187,13 +200,18 @@ Key ML settings in `config/settings.yaml`:
 ml:
   enabled: true
   supervised_enabled: true
-  supervised_threshold: 0.58   # minimum setup probability to pass gate
+  supervised_threshold: 0.58   # minimum win probability to pass the gate
   hard_ml_gate: true           # block trades below threshold
   min_training_samples: 100
+  kelly_fraction: 0.25         # fractional Kelly for risk/leverage scaling
+  auto_retrain_enabled: false  # background ONNX retrain (needs Python)
+decision:
+  enabled: true
+  min_expected_value: 0.0      # require non-negative EV (in R)
+  min_reward_risk: 0.8
 learning:
   enabled: true
-  shadow_ml_rejects: true      # learn from ML-rejected setups (no trade)
-  shadow_near_miss: true       # learn from near-miss confluence scores
+  shadow_ml_rejects: true      # learn from rejected setups (no trade)
 ```
 
 ### 7. (Optional) Telegram notifications
@@ -205,32 +223,125 @@ Get trade alerts and query bot status from Telegram.
 3. On **Account → Telegram Notifications**, paste token + chat ID → **Connect Telegram**.
 4. Open Telegram, chat with your bot, and press **Start** (required before messages can be delivered).
 5. Click **Send test message** to confirm.
-6. Toggle which events to receive (open, close, TP, SL, kill switch, volume pump armed/detected).
 
-Trade alerts include the **strategy** label (Confluence, Volume Pump, etc.).
-
-**Bot commands** (only from your configured chat):
-
-| Command | Description |
-|---------|-------------|
-| `/info` | Wallet, open positions, scanner status, risk summary |
-| `/start` | Welcome + short help |
-| `/help` | Command list |
+**Bot commands** (only from your configured chat): `/info`, `/sync`, `/run`, `/stop`, `/start`, `/help`.
 
 Telegram credentials are stored in `secrets.json` alongside MEXC keys — not in `settings.yaml`.
 
-### 8. Review risk & settings
+---
 
-Use the **Settings** tab (or edit `config/settings.yaml`) for:
+## Auto-updates
 
-- **Trading mode** (`trading.mode`) and per-strategy position caps
-- Confluence thresholds (`min_composite_score`, HTF filter, liquidity grab)
-- Volume pump confirmation gates (`pump.confirmation_enabled`, breakout/macro/HTF filters)
-- Circuit breakers (`max_consecutive_losses`, `loss_streak_cooldown_sec`, `max_drawdown_halt_pct`)
-- Max hold time (`confluence.max_hold_sec`, `pump.max_hold_sec`) — signals that never hit TP or SL within this window are labeled **expired**
-- Kill switch — Trading tab or `POST /kill-switch/activate`
+### For end-users (no action needed)
 
-Changes saved from the Settings tab are written to `settings.yaml` and **reloaded live** by the scanner, risk manager, and execution layer.
+Once the updater is configured by the developer (see below), the app **checks for a new release automatically** 6 seconds after the dashboard opens. If a newer version is available on GitHub Releases, a small banner appears in the bottom-right corner:
+
+> **Update available: v0.2.0** — [Install & Restart] [Later]
+
+Clicking **Install & Restart** downloads the update in the background and relaunches the app. All user data (API keys, SQLite database, trained models) is preserved — only the application binary and bundled web UI are replaced.
+
+**No prerequisites are needed by end-users** — the `.dmg` (macOS) and `.msi` (Windows) installers are fully self-contained:
+
+| Requirement | Handled by |
+|---|---|
+| Rust runtime | Compiled into the binary — not needed by users |
+| WebView2 (Windows) | Embedded in the installer (`embedBootstrapper`) |
+| WebKit (macOS) | Built into macOS since 10.13 |
+| API keys | Entered in the app — not bundled |
+| ML models | Bundled in the installer and seeded on first launch |
+| Ollama | **Automatic** — the desktop app installs, starts, and stops Ollama for you |
+| Python | Optional — only if you want to manually retrain the ONNX model |
+
+### For developers: one-time updater setup
+
+Before your first versioned release, run the setup script once:
+
+```bash
+./scripts/setup_signing.sh
+```
+
+It walks you through:
+1. Generating a signing key pair (`cargo tauri signer generate`)
+2. Copying the **public key** into `desktop/src-tauri/tauri.conf.json`
+3. Adding **4 GitHub Secrets** to your repo (Settings → Secrets → Actions):
+
+| Secret | Value |
+|---|---|
+| `TAURI_SIGNING_PRIVATE_KEY` | The private key (base64 of `~/.tauri/mexc-bot/private.key`) |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Key password (empty if you chose none) |
+| `TAURI_UPDATER_PUBKEY` | The public key (same as in `tauri.conf.json`) |
+| `TAURI_UPDATE_ENDPOINT` | `https://github.com/YOUR_USERNAME/mexc-trading-bot-rust/releases/latest/download/latest.json` |
+
+Also update the two placeholder URLs in `desktop/src-tauri/tauri.conf.json` and `web/app.js` with your actual GitHub username.
+
+### Releasing a new version
+
+```bash
+# 1. Bump the version (0.1.6 → 0.1.7):
+bash scripts/bump_version.sh
+
+# 2. Commit, tag, and push:
+git add -A && git commit -m "chore: release v$(cat VERSION)"
+git tag -a "v$(cat VERSION)" -m "Release v$(cat VERSION)"
+git push && git push --tags
+```
+
+The `.github/workflows/release.yml` workflow starts automatically:
+- Builds signed macOS (Intel + Apple Silicon) and Windows installers
+- Generates `latest.json` with signatures
+- Creates a GitHub Release with all artifacts
+- Existing installs pick up the update on next launch
+
+---
+
+## Local LLM regime layer (optional)
+
+Runs entirely on localhost via [Ollama](https://ollama.com):
+
+```bash
+ollama pull llama3.2      # one-time, ~2GB
+ollama serve              # usually already running as a service
+```
+
+Settings (**Settings → Local LLM Regime** or `config/settings.yaml`):
+
+```yaml
+llm:
+  enabled: true
+  base_url: http://localhost:11434
+  model: llama3.2
+  poll_interval_sec: 300   # classify every 5 minutes, cached in between
+  timeout_sec: 30
+```
+
+The current regime appears on the **Dashboard** (Fear & Greed card) and **Training → Market Sentiment**. Check `GET /llm/status` for raw output and error diagnostics. When Ollama is unreachable the bot logs a warning, holds a **neutral regime**, and keeps trading on ML alone.
+
+---
+
+## Validation & going live
+
+The backtester replays resolved signal history with a unified **R-based PnL model** (win = +RR·risk, loss = −risk, expired = quarter-R time-stop, fees included, compounding equity).
+
+On the **Training** tab (Advanced diagnostics):
+
+| Action | What it does |
+|--------|--------------|
+| **Backtest** | Replay history through the fixed ML threshold gate |
+| **Walk-forward** | Train on the first 80%, report out-of-sample accuracy **and** traded PnL |
+| **Acceptance gate** | Replay through the **decision engine**, then check the go-live gates |
+
+The acceptance gate (`POST /backtest/acceptance`) checks against `config/settings.yaml`:
+
+```yaml
+backtest:
+  acceptance_min_trades: 50
+  acceptance_min_win_rate: 0.55
+  acceptance_min_profit_factor: 1.3
+  acceptance_min_expectancy: 0.0
+  acceptance_max_drawdown: 0.20
+```
+
+**All checks must pass before enabling live trading.** The UI shows each check with actual vs required values.
 
 ---
 
@@ -238,12 +349,14 @@ Changes saved from the Settings tab are written to `settings.yaml` and **reloade
 
 | Tab | Purpose |
 |-----|---------|
-| **Trading** | Start/stop bot, live snapshot, recent signals preview, activity feed |
-| **Signals** | Full signal history (server-side pagination, 25 per page), chart overlay |
-| **Positions** | Open positions (strategy, entry type, pending limits), **History** (closed trades, All/Live/Paper filter), manual close, P&amp;L chart |
-| **Training** | ML stack status, outcome trends, shadow learning stats, win rate by side |
+| **Dashboard** | Start/stop bot, portfolio KPIs, Fear & Greed + news sentiment + LLM regime, live scan feed, top signals |
+| **Signals** | Full signal history with ML %, EV (R), R:R, and decision reason (hover a row); chart overlay |
+| **Positions** | Open positions, **History** (closed trades, All/Live/Paper filter), manual close |
+| **Readiness** | Production-readiness score and validation gates |
+| **Training** | Ensemble status, Kelly sizing, gate accuracy, win rate by side, sentiment + regime, backtest / walk-forward / **acceptance gate** |
+| **P&L** | Realized P&L history and daily breakdown |
 | **Account** | Paper/live mode, wallet, MEXC keys, Telegram |
-| **Settings** | Edit `settings.yaml` fields from the UI |
+| **Settings** | Edit `settings.yaml` from the UI — includes ML, LLM regime, and decision-engine sections |
 
 ---
 
@@ -256,6 +369,8 @@ Changes saved from the Settings tab are written to `settings.yaml` and **reloade
 | Override config path | `MEXC_BOT_CONFIG=/path/to/settings.yaml` |
 | Env overrides | `MEXC_BOT_*` with `__` for nesting, e.g. `MEXC_BOT_SERVER__PORT=9000` |
 | Secrets path override | `MEXC_BOT_SECRETS_PATH=/path/to/secrets.json` |
+
+Settings saved from the UI are written to `settings.yaml` and **reloaded live** by the scanner, risk manager, ML pipeline, LLM service, and execution layer.
 
 ### Data locations
 
@@ -335,13 +450,6 @@ cd desktop && cargo tauri build --release
 | `dist/windows/` | Convenience copies: `.msi`, NSIS `*-setup.exe` |
 | `desktop/src-tauri/target/release/bundle/` | Full Tauri output (same files) |
 
-Typical artifact names:
-
-| OS | Files |
-|----|--------|
-| **macOS** | `dmg/MEXC Trading Bot_0.1.0_*.dmg`, `macos/MEXC Trading Bot.app` |
-| **Windows** | `msi/*.msi`, `nsis/*-setup.exe` |
-
 ### Bundled vs user data
 
 | Bundled in installer (read-only) | User data (never in installer) |
@@ -350,11 +458,6 @@ Typical artifact names:
 | `web/` dashboard | SQLite database |
 | `release-assets/models/` (ONNX + optional online weights) | User-retrained models (never overwritten on upgrade) |
 | App binary + WebView | |
-
-On first launch, defaults and bundled models are seeded into:
-
-- **macOS:** `~/Library/Application Support/MEXC Trading Bot/`
-- **Windows:** `%LOCALAPPDATA%\MEXC Trading Bot\`
 
 ### Distribution notes
 
@@ -379,25 +482,13 @@ Build macOS **and** Windows installers from a Mac by pushing to GitHub — a fre
 | `build-macos` | `macos-latest` | `macos-installer` — `.dmg` + `.app` |
 | `build-windows` | `windows-latest` | `windows-installer` — `.msi` + setup `.exe` |
 
-Both jobs run the same build scripts as local builds, so the ONNX model is bundled in the installer.
-
-**ML model for CI** — either:
-
-1. **Commit** `data/models/supervised.onnx` to the repo (recommended for team sharing), or
-2. Set repository **Secrets** (Settings → Secrets and variables → Actions):
-   - `SUPERVISED_ONNX_B64` — base64 of `supervised.onnx` (required if not committed)
-   - `ONLINE_MODEL_JSON_B64` — optional base64 of `online_model.json`
-
-Generate base64 locally:
+**ML model for CI** — either commit `data/models/supervised.onnx` to the repo, or set repository **Secrets**: `SUPERVISED_ONNX_B64` (base64 of `supervised.onnx`), optional `ONLINE_MODEL_JSON_B64`.
 
 ```bash
 base64 -i data/models/supervised.onnx | pbcopy          # macOS
-base64 -i data/models/online_model.json | pbcopy       # optional
 ```
 
 Download built installers from the workflow run → **Artifacts**.
-
-**Minute usage (private repos):** Windows builds bill at 2×, macOS at 10×. Public repos get unlimited Actions minutes.
 
 ---
 
@@ -409,14 +500,18 @@ curl http://127.0.0.1:8001/risk
 curl http://127.0.0.1:8001/live/snapshot
 curl "http://127.0.0.1:8001/signals?limit=25&offset=0"
 curl http://127.0.0.1:8001/positions/history?paper=all&limit=100
-curl http://127.0.0.1:8001/ml/status
+curl http://127.0.0.1:8001/ml/status          # ensemble + Kelly + gate state
+curl http://127.0.0.1:8001/llm/status         # LLM regime + Ollama health
+curl -X POST http://127.0.0.1:8001/backtest -d '{}'
+curl -X POST http://127.0.0.1:8001/backtest/acceptance -d '{}'   # go-live gate
+curl -X POST http://127.0.0.1:8001/walk-forward -d '{}'
 curl -X POST http://127.0.0.1:8001/trading/start
 curl -X POST http://127.0.0.1:8001/trading/stop
 ```
 
 WebSocket live updates: `ws://127.0.0.1:8001/ws`
 
-Full route list: `src/api/mod.rs` (~50 HTTP routes + `/ws`).
+Full route list: `src/api/mod.rs`.
 
 ---
 
@@ -425,14 +520,15 @@ Full route list: `src/api/mod.rs` (~50 HTTP routes + `/ws`).
 ```
 mexc-trading-bot-rust/           # this repo (standalone)
 ├── Cargo.toml
-├── requirements.txt             # optional Python deps (ONNX export only)
-├── config/settings.yaml         # defaults (strategy, risk, ML, learning)
+├── requirements.txt             # optional Python deps (ONNX export/retrain only)
+├── UPGRADE-v1.0.0.md            # AI-first rebuild plan + phase log
+├── config/settings.yaml         # defaults (risk, ML, LLM, decision, backtest)
 ├── web/                         # dashboard (HTML/CSS/JS)
 ├── desktop/                     # Tauri shell (see tauri.conf.json)
 ├── .github/workflows/           # CI installer builds
 ├── data/                        # SQLite, secrets, models (partially gitignored)
 ├── scripts/
-│   ├── export_onnx.py           # optional ONNX bootstrap from signal DB
+│   ├── export_onnx.py           # ONNX train/export from signal DB (33 features)
 │   ├── prepare_release_assets.sh
 │   ├── build_installers.sh      # macOS/Linux installer build
 │   ├── build_installers.ps1     # Windows installer build
@@ -440,11 +536,13 @@ mexc-trading-bot-rust/           # this repo (standalone)
 ├── release-assets/models/       # staged for installer (gitignored binaries)
 ├── src/
 │   ├── main.rs                  # Axum server entry
-│   ├── scanner/                 # kline poll, confluence + pump loops
-│   ├── signals/                 # confluence, volume pump, sniper, zones
+│   ├── scanner/                 # kline poll, AI signal loop, retrain + regime loops
+│   ├── signals/                 # AI candidate generator, signal types
+│   ├── ai/                      # LLM regime service + decision engine
+│   ├── ml/                      # features (33-dim), online + ONNX ensemble, Kelly
+│   ├── backtest/                # R-based replay, walk-forward, acceptance gate
 │   ├── risk/                    # RiskManager, circuit breakers
 │   ├── execution/               # paper + live traders
-│   ├── ml/                      # ONNX inference + online learner
 │   ├── learning/                # shadow signal capture
 │   ├── api/                     # REST + WebSocket handlers
 │   └── utils/                   # secrets, alerts, telegram_bot, paths
@@ -455,26 +553,25 @@ mexc-trading-bot-rust/           # this repo (standalone)
 
 ## Feature status
 
-See [MIGRATION.md](./MIGRATION.md) for the full tracker.
+See [UPGRADE-v1.0.0.md](./UPGRADE-v1.0.0.md) for the full phase-by-phase rebuild log.
 
 | Area | Status |
 |------|--------|
 | Config + SQLite | ✓ |
-| Confluence scanner + sniper entry | ✓ |
-| Volume pump (two-phase confirmation, BTC/ETH macro) | ✓ |
-| Per-strategy position slots | ✓ |
+| AI signal pipeline (33-feature engine) | ✓ |
+| Online + ONNX ensemble with Kelly sizing | ✓ |
+| Automated ONNX retrain + hot reload | ✓ |
+| Local LLM regime layer (Ollama — auto-install, auto-start/stop) | ✓ |
+| Unified decision engine (EV / R:R / regime gates) | ✓ |
+| R-based backtest + walk-forward + acceptance gate | ✓ |
 | Paper + live execution (contract-aware sizing) | ✓ |
 | Built-in web UI + Tauri desktop | ✓ |
 | Settings hot-reload from UI | ✓ |
-| ONNX inference + ML gate | ✓ |
-| Online ML (Rust, no Python at runtime) | ✓ |
 | Shadow learning + outcome resolution | ✓ |
-| Telegram trade alerts + strategy labels + `/info` bot | ✓ |
+| Telegram trade alerts + `/info` bot | ✓ |
+| In-app auto-update notifications + one-click install | ✓ |
+| Signed GitHub Releases via CI (macOS + Windows) | ✓ |
 | Server-side signals pagination | ✓ |
-| Position history + entry mode on open positions | ✓ |
-| Builtin backtest API | ✓ |
-| Scalp strategy | Stub (`scalp.enabled: false`) |
-| In-process sklearn training | Use `scripts/export_onnx.py` + `requirements.txt` or online learner |
 
 ---
 

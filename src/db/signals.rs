@@ -158,8 +158,6 @@ impl Database {
         Ok(())
     }
 
-    /// Write a recomputed feature vector back into a signal's stored payload so
-    /// historically featureless signals become trainable.
     pub async fn set_signal_features(&self, signal_id: i64, features: &[f64]) -> Result<()> {
         let row = sqlx::query("SELECT payload FROM signals WHERE id = ?")
             .bind(signal_id)
@@ -179,6 +177,85 @@ impl Database {
             .execute(self.pool())
             .await?;
         Ok(())
+    }
+
+    /// Store R-multiple and soft label metadata on a resolved signal.
+    pub async fn set_signal_outcome_meta(
+        &self,
+        signal_id: i64,
+        r_multiple: f64,
+        soft_label: f64,
+    ) -> Result<()> {
+        let row = sqlx::query("SELECT payload FROM signals WHERE id = ?")
+            .bind(signal_id)
+            .fetch_optional(self.pool())
+            .await?;
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let payload: String = row.try_get("payload").unwrap_or_else(|_| "{}".into());
+        let mut v: Value = serde_json::from_str(&payload).unwrap_or(json!({}));
+        if let Value::Object(ref mut m) = v {
+            m.insert("r_multiple".into(), json!(r_multiple));
+            m.insert("soft_label".into(), json!(soft_label));
+            m.insert("from_trade".into(), json!(true));
+        }
+        sqlx::query("UPDATE signals SET payload = ? WHERE id = ?")
+            .bind(v.to_string())
+            .bind(signal_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Promotion metrics for paper trading gate.
+    pub async fn promotion_metrics(&self) -> Result<Value> {
+        let stats = self.get_signal_outcome_counts().await?;
+        let resolved = stats.get("resolved").and_then(|v| v.as_i64()).unwrap_or(0);
+        let win = stats.get("win").and_then(|v| v.as_i64()).unwrap_or(0);
+        let loss = stats.get("loss").and_then(|v| v.as_i64()).unwrap_or(0);
+        let win_rate = if win + loss > 0 {
+            win as f64 / (win + loss) as f64
+        } else {
+            0.0
+        };
+
+        let halt_rows = sqlx::query(
+            "SELECT COUNT(*) AS n FROM audit_log \
+             WHERE event_type IN ('kill_switch','circuit_breaker') \
+             AND created_at >= datetime('now', '-30 days')",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        let halts: i64 = halt_rows.try_get("n").unwrap_or(0);
+
+        let pf_row = sqlx::query(
+            "SELECT \
+               SUM(CASE WHEN realized_pnl > 0 THEN realized_pnl ELSE 0 END) AS gross_win, \
+               SUM(CASE WHEN realized_pnl < 0 THEN -realized_pnl ELSE 0 END) AS gross_loss \
+             FROM positions WHERE paper = 1 AND status = 'closed'",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        let gross_win: f64 = pf_row.try_get("gross_win").unwrap_or(0.0);
+        let gross_loss: f64 = pf_row.try_get::<f64, _>("gross_loss").unwrap_or(1.0).max(1e-9);
+        let profit_factor = gross_win / gross_loss;
+
+        let ready = resolved >= 300 && profit_factor >= 1.3 && win_rate >= 0.45 && halts == 0;
+
+        Ok(json!({
+            "resolved_trades": resolved,
+            "win_rate": (win_rate * 10000.0).round() / 10000.0,
+            "profit_factor": (profit_factor * 100.0).round() / 100.0,
+            "drawdown_halts_30d": halts,
+            "criteria": {
+                "min_trades": 300,
+                "min_profit_factor": 1.3,
+                "min_gate_accuracy": 0.60,
+                "no_halts": true,
+            },
+            "live_promotion_ready": ready,
+        }))
     }
 
     /// Aggregate signal outcome counts (win / loss / expired / pending) used by

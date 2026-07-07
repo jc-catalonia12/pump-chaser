@@ -398,103 +398,115 @@ export function renderTradingViewWidget(containerId, tvSymbol, interval = "15") 
 
 export function renderLightweightChart(containerId, chartData) {
   const el = document.getElementById(containerId);
-  if (!el || typeof LightweightCharts === "undefined") return;
-
-  if (chartInstances.has(containerId)) {
-    try {
-      chartInstances.get(containerId).chart.remove();
-    } catch {
-      /* ignore */
-    }
-    chartInstances.delete(containerId);
-  }
-  el.innerHTML = "";
-
-  const bars = chartData.bars || [];
-  if (!bars.length) {
-    el.innerHTML = '<p class="empty">No kline data for this symbol</p>';
+  if (!el) return;
+  if (typeof LightweightCharts === "undefined") {
+    el.innerHTML = '<p class="empty">Chart library failed to load — check network</p>';
     return;
   }
 
-  const chart = LightweightCharts.createChart(el, {
-    layout: { background: { color: CHART_THEME.bg }, textColor: CHART_THEME.text },
-    grid: {
-      vertLines: { color: CHART_THEME.grid },
-      horzLines: { color: CHART_THEME.grid },
-    },
-    width: el.clientWidth,
-    height: el.clientHeight || 300,
-    timeScale: { timeVisible: true, secondsVisible: false, borderColor: CHART_THEME.grid },
-    rightPriceScale: { borderColor: CHART_THEME.grid },
-    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-  });
+  const draw = () => {
+    if (chartInstances.has(containerId)) {
+      try {
+        chartInstances.get(containerId).chart.remove();
+      } catch {
+        /* ignore */
+      }
+      chartInstances.delete(containerId);
+    }
+    el.innerHTML = "";
 
-  const candleSeries = chart.addCandlestickSeries({
-    upColor: CHART_THEME.up,
-    downColor: CHART_THEME.down,
-    borderVisible: false,
-    wickUpColor: CHART_THEME.up,
-    wickDownColor: CHART_THEME.down,
-  });
+    const bars = chartData.bars || [];
+    if (!bars.length) {
+      el.innerHTML = '<p class="empty">No kline data for this symbol</p>';
+      return;
+    }
 
-  const dedup = new Map();
-  bars.forEach((b) => {
-    dedup.set(barTime(b.timestamp), b);
-  });
-  const sortedBars = [...dedup.entries()].sort((a, b) => a[0] - b[0]);
+    const width = el.clientWidth || el.parentElement?.clientWidth || 640;
+    const height = el.clientHeight || 300;
 
-  const candles = sortedBars.map(([time, b]) => ({
-    time,
-    open: num(b.open),
-    high: num(b.high),
-    low: num(b.low),
-    close: num(b.close),
-  }));
-  candleSeries.setData(candles);
-
-  const volSeries = chart.addHistogramSeries({
-    color: "rgba(34, 211, 238, 0.35)",
-    priceFormat: { type: "volume" },
-    priceScaleId: "vol",
-  });
-  chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
-
-  volSeries.setData(
-    sortedBars.map(([time, b]) => ({
-      time,
-      value: num(b.volume || b.amount),
-      color:
-        num(b.close) >= num(b.open)
-          ? "rgba(52, 211, 153, 0.35)"
-          : "rgba(248, 113, 113, 0.35)",
-    }))
-  );
-
-  const { lines, trade, side } = buildTradeLines(chartData);
-  chartInstances.set(containerId, { chart, candleSeries, volSeries, trade, side, visibleRange: null });
-  lines.forEach((line) => {
-    candleSeries.createPriceLine({
-      price: line.price,
-      color: line.color,
-      lineWidth: line.lineWidth ?? 2,
-      lineStyle: LINE_STYLES[line.lineStyle ?? 0] ?? 0,
-      axisLabelVisible: true,
-      title: line.title,
+    const chart = LightweightCharts.createChart(el, {
+      layout: { background: { color: CHART_THEME.bg }, textColor: CHART_THEME.text },
+      grid: {
+        vertLines: { color: CHART_THEME.grid },
+        horzLines: { color: CHART_THEME.grid },
+      },
+      width,
+      height,
+      timeScale: { timeVisible: true, secondsVisible: false, borderColor: CHART_THEME.grid },
+      rightPriceScale: { borderColor: CHART_THEME.grid },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     });
-  });
 
-  applyTradeMarkers(candleSeries, bars, trade, side);
+    const candleSeries = chart.addCandlestickSeries({
+      upColor: CHART_THEME.up,
+      downColor: CHART_THEME.down,
+      borderVisible: false,
+      wickUpColor: CHART_THEME.up,
+      wickDownColor: CHART_THEME.down,
+    });
 
-  const visibleRange = hasExitMarker(trade)
-    ? focusTradeViewport(chart, bars, trade)
-    : (chart.timeScale().fitContent(), null);
-  const inst = chartInstances.get(containerId);
-  if (inst) inst.visibleRange = visibleRange;
+    const dedup = new Map();
+    bars.forEach((b) => {
+      dedup.set(barTime(b.timestamp), b);
+    });
+    const sortedBars = [...dedup.entries()].sort((a, b) => a[0] - b[0]);
 
-  const ro = new ResizeObserver(() => {
-    chart.applyOptions({ width: el.clientWidth, height: el.clientHeight || 300 });
-  });
-  ro.observe(el);
+    const candles = sortedBars.map(([time, b]) => ({
+      time,
+      open: num(b.open),
+      high: num(b.high),
+      low: num(b.low),
+      close: num(b.close),
+    }));
+    candleSeries.setData(candles);
+
+    const volSeries = chart.addHistogramSeries({
+      color: "rgba(34, 211, 238, 0.35)",
+      priceFormat: { type: "volume" },
+      priceScaleId: "vol",
+    });
+    chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+    volSeries.setData(
+      sortedBars.map(([time, b]) => ({
+        time,
+        value: num(b.volume || b.amount),
+        color:
+          num(b.close) >= num(b.open)
+            ? "rgba(52, 211, 153, 0.35)"
+            : "rgba(248, 113, 113, 0.35)",
+      }))
+    );
+
+    const { lines, trade, side } = buildTradeLines(chartData);
+    chartInstances.set(containerId, { chart, candleSeries, volSeries, trade, side, visibleRange: null });
+    lines.forEach((line) => {
+      candleSeries.createPriceLine({
+        price: line.price,
+        color: line.color,
+        lineWidth: line.lineWidth ?? 2,
+        lineStyle: LINE_STYLES[line.lineStyle ?? 0] ?? 0,
+        axisLabelVisible: true,
+        title: line.title,
+      });
+    });
+
+    applyTradeMarkers(candleSeries, bars, trade, side);
+
+    const visibleRange = hasExitMarker(trade)
+      ? focusTradeViewport(chart, bars, trade)
+      : (chart.timeScale().fitContent(), null);
+    const inst = chartInstances.get(containerId);
+    if (inst) inst.visibleRange = visibleRange;
+
+    const ro = new ResizeObserver(() => {
+      chart.applyOptions({ width: el.clientWidth || width, height: el.clientHeight || height });
+    });
+    ro.observe(el);
+  };
+
+  // Defer until the modal has layout (avoids 0-width charts).
+  requestAnimationFrame(() => requestAnimationFrame(draw));
 }
 
 // Refresh an already-rendered lightweight chart with fresh klines without

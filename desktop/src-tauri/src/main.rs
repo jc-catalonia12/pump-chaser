@@ -1,7 +1,23 @@
 //! Tauri desktop — splash screen while the embedded API server starts, then opens the dashboard.
+//!
+//! Startup sequence (5 steps):
+//!   1. Prepare app data directory.
+//!   2. Copy first-launch assets.
+//!   3. Manage Ollama (install if absent → start → pull model in background).
+//!   4. Start the local Axum API server on 127.0.0.1:8001.
+//!   5. Open the dashboard webview; close the splash window.
+//!
+//! On exit, if we started Ollama ourselves, it is killed so it does not keep
+//! running in the background.
+//!
+//! Auto-update checks run 6 s after the dashboard opens and show a dismissible
+//! in-app banner when a new version is available on GitHub Releases.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ollama;
+
+use std::sync::Arc;
 use std::time::Duration;
 
 use tauri::Manager;
@@ -19,6 +35,8 @@ const WEBVIEW_GUARD: &str = r#"
 })();
 "#;
 
+// ── Logging / splash helpers ───────────────────────────────────────────────
+
 fn log_startup(message: &str) {
     eprintln!("{message}");
     mexc_trading_bot::utils::append_startup_log(message);
@@ -27,9 +45,7 @@ fn log_startup(message: &str) {
 fn splash_status(app: &tauri::AppHandle, message: &str, step: u8) {
     let msg = message.replace('\\', "\\\\").replace('\'', "\\'");
     if let Some(splash) = app.get_webview_window("splash") {
-        let _ = splash.eval(format!(
-            "window.setStartupStatus('{msg}', {step});"
-        ));
+        let _ = splash.eval(format!("window.setStartupStatus('{msg}', {step});"));
     }
 }
 
@@ -42,6 +58,8 @@ fn splash_error(app: &tauri::AppHandle, message: &str) {
         let _ = splash.eval(format!("window.setStartupError('{msg}');"));
     }
 }
+
+// ── API server ─────────────────────────────────────────────────────────────
 
 fn spawn_api_server_if_needed() {
     if mexc_trading_bot::server::is_api_reachable() {
@@ -69,6 +87,8 @@ fn spawn_api_server_if_needed() {
         }
     });
 }
+
+// ── Dashboard ──────────────────────────────────────────────────────────────
 
 fn open_dashboard(app: &tauri::AppHandle) {
     let api_url = mexc_trading_bot::server::default_api_url();
@@ -99,9 +119,189 @@ fn open_dashboard(app: &tauri::AppHandle) {
     }
 
     log_startup("Dashboard opened");
+
+    // Kick off background update check 6 s after the dashboard is visible.
+    let check_app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(6));
+        run_update_check(check_app);
+    });
 }
 
-fn run_startup_sequence(app: tauri::AppHandle) {
+// ── Auto-updater ───────────────────────────────────────────────────────────
+
+/// Check for a newer version on GitHub Releases and show the in-app banner.
+/// All errors are logged and ignored so a missing/misconfigured updater never
+/// interrupts trading.
+fn run_update_check(app: tauri::AppHandle) {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            log_startup(&format!("Update-check runtime failed to start: {e}"));
+            return;
+        }
+    };
+
+    rt.block_on(async move {
+        use tauri_plugin_updater::UpdaterExt;
+
+        let updater = match app.updater() {
+            Ok(u) => u,
+            Err(e) => {
+                log_startup(&format!("Updater skipped: {e}"));
+                return;
+            }
+        };
+
+        match updater.check().await {
+            Ok(Some(update)) => {
+                let version = update.version.clone();
+                let notes = update.body.clone().unwrap_or_default();
+                log_startup(&format!("Update available: v{version}"));
+
+                if let Some(win) = app.get_webview_window("main") {
+                    let ver_esc = version.replace('\\', "\\\\").replace('\'', "\\'");
+                    let notes_esc = notes
+                        .replace('\\', "\\\\")
+                        .replace('\'', "\\'")
+                        .replace('\n', " ");
+                    let _ = win.eval(&format!(
+                        "window.showUpdateBanner('{ver_esc}', '{notes_esc}');"
+                    ));
+                }
+            }
+            Ok(None) => log_startup("App is up to date"),
+            Err(e) => log_startup(&format!("Update check failed (non-fatal): {e}")),
+        }
+    });
+}
+
+/// Tauri command: download the pending update and install it.
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Updater unavailable: {e}"))?;
+
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("Update check failed: {e}"))?;
+
+    let Some(update) = update else {
+        return Err("No update available".into());
+    };
+
+    update
+        .download_and_install(
+            |chunk_len, total| {
+                let _ = (chunk_len, total);
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("Install failed: {e}"))?;
+
+    app.restart();
+}
+
+// ── Ollama step (step 3 of 5) ──────────────────────────────────────────────
+
+/// Ensure the Ollama LLM service is running and, if needed, install it first.
+/// This is intentionally resilient — any failure is logged and the bot
+/// continues without the regime-filter layer.
+fn setup_ollama(app: &tauri::AppHandle, handle: Arc<ollama::OllamaHandle>) {
+    // If the API is already reachable (externally started service, OS autostart,
+    // etc.) we do not manage its lifecycle at all.
+    if ollama::is_api_reachable() {
+        log_startup("Ollama already running — reusing external instance");
+        // Pull model in background so it is ready for the first prediction.
+        if let Some(bin) = ollama::find_binary() {
+            ollama::pull_model_background(
+                bin,
+                ollama::DEFAULT_MODEL.to_string(),
+                |msg| log_startup(&format!("[ollama] {msg}")),
+            );
+        }
+        return;
+    }
+
+    // Try to find (or install) the binary.
+    let bin_opt = match ollama::find_binary() {
+        Some(bin) => {
+            log_startup(&format!("Ollama binary found: {}", bin.display()));
+            Some(bin)
+        }
+        None => {
+            log_startup("Ollama not found — attempting automatic install");
+            splash_status(app, "Installing Ollama (LLM regime layer)…", 3);
+
+            match ollama::install(|msg| {
+                log_startup(&format!("[ollama] {msg}"));
+                splash_status(app, msg, 3);
+            }) {
+                Ok(bin) => {
+                    log_startup(&format!(
+                        "Ollama installed successfully: {}",
+                        bin.display()
+                    ));
+                    Some(bin)
+                }
+                Err(e) => {
+                    log_startup(&format!(
+                        "Ollama install failed (non-fatal, LLM layer disabled): {e}"
+                    ));
+                    None
+                }
+            }
+        }
+    };
+
+    let Some(bin) = bin_opt else {
+        return;
+    };
+
+    // Start `ollama serve` and track the child so we can stop it on exit.
+    splash_status(app, "Starting Ollama (LLM regime layer)…", 3);
+    match ollama::start_server(&bin) {
+        Some(child) => {
+            handle.set_child(child);
+            log_startup("Ollama server started by bot — will be stopped on exit");
+
+            // Give it a moment to bind its port before proceeding.
+            if !ollama::wait_for_api(15, 300) {
+                log_startup("Ollama started but API not yet reachable — continuing anyway");
+            }
+        }
+        None => {
+            log_startup("Failed to spawn Ollama process — LLM regime layer disabled");
+            return;
+        }
+    }
+
+    // Pull the model in the background (non-blocking, may take several minutes).
+    let app_clone = app.clone();
+    ollama::pull_model_background(
+        bin,
+        ollama::DEFAULT_MODEL.to_string(),
+        move |msg| {
+            log_startup(&format!("[ollama] {msg}"));
+            // Surface long-running model pull status in the status bar (best-effort).
+            if let Some(win) = app_clone.get_webview_window("main") {
+                let safe = msg.replace('\'', "\\'");
+                let _ = win.eval(&format!(
+                    "if(window.showOllamaStatus)window.showOllamaStatus('{safe}');"
+                ));
+            }
+        },
+    );
+}
+
+// ── Main startup sequence ──────────────────────────────────────────────────
+
+fn run_startup_sequence(app: tauri::AppHandle, ollama_handle: Arc<ollama::OllamaHandle>) {
     std::thread::spawn(move || {
         splash_status(&app, "Preparing application data…", 1);
         log_startup("Desktop startup sequence began");
@@ -109,7 +309,12 @@ fn run_startup_sequence(app: tauri::AppHandle) {
         splash_status(&app, "Copying settings and models (first launch)…", 2);
         std::thread::sleep(Duration::from_millis(150));
 
-        splash_status(&app, "Starting local server on 127.0.0.1:8001…", 3);
+        // ── Step 3: Ollama ─────────────────────────────────────────────────
+        splash_status(&app, "Checking Ollama (LLM regime layer)…", 3);
+        setup_ollama(&app, ollama_handle);
+
+        // ── Step 4: API server ─────────────────────────────────────────────
+        splash_status(&app, "Starting local server on 127.0.0.1:8001…", 4);
         spawn_api_server_if_needed();
 
         let ready = mexc_trading_bot::server::wait_for_api(240, 250);
@@ -119,9 +324,8 @@ fn run_startup_sequence(app: tauri::AppHandle) {
                 .display()
                 .to_string();
             log_startup("API server did not become reachable within 60 seconds");
-            let handle = app.clone();
-            let err_handle = handle.clone();
-            let _ = handle.run_on_main_thread(move || {
+            let err_handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
                 splash_error(
                     &err_handle,
                     &format!(
@@ -135,7 +339,8 @@ fn run_startup_sequence(app: tauri::AppHandle) {
             return;
         }
 
-        splash_status(&app, "Loading dashboard…", 4);
+        // ── Step 5: Open dashboard ─────────────────────────────────────────
+        splash_status(&app, "Loading dashboard…", 5);
         log_startup(&format!(
             "API ready at {}",
             mexc_trading_bot::server::default_api_url()
@@ -148,16 +353,37 @@ fn run_startup_sequence(app: tauri::AppHandle) {
     });
 }
 
+// ── Entry point ────────────────────────────────────────────────────────────
+
 fn main() {
     mexc_trading_bot::utils::init_runtime_paths();
     log_startup("MEXC Trading Bot desktop process started");
 
-    tauri::Builder::default()
-        .setup(|app| {
+    // Shared Ollama process handle — registered as Tauri managed state so the
+    // exit handler can reach it even after setup() returns.
+    let ollama_handle = Arc::new(ollama::OllamaHandle::new());
+    let handle_for_setup = Arc::clone(&ollama_handle);
+
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .manage(ollama_handle)
+        .invoke_handler(tauri::generate_handler![install_update])
+        .setup(move |app| {
             splash_status(app.handle(), "Starting…", 1);
-            run_startup_sequence(app.handle().clone());
+            run_startup_sequence(app.handle().clone(), Arc::clone(&handle_for_setup));
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error building tauri application");
+
+    // Run the event loop. On exit, shut down the Ollama process we started.
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(ollama) = app_handle.try_state::<Arc<ollama::OllamaHandle>>() {
+                log_startup("App closing — stopping Ollama if we started it…");
+                ollama.shutdown();
+            }
+        }
+    });
 }

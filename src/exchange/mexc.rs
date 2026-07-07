@@ -46,6 +46,14 @@ impl MexcClient {
         self.rest.get_klines(symbol, interval, None, None).await
     }
 
+    /// Latest perpetual funding rate for a symbol, as a fraction (e.g. 0.0001 =
+    /// 0.01%). Returns 0.0 on any parse failure rather than erroring, since
+    /// funding is a soft feature input, not a trading gate.
+    pub async fn get_funding_rate(&self, symbol: &str) -> Result<f64> {
+        let data = self.rest.get_funding_rate(symbol).await?;
+        Ok(data.get("fundingRate").and_then(|v| v.as_f64()).unwrap_or(0.0))
+    }
+
     /// Historical klines bounded by a unix-second `start`/`end` window. Used to
     /// shadow-resolve past signals against the price action that followed them.
     pub async fn get_klines_range(

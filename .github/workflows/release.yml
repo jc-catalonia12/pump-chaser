@@ -1,0 +1,300 @@
+name: Release
+
+# Triggered when you push a version tag (e.g. v0.2.0).
+# Builds signed macOS + Windows installers, generates latest.json for the
+# in-app auto-updater, and publishes everything to a GitHub Release.
+#
+# One-time setup (do this once before your first release):
+#   1. cargo tauri signer generate          (generates a key pair)
+#   2. Copy the PUBLIC key to tauri.conf.json > plugins.updater.pubkey
+#   3. Add the PRIVATE key as GitHub secret: TAURI_SIGNING_PRIVATE_KEY
+#   4. Add any key password as:             TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#   5. Set your repo URL in:                TAURI_UPDATE_ENDPOINT secret
+#      e.g. https://github.com/OWNER/mexc-trading-bot-rust/releases/latest/download/latest.json
+#   6. Set TAURI_UPDATER_PUBKEY secret to the same public key value
+#      (so the CI can inject it into tauri.conf.json at build time)
+#
+# See scripts/setup_signing.sh for a guided setup walkthrough.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  ONNX_PATH: data/models/supervised.onnx
+
+jobs:
+  # ─────────────────────────── macOS ────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ML models
+        env:
+          SUPERVISED_ONNX_B64: ${{ secrets.SUPERVISED_ONNX_B64 }}
+          ONLINE_MODEL_JSON_B64: ${{ secrets.ONLINE_MODEL_JSON_B64 }}
+        run: |
+          if [ -z "$SUPERVISED_ONNX_B64" ] && [ ! -f "$ONNX_PATH" ]; then
+            echo "::error::Commit data/models/supervised.onnx or set SUPERVISED_ONNX_B64 secret"
+            exit 1
+          fi
+          mkdir -p data/models
+          if [ -n "$SUPERVISED_ONNX_B64" ] && [ ! -f "$ONNX_PATH" ]; then
+            echo "$SUPERVISED_ONNX_B64" | base64 --decode > "$ONNX_PATH"
+          fi
+          if [ -n "$ONLINE_MODEL_JSON_B64" ]; then
+            echo "$ONLINE_MODEL_JSON_B64" | base64 --decode > data/models/online_model.json
+          fi
+
+      - name: Inject updater pubkey + endpoint into tauri.conf.json
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+          TAURI_UPDATE_ENDPOINT: ${{ secrets.TAURI_UPDATE_ENDPOINT }}
+        run: |
+          CONF="desktop/src-tauri/tauri.conf.json"
+          # Only inject if secrets are set; otherwise leave placeholder (updater silently skips).
+          if [ -n "$TAURI_UPDATER_PUBKEY" ]; then
+            python3 -c "
+          import json, os, sys
+          conf = json.load(open('$CONF'))
+          conf.setdefault('plugins', {}).setdefault('updater', {})
+          conf['plugins']['updater']['pubkey'] = os.environ['TAURI_UPDATER_PUBKEY']
+          if os.environ.get('TAURI_UPDATE_ENDPOINT'):
+              conf['plugins']['updater']['endpoints'] = [os.environ['TAURI_UPDATE_ENDPOINT']]
+          json.dump(conf, open('$CONF', 'w'), indent=2)
+          "
+            echo "Injected updater pubkey and endpoint"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Stage release assets
+        run: bash scripts/prepare_release_assets.sh
+
+      - name: Build macOS installer (x86_64)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        working-directory: desktop
+        run: cargo tauri build --target x86_64-apple-darwin
+
+      # Optional: also build for Apple Silicon
+      - name: Add aarch64 target
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Build macOS installer (aarch64)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        working-directory: desktop
+        run: cargo tauri build --target aarch64-apple-darwin
+
+      - name: Collect macOS artifacts
+        run: |
+          mkdir -p dist/release-macos
+          BUNDLE="desktop/src-tauri/target"
+
+          # x86_64
+          find "$BUNDLE/x86_64-apple-darwin/release/bundle" \
+            \( -name "*.dmg" -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \) \
+            -exec cp {} dist/release-macos/ \; 2>/dev/null || true
+
+          # aarch64
+          find "$BUNDLE/aarch64-apple-darwin/release/bundle" \
+            \( -name "*.dmg" -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \) \
+            -exec cp {} dist/release-macos/ \; 2>/dev/null || true
+
+          echo "=== macOS artifacts ==="
+          ls -lh dist/release-macos/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: dist/release-macos/**
+          if-no-files-found: error
+          retention-days: 1
+
+  # ─────────────────────────── Windows ──────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore ML models
+        env:
+          SUPERVISED_ONNX_B64: ${{ secrets.SUPERVISED_ONNX_B64 }}
+          ONLINE_MODEL_JSON_B64: ${{ secrets.ONLINE_MODEL_JSON_B64 }}
+        shell: pwsh
+        run: |
+          if (-not $env:SUPERVISED_ONNX_B64 -and -not (Test-Path $env:ONNX_PATH)) {
+            Write-Error "Commit data/models/supervised.onnx or set SUPERVISED_ONNX_B64 secret"
+          }
+          New-Item -ItemType Directory -Force -Path "data/models" | Out-Null
+          if ($env:SUPERVISED_ONNX_B64 -and -not (Test-Path $env:ONNX_PATH)) {
+            [IO.File]::WriteAllBytes($env:ONNX_PATH, [Convert]::FromBase64String($env:SUPERVISED_ONNX_B64))
+          }
+          if ($env:ONLINE_MODEL_JSON_B64) {
+            [IO.File]::WriteAllBytes("data/models/online_model.json",
+              [Convert]::FromBase64String($env:ONLINE_MODEL_JSON_B64))
+          }
+
+      - name: Inject updater pubkey + endpoint into tauri.conf.json
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+          TAURI_UPDATE_ENDPOINT: ${{ secrets.TAURI_UPDATE_ENDPOINT }}
+        shell: pwsh
+        run: |
+          if ($env:TAURI_UPDATER_PUBKEY) {
+            $conf = Get-Content "desktop/src-tauri/tauri.conf.json" | ConvertFrom-Json
+            if (-not $conf.plugins) { $conf | Add-Member -MemberType NoteProperty -Name plugins -Value @{} }
+            if (-not $conf.plugins.updater) { $conf.plugins | Add-Member -MemberType NoteProperty -Name updater -Value @{} }
+            $conf.plugins.updater.pubkey = $env:TAURI_UPDATER_PUBKEY
+            if ($env:TAURI_UPDATE_ENDPOINT) {
+              $conf.plugins.updater.endpoints = @($env:TAURI_UPDATE_ENDPOINT)
+            }
+            $conf | ConvertTo-Json -Depth 10 | Set-Content "desktop/src-tauri/tauri.conf.json"
+            Write-Host "Injected updater pubkey and endpoint"
+          }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Stage release assets (bash)
+        shell: bash
+        run: bash scripts/prepare_release_assets.sh
+
+      - name: Build Windows installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        working-directory: desktop
+        run: cargo tauri build
+
+      - name: Collect Windows artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/release-windows" | Out-Null
+          $bundle = "desktop/src-tauri/target/release/bundle"
+          Get-ChildItem "$bundle/msi" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in ".msi",".sig",".zip" } |
+            Copy-Item -Destination "dist/release-windows" -Force
+          Get-ChildItem "$bundle/nsis" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in ".exe",".sig",".zip" -or $_.Name -like "*setup*" } |
+            Copy-Item -Destination "dist/release-windows" -Force
+          Write-Host "=== Windows artifacts ==="
+          Get-ChildItem "dist/release-windows" | Format-Table Name, Length -AutoSize
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: dist/release-windows/**
+          if-no-files-found: error
+          retention-days: 1
+
+  # ────────────────────── Publish GitHub Release ────────────────────────────
+  publish:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-release
+          path: dist/release-macos
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: dist/release-windows
+
+      - name: Generate latest.json (auto-updater manifest)
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build-macos.outputs.version }}
+        run: |
+          python3 scripts/gen_update_manifest.py \
+            --version "$VERSION" \
+            --tag     "$TAG" \
+            --repo    "$GITHUB_REPOSITORY" \
+            --macos   dist/release-macos \
+            --windows dist/release-windows \
+            --out     dist/latest.json
+          echo "=== latest.json ===" && cat dist/latest.json
+
+      - name: Extract release notes from UPGRADE-v1.0.0.md (first 40 lines after last phase)
+        id: notes
+        run: |
+          {
+            echo 'notes<<ENDNOTES'
+            echo "## MEXC Trading Bot v${{ needs.build-macos.outputs.version }}"
+            echo ""
+            echo "Automated release — see [UPGRADE-v1.0.0.md](https://github.com/${{ github.repository }}/blob/main/UPGRADE-v1.0.0.md) for the full change log."
+            echo ""
+            echo "### What's included"
+            echo "- AI-first trading pipeline (33-feature engine, online+ONNX ensemble, Kelly sizing)"
+            echo "- Local LLM regime layer (Ollama, optional — graceful degradation when offline)"
+            echo "- Unified decision engine (EV + R:R + regime gates)"
+            echo "- R-based backtest + acceptance gate"
+            echo "- In-app auto-update notifications"
+            echo ""
+            echo "### Installation"
+            echo "- **macOS**: download the \`.dmg\` and drag to Applications"
+            echo "- **Windows**: download the \`.msi\` installer and run it"
+            echo ""
+            echo "No additional prerequisites — all dependencies are bundled."
+            echo "Ollama is optional (install separately for the LLM regime layer)."
+            echo 'ENDNOTES'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "MEXC Trading Bot v${{ needs.build-macos.outputs.version }}"
+          body: ${{ steps.notes.outputs.notes }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/release-macos/*.dmg
+            dist/release-macos/*.app.tar.gz
+            dist/release-macos/*.app.tar.gz.sig
+            dist/release-windows/*.msi
+            dist/release-windows/*.msi.zip
+            dist/release-windows/*.msi.zip.sig
+            dist/release-windows/*setup*.exe
+            dist/latest.json

@@ -11,10 +11,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{Datelike, Duration, Utc};
 use serde::Serialize;
 
-use crate::config::{AppConfig, SharedAppConfig};
+use crate::config::SharedAppConfig;
 use crate::db::{Database, PortfolioState};
 use crate::error::{BotError, Result};
 use crate::signals::PumpSignal;
@@ -61,15 +61,78 @@ impl RiskManager {
     pub async fn new(config: SharedAppConfig, db: Arc<Database>) -> Result<Self> {
         let mut state = db.get_portfolio_state().await?;
         roll_pnl_periods(&mut state);
-        if state.daily_pnl_date.is_empty() {
-            db.save_portfolio_state(&state).await?;
-        }
-        Ok(Self {
+        let mut rm = Self {
             config,
-            db,
+            db: db.clone(),
             state,
             symbol_cooldowns: HashMap::new(),
-        })
+        };
+        let reset_on_start = rm.config.read().unwrap().execution.paper_reset_on_start;
+        let equity_zero = rm.state.equity < 1.0;
+        let no_open = db.count_open_positions().await? == 0;
+        if (reset_on_start || equity_zero) && no_open {
+            let initial = rm.config.read().unwrap().execution.paper_initial_equity;
+            if equity_zero {
+                tracing::warn!(
+                    "Paper equity is {:.2} — reinitializing to {:.2} USDT",
+                    rm.state.equity,
+                    initial
+                );
+            }
+            rm.reset_paper_equity(initial).await?;
+        } else {
+            rm.sync_pnl_totals_from_db().await?;
+            if rm.state.daily_pnl_date.is_empty() {
+                rm.persist().await?;
+            }
+        }
+        Ok(rm)
+    }
+
+    /// Reset paper portfolio to a fresh starting equity (training session restart).
+    pub async fn reset_paper_equity(&mut self, initial: f64) -> Result<()> {
+        let eq = initial.max(1.0);
+        self.state.equity = eq;
+        self.state.peak_equity = eq;
+        self.state.daily_pnl = 0.0;
+        self.state.weekly_pnl = 0.0;
+        self.state.paper_pnl_total = 0.0;
+        self.state.last_wallet_equity = 0.0;
+        self.state.equity_source = "paper".into();
+        self.state.consecutive_losses = 0;
+        self.state.paused_until = 0;
+        self.state.trading_paused = 0;
+        self.state.kill_switch = 0;
+        roll_pnl_periods(&mut self.state);
+        self.persist().await?;
+        let _ = self
+            .db
+            .log_event(
+                "paper_reset",
+                &format!("Paper equity reset to {eq:.2} USDT"),
+                None,
+            )
+            .await;
+        Ok(())
+    }
+
+    /// Reconcile daily/weekly PnL from closed positions in the database (source of truth).
+    pub async fn sync_pnl_totals_from_db(&mut self) -> Result<()> {
+        roll_pnl_periods(&mut self.state);
+        let today = utc_today();
+        let (week_start, week_end) = utc_week_date_bounds();
+        self.state.daily_pnl = self.db.sum_realized_pnl_for_day(&today, None).await?;
+        self.state.weekly_pnl = self
+            .db
+            .sum_realized_pnl_for_week(&week_start, &week_end, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Sync PnL totals from DB and persist portfolio state (after exchange sync / heal).
+    pub async fn reconcile_pnl_from_db(&mut self) -> Result<()> {
+        self.sync_pnl_totals_from_db().await?;
+        self.persist().await
     }
 
     pub fn metrics(&self, open_positions: i64) -> RiskMetrics {
@@ -212,6 +275,27 @@ impl RiskManager {
         Ok(())
     }
 
+    /// Manually reset the circuit breaker regardless of remaining cooldown.
+    /// Clears `paused_until`, resets `consecutive_losses`, and resumes trading
+    /// (unless the kill switch is also active).
+    pub async fn reset_circuit_breaker(&mut self) -> Result<()> {
+        self.state.paused_until = 0;
+        self.state.consecutive_losses = 0;
+        if self.state.kill_switch == 0 {
+            self.state.trading_paused = 0;
+        }
+        self.persist().await?;
+        let _ = self
+            .db
+            .log_event(
+                "circuit_breaker",
+                "Circuit breaker manually reset — trading resumed",
+                None,
+            )
+            .await;
+        Ok(())
+    }
+
     /// If the circuit-breaker pause has expired, clear `paused_until` and
     /// resume trading. Call this at the start of each scan cycle.
     pub async fn lift_circuit_breaker_if_expired(&mut self) -> bool {
@@ -299,14 +383,7 @@ impl RiskManager {
             .await
     }
 
-    pub fn metrics_json(
-        &self,
-        open_positions: i64,
-        open_scalp: i64,
-        open_confluence: i64,
-        open_volume_pump: i64,
-        ws_stale: bool,
-    ) -> serde_json::Value {
+    pub fn metrics_json(&self, open_positions: i64, ws_stale: bool) -> serde_json::Value {
         let equity = self.state.equity.max(1.0);
         let drawdown = if self.state.peak_equity > 0.0 {
             (self.state.peak_equity - self.state.equity) / self.state.peak_equity * 100.0
@@ -328,13 +405,7 @@ impl RiskManager {
             "daily_pnl_pct": round2(self.state.daily_pnl / equity * 100.0),
             "weekly_pnl": round2(self.state.weekly_pnl),
             "open_positions": open_positions,
-            "open_scalp_positions": open_scalp,
-            "open_confluence_positions": open_confluence,
-            "open_volume_pump_positions": open_volume_pump,
             "max_positions": cfg.risk.max_concurrent_positions,
-            "max_scalp_positions": 0,
-            "max_confluence_positions": cfg.risk.max_confluence_positions,
-            "max_volume_pump_positions": cfg.risk.max_volume_pump_positions,
             "trading_paused": self.state.trading_paused != 0,
             "kill_switch": self.state.kill_switch != 0,
             "max_risk_per_trade_pct": round2(cfg.risk.max_risk_per_trade * 100.0),
@@ -343,7 +414,6 @@ impl RiskManager {
             "ml_enabled": cfg.ml.enabled,
             "learning_enabled": cfg.learning.enabled,
             "trading_mode": cfg.trading.mode,
-            "scalp_enabled": cfg.scalp.enabled,
             "ws_stale": ws_stale,
             // Circuit-breaker state
             "consecutive_losses": self.state.consecutive_losses,
@@ -361,9 +431,8 @@ impl RiskManager {
         } else {
             self.state.equity += delta;
         }
-        self.state.daily_pnl += delta;
-        self.state.weekly_pnl += delta;
         self.state.peak_equity = self.state.peak_equity.max(self.state.equity);
+        self.sync_pnl_totals_from_db().await?;
 
         let equity = self.state.equity.max(1.0);
         let daily_limit = self.config.read().unwrap().risk.daily_loss_limit;
@@ -392,26 +461,6 @@ impl RiskManager {
         }
 
         let cfg = self.config.read().unwrap().clone();
-        let strategy_cap = strategy_position_cap(&cfg, &signal.strategy);
-        let strategy_open = self
-            .db
-            .count_open_positions_by_strategy(&signal.strategy)
-            .await?;
-        if strategy_open >= strategy_cap as i64 {
-            let _ = self
-                .db
-                .log_event(
-                    "trade_blocked",
-                    &format!(
-                        "Max {} positions ({}) reached",
-                        signal.strategy, strategy_cap
-                    ),
-                    Some(signal.to_payload()),
-                )
-                .await;
-            return Ok(None);
-        }
-
         if self.db.has_open_position_on_symbol(&signal.symbol).await? {
             let _ = self
                 .db
@@ -432,7 +481,7 @@ impl RiskManager {
             return Ok(None);
         }
 
-        if signal.suggested_risk_pct / 100.0 > max_risk_for_strategy(&cfg, &signal.strategy) {
+        if signal.suggested_risk_pct / 100.0 > cfg.risk.max_risk_per_trade {
             let _ = self
                 .db
                 .log_event(
@@ -489,7 +538,11 @@ impl RiskManager {
 
         // Minimum gross profit gate: reject if the expected total PnL across all
         // TP levels is below the strategy minimum.
-        let min_profit = min_profit_for_strategy(&cfg, &signal.strategy);
+        let mut min_profit = cfg.risk.min_profit_usdt;
+        if self.state.equity_source == "paper" {
+            // Small paper accounts: cap min-profit so $100 equity can still open trades.
+            min_profit = min_profit.min((self.state.equity * 0.02).max(0.25));
+        }
         if min_profit > 0.0 && !signal.projected_take_profits.is_empty() {
             let entry = signal.last_price;
             let total_projected: f64 = signal
@@ -591,35 +644,23 @@ impl RiskManager {
     }
 }
 
-fn strategy_position_cap(config: &AppConfig, strategy: &str) -> u32 {
-    match strategy {
-        "volume_pump" => config.risk.max_volume_pump_positions,
-        "confluence" => config.risk.max_confluence_positions,
-        "scalp" => config.risk.max_concurrent_positions,
-        _ => config.risk.max_concurrent_positions,
-    }
-}
-
-fn max_risk_for_strategy(config: &AppConfig, strategy: &str) -> f64 {
-    match strategy {
-        "volume_pump" => config.pump.max_risk_per_trade.min(config.risk.max_risk_per_trade),
-        _ => config.risk.max_risk_per_trade,
-    }
-}
-
-fn min_profit_for_strategy(config: &AppConfig, strategy: &str) -> f64 {
-    match strategy {
-        "volume_pump" => config.pump.min_profit_usdt,
-        _ => config.risk.min_profit_usdt,
-    }
-}
-
 fn utc_today() -> String {
     Utc::now().format("%Y-%m-%d").to_string()
 }
 
 fn utc_iso_week() -> String {
     Utc::now().format("%G-W%V").to_string()
+}
+
+fn utc_week_date_bounds() -> (String, String) {
+    let today = Utc::now().date_naive();
+    let weekday = today.weekday().num_days_from_monday();
+    let start = today - Duration::days(weekday as i64);
+    let end = start + Duration::days(6);
+    (
+        start.format("%Y-%m-%d").to_string(),
+        end.format("%Y-%m-%d").to_string(),
+    )
 }
 
 fn roll_pnl_periods(state: &mut PortfolioState) {
@@ -675,6 +716,9 @@ mod tests {
             ml_features: vec![],
             entry_mode: "limit".into(),
             limit_entry_price: 0.0,
+            expected_value_r: 0.0,
+            reward_risk: 0.0,
+            decision_reason: String::new(),
         }
     }
 
@@ -686,7 +730,7 @@ mod tests {
         let mut cfg = AppConfig::load().unwrap();
         cfg.storage.sqlite_path = db_path.to_string_lossy().into();
         let db = Arc::new(Database::connect(&cfg.storage.sqlite_path).await.unwrap());
-        db.migrate().await.unwrap();
+        db.migrate(10_000.0).await.unwrap();
         (db, Arc::new(std::sync::RwLock::new(cfg)))
     }
 
@@ -787,24 +831,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn per_strategy_slots_allow_parallel_strategies() {
+    async fn max_positions_cap_blocks_new_entries() {
         let (db, cfg) = test_db().await;
-        {
-            let mut c = cfg.write().unwrap();
-            c.risk.max_concurrent_positions = 2;
-            c.risk.max_confluence_positions = 1;
-            c.risk.max_volume_pump_positions = 1;
-        }
+        cfg.write().unwrap().risk.max_concurrent_positions = 1;
         let mut rm = RiskManager::new(cfg.clone(), db.clone()).await.unwrap();
         rm.state.equity = 10_000.0;
         rm.state.peak_equity = 10_000.0;
 
-        let conf = sample_signal("confluence", "BTC_USDT");
-        assert!(
-            rm.prepare_open_from_signal(&conf).await.unwrap().is_some(),
-            "confluence should open first slot"
-        );
-        rm.commit_open_from_signal(&conf, true, &PreparedOpen {
+        let first = sample_signal("ai", "BTC_USDT");
+        rm.commit_open_from_signal(&first, true, &PreparedOpen {
             side: "long".into(),
             size: 1.0,
             leverage: 10,
@@ -815,55 +850,22 @@ mod tests {
         .await
         .unwrap();
 
-        let pump = sample_signal("volume_pump", "ETH_USDT");
+        let second = sample_signal("ai", "ETH_USDT");
         assert!(
-            rm.prepare_open_from_signal(&pump).await.unwrap().is_some(),
-            "volume pump should still open with confluence slot full"
+            rm.prepare_open_from_signal(&second).await.unwrap().is_none(),
+            "second position should be blocked by the global cap"
         );
     }
 
     #[tokio::test]
-    async fn volume_pump_slot_blocks_second_pump() {
-        let (db, cfg) = test_db().await;
-        cfg.write().unwrap().risk.max_volume_pump_positions = 1;
-        let mut rm = RiskManager::new(cfg.clone(), db.clone()).await.unwrap();
-        rm.state.equity = 10_000.0;
-        rm.state.peak_equity = 10_000.0;
-
-        let pump1 = sample_signal("volume_pump", "SOL_USDT");
-        rm.commit_open_from_signal(&pump1, true, &PreparedOpen {
-            side: "long".into(),
-            size: 1.0,
-            leverage: 10,
-            entry_mode: "limit".into(),
-            entry_price: 100.0,
-            limit_price: Some(100.0),
-        })
-        .await
-        .unwrap();
-
-        let pump2 = sample_signal("volume_pump", "AVAX_USDT");
-        assert!(
-            rm.prepare_open_from_signal(&pump2).await.unwrap().is_none(),
-            "second volume pump should be blocked"
-        );
-
-        let conf = sample_signal("confluence", "LINK_USDT");
-        assert!(
-            rm.prepare_open_from_signal(&conf).await.unwrap().is_some(),
-            "confluence should be unaffected by full pump slot"
-        );
-    }
-
-    #[tokio::test]
-    async fn same_symbol_blocked_across_strategies() {
+    async fn same_symbol_blocked_for_second_position() {
         let (db, cfg) = test_db().await;
         let mut rm = RiskManager::new(cfg.clone(), db.clone()).await.unwrap();
         rm.state.equity = 10_000.0;
         rm.state.peak_equity = 10_000.0;
 
-        let conf = sample_signal("confluence", "DOGE_USDT");
-        rm.commit_open_from_signal(&conf, true, &PreparedOpen {
+        let first = sample_signal("ai", "DOGE_USDT");
+        rm.commit_open_from_signal(&first, true, &PreparedOpen {
             side: "long".into(),
             size: 1.0,
             leverage: 10,
@@ -874,10 +876,10 @@ mod tests {
         .await
         .unwrap();
 
-        let pump = sample_signal("volume_pump", "DOGE_USDT");
+        let dup = sample_signal("ai", "DOGE_USDT");
         assert!(
-            rm.prepare_open_from_signal(&pump).await.unwrap().is_none(),
-            "same symbol must not double across strategies"
+            rm.prepare_open_from_signal(&dup).await.unwrap().is_none(),
+            "same symbol must not open a second position"
         );
     }
 }

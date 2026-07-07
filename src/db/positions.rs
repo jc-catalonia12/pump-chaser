@@ -384,18 +384,56 @@ impl Database {
         Ok(result.last_insert_rowid())
     }
 
-    /// Close a position discovered missing on the exchange (no exit price available).
-    pub async fn close_position_synced(&self, id: i64, reason: &str) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
-            "UPDATE positions SET status = 'closed', remaining_size = 0, closed_at = ?, exit_reason = ? WHERE id = ?",
-        )
-        .bind(&now)
-        .bind(reason)
-        .bind(id)
-        .execute(self.pool())
-        .await?;
-        Ok(())
+    /// Estimate exit price when MEXC closed a position but no fill price was recorded locally.
+    pub fn estimate_exit_price(
+        _side: &str,
+        entry: f64,
+        stop_loss: f64,
+        reason: &str,
+        mark_price: f64,
+    ) -> f64 {
+        if matches!(reason, "limit_ttl_expired" | "deduped") {
+            return entry.max(0.0);
+        }
+        // Exchange-side SL/TP is the most likely fill when the bot missed the close event.
+        if matches!(reason, "exchange_closed" | "phantom_heal") && stop_loss > 0.0 {
+            return stop_loss;
+        }
+        if mark_price > 0.0 {
+            mark_price
+        } else {
+            entry.max(0.0)
+        }
+    }
+
+    /// Close a position discovered missing on the exchange and record estimated PnL.
+    ///
+    /// Returns `(realized_pnl, exit_price)`.
+    pub async fn close_position_synced(
+        &self,
+        id: i64,
+        reason: &str,
+        contract_size: f64,
+        fee_rate: f64,
+        mark_price: f64,
+    ) -> Result<(f64, f64)> {
+        let pos = self
+            .get_position_by_id(id)
+            .await?
+            .ok_or_else(|| crate::error::BotError::Other(format!("position {id} not found")))?;
+        let side = pos.get("side").and_then(|v| v.as_str()).unwrap_or("long");
+        let entry = pos.get("entry_price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let stop_loss = pos.get("stop_loss").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let exit = Self::estimate_exit_price(side, entry, stop_loss, reason, mark_price);
+        let fee = if reason == "limit_ttl_expired" {
+            0.0
+        } else {
+            fee_rate
+        };
+        let pnl = self
+            .close_position(id, exit, contract_size, fee, reason)
+            .await?;
+        Ok((pnl, exit))
     }
 
     /// Close a position and record realized PnL (fees included).
@@ -412,7 +450,7 @@ impl Database {
         reason: &str,
     ) -> Result<f64> {
         let row = sqlx::query(
-            "SELECT side, entry_price, remaining_size FROM positions WHERE id = ?",
+            "SELECT side, entry_price, remaining_size, COALESCE(realized_pnl, 0) AS realized_pnl FROM positions WHERE id = ?",
         )
         .bind(id)
         .fetch_one(self.pool())
@@ -420,6 +458,7 @@ impl Database {
         let side: String = row.try_get("side")?;
         let entry: f64 = row.try_get("entry_price")?;
         let size: f64 = row.try_get("remaining_size")?;
+        let existing_pnl: f64 = row.try_get("realized_pnl")?;
         let cs = if contract_size > 0.0 { contract_size } else { 1.0 };
         let qty = size * cs;
         let gross = if side == "long" {
@@ -429,19 +468,20 @@ impl Database {
         };
         // Deduct round-trip taker fees (open + close notional × fee_rate).
         let fees = (entry * qty + exit_price * qty) * fee_rate;
-        let pnl = gross - fees;
+        let chunk_pnl = gross - fees;
+        let total_pnl = existing_pnl + chunk_pnl;
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
             "UPDATE positions SET status = 'closed', remaining_size = 0, closed_at = ?, realized_pnl = ?, exit_price = ?, exit_reason = ? WHERE id = ?",
         )
         .bind(&now)
-        .bind(pnl)
+        .bind(total_pnl)
         .bind(exit_price)
         .bind(reason)
         .bind(id)
         .execute(self.pool())
         .await?;
-        Ok(pnl)
+        Ok(chunk_pnl)
     }
 
     /// Update stop-loss and take-profit levels (JSON string) for a position.
@@ -482,25 +522,35 @@ impl Database {
         Ok(())
     }
 
-    /// Partially close a position — reduce `remaining_size` and mark 'partial'.
+    /// Partially close a position — reduce `remaining_size`, accumulate `realized_pnl`, mark 'partial'.
     /// Used by the live monitor when a TP level closes only a fraction of the position.
-    pub async fn partial_close_position(&self, id: i64, new_remaining: f64, exit_price: f64) -> Result<()> {
+    pub async fn partial_close_position(
+        &self,
+        id: i64,
+        new_remaining: f64,
+        exit_price: f64,
+        partial_pnl: f64,
+    ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         if new_remaining <= 0.0 {
             sqlx::query(
-                "UPDATE positions SET status = 'closed', remaining_size = 0, closed_at = ?, exit_price = ? WHERE id = ?",
+                "UPDATE positions SET status = 'closed', remaining_size = 0, closed_at = ?, exit_price = ?, \
+                 realized_pnl = COALESCE(realized_pnl, 0) + ? WHERE id = ?",
             )
             .bind(&now)
             .bind(exit_price)
+            .bind(partial_pnl)
             .bind(id)
             .execute(self.pool())
             .await?;
         } else {
             sqlx::query(
-                "UPDATE positions SET status = 'partial', remaining_size = ?, exit_price = ? WHERE id = ?",
+                "UPDATE positions SET status = 'partial', remaining_size = ?, exit_price = ?, \
+                 realized_pnl = COALESCE(realized_pnl, 0) + ? WHERE id = ?",
             )
             .bind(new_remaining)
             .bind(exit_price)
+            .bind(partial_pnl)
             .bind(id)
             .execute(self.pool())
             .await?;
@@ -563,7 +613,7 @@ fn position_row(row: &sqlx::sqlite::SqliteRow) -> Value {
         "realized_pnl_pct": realized_pnl_pct,
         "unrealized_pnl": 0.0,
         "unrealized_pnl_pct": 0.0,
-        "strategy": row.try_get::<String, _>("strategy").unwrap_or_else(|_| "confluence".into()),
+        "strategy": row.try_get::<String, _>("strategy").unwrap_or_else(|_| "ai".into()),
         "entry_mode": row
             .try_get::<Option<String>, _>("entry_mode")
             .ok()
@@ -583,4 +633,29 @@ fn position_row(row: &sqlx::sqlite::SqliteRow) -> Value {
         "closed_at": row.try_get::<Option<String>, _>("closed_at").ok().flatten(),
         "entry_context": {},
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+
+    #[test]
+    fn estimate_exit_price_uses_stop_loss_when_exchange_closed() {
+        let exit = Database::estimate_exit_price("long", 100.0, 95.0, "exchange_closed", 99.0);
+        assert!((exit - 95.0).abs() < 1e-9);
+        let exit_short = Database::estimate_exit_price("short", 100.0, 105.0, "phantom_heal", 101.0);
+        assert!((exit_short - 105.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimate_exit_price_falls_back_to_mark() {
+        let exit = Database::estimate_exit_price("long", 100.0, 0.0, "exchange_closed", 98.5);
+        assert!((exit - 98.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimate_exit_price_unfilled_limit_is_flat() {
+        let exit = Database::estimate_exit_price("long", 50.0, 48.0, "limit_ttl_expired", 49.0);
+        assert!((exit - 50.0).abs() < 1e-9);
+    }
 }

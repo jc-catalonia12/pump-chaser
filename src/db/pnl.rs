@@ -1,14 +1,101 @@
 use serde_json::{json, Value};
+use sqlx::Row;
 
 use crate::db::Database;
 use crate::error::Result;
 
 impl Database {
+    /// Sum realized PnL for positions closed on a UTC calendar day (`YYYY-MM-DD`).
+    pub async fn sum_realized_pnl_for_day(
+        &self,
+        day: &str,
+        paper: Option<bool>,
+    ) -> Result<f64> {
+        let row = match paper {
+            Some(true) => {
+                sqlx::query(
+                    "SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM positions \
+                     WHERE status = 'closed' AND closed_at IS NOT NULL AND paper = 1 \
+                     AND substr(closed_at, 1, 10) = ?",
+                )
+                .bind(day)
+                .fetch_one(self.pool())
+                .await?
+            }
+            Some(false) => {
+                sqlx::query(
+                    "SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM positions \
+                     WHERE status = 'closed' AND closed_at IS NOT NULL AND paper = 0 \
+                     AND substr(closed_at, 1, 10) = ?",
+                )
+                .bind(day)
+                .fetch_one(self.pool())
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM positions \
+                     WHERE status = 'closed' AND closed_at IS NOT NULL \
+                     AND substr(closed_at, 1, 10) = ?",
+                )
+                .bind(day)
+                .fetch_one(self.pool())
+                .await?
+            }
+        };
+        Ok(row.try_get::<f64, _>("pnl").unwrap_or(0.0))
+    }
+
+    /// Sum realized PnL for positions closed within an ISO week (inclusive, UTC dates).
+    pub async fn sum_realized_pnl_for_week(
+        &self,
+        week_start: &str,
+        week_end: &str,
+        paper: Option<bool>,
+    ) -> Result<f64> {
+        let row = match paper {
+            Some(true) => {
+                sqlx::query(
+                    "SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM positions \
+                     WHERE status = 'closed' AND closed_at IS NOT NULL AND paper = 1 \
+                     AND substr(closed_at, 1, 10) >= ? AND substr(closed_at, 1, 10) <= ?",
+                )
+                .bind(week_start)
+                .bind(week_end)
+                .fetch_one(self.pool())
+                .await?
+            }
+            Some(false) => {
+                sqlx::query(
+                    "SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM positions \
+                     WHERE status = 'closed' AND closed_at IS NOT NULL AND paper = 0 \
+                     AND substr(closed_at, 1, 10) >= ? AND substr(closed_at, 1, 10) <= ?",
+                )
+                .bind(week_start)
+                .bind(week_end)
+                .fetch_one(self.pool())
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM positions \
+                     WHERE status = 'closed' AND closed_at IS NOT NULL \
+                     AND substr(closed_at, 1, 10) >= ? AND substr(closed_at, 1, 10) <= ?",
+                )
+                .bind(week_start)
+                .bind(week_end)
+                .fetch_one(self.pool())
+                .await?
+            }
+        };
+        Ok(row.try_get::<f64, _>("pnl").unwrap_or(0.0))
+    }
+
     pub async fn get_daily_pnl_history(&self, paper: Option<bool>) -> Result<Vec<Value>> {
         let rows = match paper {
             Some(true) => {
                 sqlx::query(
-                    "SELECT date(closed_at) AS day, COUNT(*) AS trades, \
+                    "SELECT substr(closed_at, 1, 10) AS day, COUNT(*) AS trades, \
                      SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS wins, \
                      SUM(realized_pnl) AS pnl FROM positions \
                      WHERE status = 'closed' AND closed_at IS NOT NULL AND paper = 1 \
@@ -19,7 +106,7 @@ impl Database {
             }
             Some(false) => {
                 sqlx::query(
-                    "SELECT date(closed_at) AS day, COUNT(*) AS trades, \
+                    "SELECT substr(closed_at, 1, 10) AS day, COUNT(*) AS trades, \
                      SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS wins, \
                      SUM(realized_pnl) AS pnl FROM positions \
                      WHERE status = 'closed' AND closed_at IS NOT NULL AND paper = 0 \
@@ -30,7 +117,7 @@ impl Database {
             }
             None => {
                 sqlx::query(
-                    "SELECT date(closed_at) AS day, COUNT(*) AS trades, \
+                    "SELECT substr(closed_at, 1, 10) AS day, COUNT(*) AS trades, \
                      SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS wins, \
                      SUM(realized_pnl) AS pnl FROM positions \
                      WHERE status = 'closed' AND closed_at IS NOT NULL \

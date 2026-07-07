@@ -56,6 +56,16 @@ pub struct PumpSignal {
     /// Price for the limit order (set by sniper module; 0.0 = use last_price ± offset).
     #[serde(default)]
     pub limit_entry_price: f64,
+    /// Decision-engine expected value in R multiples (Phase 5). 0.0 until the
+    /// decision layer evaluates the signal.
+    #[serde(default)]
+    pub expected_value_r: f64,
+    /// Decision-engine reward:risk ratio at emission (Phase 5).
+    #[serde(default)]
+    pub reward_risk: f64,
+    /// Human-readable decision-engine reasoning (Phase 5).
+    #[serde(default)]
+    pub decision_reason: String,
 }
 
 fn default_entry_mode() -> String {
@@ -90,6 +100,9 @@ impl PumpSignal {
             "ml_features": self.ml_features,
             "entry_mode": self.entry_mode,
             "limit_entry_price": self.limit_entry_price,
+            "expected_value_r": self.expected_value_r,
+            "reward_risk": self.reward_risk,
+            "decision_reason": self.decision_reason,
         })
     }
 }

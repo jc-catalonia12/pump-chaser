@@ -137,10 +137,7 @@ fn extract_win_probability(outputs: &ort::session::SessionOutputs<'_>) -> Result
 }
 
 pub fn resolve_model_path(config: &MlConfig) -> PathBuf {
-    if let Some(ref p) = config.onnx_model_path {
-        return PathBuf::from(p);
-    }
-    PathBuf::from("data/models/supervised.onnx")
+    crate::ml::onnx_model_path(config)
 }
 
 #[cfg(all(test, feature = "onnx"))]
@@ -155,7 +152,11 @@ mod tests {
             return;
         }
         let clf = OnnxClassifier::load(&path).expect("sklearn ONNX export should load via ONNX Runtime");
-        assert!(clf.input_dim() == LEGACY_ONNX_FEATURE_DIM || clf.input_dim() == FEATURE_DIM);
+        assert!(
+            clf.input_dim() == LEGACY_ONNX_FEATURE_DIM
+                || clf.input_dim() == 15
+                || clf.input_dim() == FEATURE_DIM
+        );
         let sample = vec![0.0; clf.input_dim()];
         clf.predict_proba(&sample).expect("ONNX predict should succeed");
     }

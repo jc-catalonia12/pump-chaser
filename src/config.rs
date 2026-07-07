@@ -14,7 +14,6 @@ pub struct AppConfig {
     pub mexc: MexcConfig,
     pub scanner: ScannerConfig,
     pub zones: ZonesConfig,
-    pub confluence: ConfluenceConfig,
     pub trading: TradingConfig,
     pub risk: RiskConfig,
     pub execution: ExecutionConfig,
@@ -24,8 +23,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub learning: LearningConfig,
     #[serde(default)]
-    pub scalp: ScalpConfig,
-    #[serde(default)]
     pub watchlist: WatchlistConfig,
     #[serde(default)]
     pub backtest: BacktestConfig,
@@ -34,9 +31,156 @@ pub struct AppConfig {
     #[serde(default)]
     pub alerts: AlertsConfig,
     #[serde(default)]
-    pub sniper: SniperConfig,
+    pub sentiment: SentimentConfig,
     #[serde(default)]
-    pub pump: PumpConfig,
+    pub ai: AiConfig,
+    #[serde(default)]
+    pub llm: LlmConfig,
+    #[serde(default)]
+    pub decision: DecisionConfig,
+}
+
+/// Unified decision & sizing authority — Phase 5.
+/// The decision engine is the single go/no-go authority: it combines the ML
+/// win probability, expected value (in R), the LLM regime alignment, and
+/// sentiment into an approve/reject + size/leverage multipliers, *before* the
+/// preserved `RiskManager` safety net. When the LLM regime is neutral (Ollama
+/// offline) the regime terms vanish and the decision reduces to a pure
+/// EV / reward-risk gate on the ML edge — the graceful-degradation path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Minimum expected value (in R multiples) to approve a trade.
+    /// EV = p*reward_risk - (1-p). 0.0 = require non-negative expectancy.
+    #[serde(default = "default_decision_min_ev")]
+    pub min_expected_value: f64,
+    /// Minimum reward:risk ratio (first TP distance / SL distance).
+    #[serde(default = "default_decision_min_rr")]
+    pub min_reward_risk: f64,
+    /// LLM confidence at/above which a strongly-opposing regime can veto.
+    #[serde(default = "default_decision_veto_conf")]
+    pub regime_veto_confidence: f64,
+    /// Confidence-weighted alignment (0..1) below -this triggers a veto.
+    #[serde(default = "default_decision_veto_align")]
+    pub regime_veto_alignment: f64,
+    /// Max fractional size boost/cut from confidence-weighted regime alignment.
+    #[serde(default = "default_decision_regime_boost")]
+    pub regime_size_boost: f64,
+    /// Fractional size (and leverage) haircut in a high-volatility regime.
+    #[serde(default = "default_decision_highvol_haircut")]
+    pub high_vol_size_haircut: f64,
+    /// How strongly directional sentiment nudges size (fraction per unit).
+    #[serde(default = "default_decision_sentiment_weight")]
+    pub sentiment_size_weight: f64,
+    /// Lower/upper clamp on the final size multiplier.
+    #[serde(default = "default_decision_min_size_scale")]
+    pub min_size_scale: f64,
+    #[serde(default = "default_decision_max_size_scale")]
+    pub max_size_scale: f64,
+}
+
+impl Default for DecisionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_expected_value: default_decision_min_ev(),
+            min_reward_risk: default_decision_min_rr(),
+            regime_veto_confidence: default_decision_veto_conf(),
+            regime_veto_alignment: default_decision_veto_align(),
+            regime_size_boost: default_decision_regime_boost(),
+            high_vol_size_haircut: default_decision_highvol_haircut(),
+            sentiment_size_weight: default_decision_sentiment_weight(),
+            min_size_scale: default_decision_min_size_scale(),
+            max_size_scale: default_decision_max_size_scale(),
+        }
+    }
+}
+
+fn default_decision_min_ev() -> f64 {
+    0.0
+}
+
+fn default_decision_min_rr() -> f64 {
+    0.8
+}
+
+fn default_decision_veto_conf() -> f64 {
+    0.6
+}
+
+fn default_decision_veto_align() -> f64 {
+    0.5
+}
+
+fn default_decision_regime_boost() -> f64 {
+    0.25
+}
+
+fn default_decision_highvol_haircut() -> f64 {
+    0.25
+}
+
+fn default_decision_sentiment_weight() -> f64 {
+    0.15
+}
+
+fn default_decision_min_size_scale() -> f64 {
+    0.4
+}
+
+fn default_decision_max_size_scale() -> f64 {
+    1.5
+}
+
+/// Local LLM (Ollama) market-regime layer — Phase 4.
+/// Purely additive: regime output feeds ML features and (later) the decision
+/// layer as soft context. If Ollama is offline the regime stays neutral and
+/// nothing is ever hard-blocked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Ollama HTTP endpoint.
+    #[serde(default = "default_llm_base_url")]
+    pub base_url: String,
+    /// Ollama model tag (must already be pulled, e.g. `ollama pull llama3.2`).
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+    /// Seconds between regime classifications (result is cached in between).
+    #[serde(default = "default_llm_poll_sec")]
+    pub poll_interval_sec: u64,
+    /// HTTP timeout per classification request.
+    #[serde(default = "default_llm_timeout_sec")]
+    pub timeout_sec: u64,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_url: default_llm_base_url(),
+            model: default_llm_model(),
+            poll_interval_sec: default_llm_poll_sec(),
+            timeout_sec: default_llm_timeout_sec(),
+        }
+    }
+}
+
+fn default_llm_base_url() -> String {
+    "http://localhost:11434".into()
+}
+
+fn default_llm_model() -> String {
+    "llama3.2".into()
+}
+
+fn default_llm_poll_sec() -> u64 {
+    300
+}
+
+fn default_llm_timeout_sec() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +243,16 @@ pub struct ScannerConfig {
     pub usdt_m_crypto_only: bool,
     #[serde(default = "default_kline_refresh")]
     pub kline_refresh_sec: u64,
+    /// Higher-timeframe kline interval for per-symbol and BTC/ETH macro context.
+    #[serde(default = "default_htf_interval")]
+    pub htf_interval: String,
+    /// Number of HTF bars fetched/kept for context features.
+    #[serde(default = "default_htf_lookback")]
+    pub htf_lookback_bars: u32,
+    /// Poll perpetual funding rates for tracked symbols as an ML feature input
+    /// (low-frequency — see `FUNDING_REFRESH_EVERY_N_CYCLES`).
+    #[serde(default = "default_true")]
+    pub fetch_funding_rate: bool,
 }
 
 fn default_kline_refresh() -> u64 {
@@ -123,6 +277,14 @@ fn default_kline_interval() -> String {
 
 fn default_kline_lookback() -> u32 {
     60
+}
+
+fn default_htf_interval() -> String {
+    "Min15".into()
+}
+
+fn default_htf_lookback() -> u32 {
+    48
 }
 
 fn default_true() -> bool {
@@ -161,237 +323,104 @@ fn default_proximity() -> f64 {
     0.25
 }
 
+/// Single AI-driven trading pipeline (the only mode since the strategy engines
+/// were retired). `mode` is kept for API/UI compatibility and must be `ai`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfluenceConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_min_score")]
-    pub min_composite_score: f64,
-    #[serde(default = "default_min_zone_score")]
-    pub min_zone_score: f64,
-    #[serde(default = "default_min_confluences")]
-    pub min_confluences: u32,
-    #[serde(default = "default_min_move")]
-    pub min_move_pct: f64,
-    #[serde(default = "default_max_move")]
-    pub max_move_pct: f64,
-    #[serde(default = "default_vol_surge")]
-    pub volume_surge_multiplier: f64,
-    #[serde(default = "default_vol_z")]
-    pub volume_zscore_threshold: f64,
-    #[serde(default = "default_cooldown")]
-    pub alert_cooldown_sec: u64,
-    #[serde(default = "default_sl_pct")]
-    pub default_sl_pct: f64,
-    #[serde(default = "default_trailing")]
-    pub trailing_stop_pct: f64,
-    #[serde(default = "default_trail_act")]
-    pub trailing_activation_pct: f64,
-    #[serde(default = "default_tp_levels")]
-    pub tp_levels_pct: Vec<f64>,
-    #[serde(default = "default_tp_fracs")]
-    pub tp_close_fractions: Vec<f64>,
+pub struct TradingConfig {
+    #[serde(default = "default_trading_mode")]
+    pub mode: String,
+    /// Max seconds a position may stay open before the time exit fires.
+    /// 0 = disabled.
     #[serde(default = "default_max_hold")]
     pub max_hold_sec: u64,
-    #[serde(default = "default_risk_pct")]
-    pub max_risk_per_trade: f64,
-    #[serde(default = "default_max_positions")]
-    pub max_concurrent_positions: u32,
-    #[serde(default = "default_true")]
-    pub require_structure: bool,
-    #[serde(default = "default_true")]
-    pub require_market_structure_bias: bool,
-    #[serde(default = "default_ms_lookback")]
-    pub market_structure_lookback_bars: u32,
-    #[serde(default)]
-    pub require_inside_zone: bool,
-    #[serde(default)]
-    pub require_ema_trend: bool,
-    #[serde(default = "default_ema_span")]
-    pub ema_trend_span: u32,
-    #[serde(default)]
-    pub require_pullback_candle: bool,
-    #[serde(default = "default_range_extreme")]
-    pub max_range_extreme_pct: f64,
-    #[serde(default = "default_extension")]
-    pub max_extension_pct: f64,
-    #[serde(default = "default_base_lev")]
-    pub base_leverage: u32,
-    #[serde(default = "default_moderate_lev")]
-    pub moderate_leverage: u32,
-    #[serde(default = "default_strong_lev")]
-    pub strong_leverage: u32,
-    /// Require higher-timeframe structural bias to align with signal direction.
-    #[serde(default = "default_true")]
-    pub htf_enabled: bool,
-    /// Kline interval for higher-timeframe bias check (e.g. "Min15", "Min30").
-    #[serde(default = "default_htf_interval")]
-    pub htf_interval: String,
-    /// Number of HTF bars to fetch and analyse.
-    #[serde(default = "default_htf_lookback")]
-    pub htf_lookback_bars: u32,
-    /// Detect 15m liquidity grabs (sweep + reclaim) for entries.
-    #[serde(default = "default_true")]
-    pub liquidity_grab_enabled: bool,
-    /// Block entries unless a recent HTF liquidity grab aligns with direction.
-    #[serde(default = "default_true")]
-    pub require_liquidity_grab: bool,
-    /// HTF bars used to build the high/low liquidity pool.
-    #[serde(default = "default_liq_grab_lookback")]
-    pub liquidity_grab_lookback_bars: u32,
-    /// Max age (bars) of the grab candle on HTF.
-    #[serde(default = "default_liq_grab_age")]
-    pub liquidity_grab_max_age_bars: u32,
-    /// Minimum sweep beyond pool level (%).
-    #[serde(default = "default_liq_grab_sweep")]
-    pub liquidity_grab_sweep_pct: f64,
-    /// Minimum wick rejection ratio (0–1) on the grab candle.
-    #[serde(default = "default_liq_grab_rejection")]
-    pub liquidity_grab_min_rejection: f64,
-    /// Wider trail once move exceeds this fraction (e.g. 0.03 = 3%).
-    #[serde(default = "default_trail_ext_act")]
-    pub trailing_extended_activation_pct: f64,
-    #[serde(default = "default_trail_ext_stop")]
-    pub trailing_extended_stop_pct: f64,
-    /// Widest trail for large runners (pumps/dumps).
-    #[serde(default = "default_trail_run_act")]
-    pub trailing_runner_activation_pct: f64,
-    #[serde(default = "default_trail_run_stop")]
-    pub trailing_runner_stop_pct: f64,
 }
 
-fn default_min_zone_score() -> f64 {
-    55.0
+impl Default for TradingConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_trading_mode(),
+            max_hold_sec: default_max_hold(),
+        }
+    }
 }
 
-fn default_min_move() -> f64 {
-    0.15
-}
-
-fn default_max_move() -> f64 {
-    2.5
-}
-
-fn default_vol_surge() -> f64 {
-    1.8
-}
-
-fn default_vol_z() -> f64 {
-    2.0
-}
-
-fn default_cooldown() -> u64 {
-    300
-}
-
-fn default_trailing() -> f64 {
-    0.008
-}
-
-fn default_trail_act() -> f64 {
-    0.012
-}
-
-fn default_tp_levels() -> Vec<f64> {
-    vec![0.01, 0.025, 0.045]
-}
-
-fn default_tp_fracs() -> Vec<f64> {
-    vec![0.4, 0.35, 0.25]
-}
-
-fn default_ms_lookback() -> u32 {
-    48
-}
-
-fn default_ema_span() -> u32 {
-    20
-}
-
-fn default_range_extreme() -> f64 {
-    0.18
-}
-
-fn default_extension() -> f64 {
-    2.0
-}
-
-fn default_base_lev() -> u32 {
-    20
-}
-
-fn default_moderate_lev() -> u32 {
-    50
-}
-
-fn default_strong_lev() -> u32 {
-    100
-}
-
-fn default_htf_interval() -> String {
-    "Min15".into()
-}
-
-fn default_htf_lookback() -> u32 {
-    120
-}
-
-fn default_liq_grab_lookback() -> u32 {
-    80
-}
-
-fn default_liq_grab_age() -> u32 {
-    5
-}
-
-fn default_liq_grab_sweep() -> f64 {
-    0.04
-}
-
-fn default_liq_grab_rejection() -> f64 {
-    0.4
-}
-
-fn default_trail_ext_act() -> f64 {
-    0.03
-}
-
-fn default_trail_ext_stop() -> f64 {
-    0.014
-}
-
-fn default_trail_run_act() -> f64 {
-    0.05
-}
-
-fn default_trail_run_stop() -> f64 {
-    0.024
-}
-
-fn default_min_score() -> f64 {
-    60.0
-}
-
-fn default_min_confluences() -> u32 {
-    3
-}
-
-fn default_sl_pct() -> f64 {
-    0.018
+fn default_trading_mode() -> String {
+    "ai".into()
 }
 
 fn default_max_hold() -> u64 {
     2400
 }
 
+/// AI candidate generator (Phase 1) — sanity filters and candidate shaping only.
+/// The ML decision core is the quality gate; nothing here should hard-block a
+/// setup on "strategy" grounds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TradingConfig {
-    #[serde(default = "default_trading_mode")]
-    pub mode: String,
+pub struct AiConfig {
+    /// Minimum absolute recent move (%) for a symbol to become a candidate.
+    /// Purely a dead-symbol filter, not a momentum gate.
+    #[serde(default = "default_ai_min_move_pct")]
+    pub min_move_pct: f64,
+    /// Ticks used to measure the recent directional move.
+    #[serde(default = "default_ai_move_lookback_ticks")]
+    pub move_lookback_ticks: usize,
+    /// Seconds between candidates on the same symbol (rate limiter, not a gate).
+    #[serde(default = "default_ai_cooldown_sec")]
+    pub signal_cooldown_sec: u64,
+    /// Stop distance = ATR% x this multiple (floored by risk.default_sl_pct).
+    #[serde(default = "default_ai_atr_sl_mult")]
+    pub atr_sl_mult: f64,
+    /// Take-profit levels expressed in R multiples of the stop distance.
+    #[serde(default = "default_ai_tp_r_multiples")]
+    pub tp_r_multiples: Vec<f64>,
+    /// Fraction of the position closed at each TP level.
+    #[serde(default = "default_ai_tp_close_fractions")]
+    pub tp_close_fractions: Vec<f64>,
+    /// Default leverage for candidates (ML risk scaling adjusts sizing).
+    #[serde(default = "default_ai_leverage")]
+    pub base_leverage: u32,
 }
 
-fn default_trading_mode() -> String {
-    "confluence".into()
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            min_move_pct: default_ai_min_move_pct(),
+            move_lookback_ticks: default_ai_move_lookback_ticks(),
+            signal_cooldown_sec: default_ai_cooldown_sec(),
+            atr_sl_mult: default_ai_atr_sl_mult(),
+            tp_r_multiples: default_ai_tp_r_multiples(),
+            tp_close_fractions: default_ai_tp_close_fractions(),
+            base_leverage: default_ai_leverage(),
+        }
+    }
+}
+
+fn default_ai_min_move_pct() -> f64 {
+    0.1
+}
+
+fn default_ai_move_lookback_ticks() -> usize {
+    6
+}
+
+fn default_ai_cooldown_sec() -> u64 {
+    120
+}
+
+fn default_ai_atr_sl_mult() -> f64 {
+    1.5
+}
+
+fn default_ai_tp_r_multiples() -> Vec<f64> {
+    vec![1.5, 2.5, 4.0]
+}
+
+fn default_ai_tp_close_fractions() -> Vec<f64> {
+    vec![0.5, 0.3, 0.2]
+}
+
+fn default_ai_leverage() -> u32 {
+    20
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,16 +437,30 @@ pub struct RiskConfig {
     pub min_position_margin_usdt: f64,
     #[serde(default = "default_true")]
     pub use_live_wallet_equity: bool,
-    #[serde(default = "default_exposure")]
-    pub max_exposure_pct: f64,
     #[serde(default = "default_funding_abs")]
     pub max_funding_rate_abs: f64,
     #[serde(default = "default_max_atr")]
     pub max_atr_pct: f64,
     #[serde(default = "default_sl_pct")]
     pub default_sl_pct: f64,
+
+    // ── Trailing stop (adaptive: widens as profit grows) ────────────────────
     #[serde(default = "default_trailing")]
     pub trailing_stop_pct: f64,
+    /// Unrealized move required before the trailing stop activates.
+    #[serde(default = "default_trail_act")]
+    pub trailing_activation_pct: f64,
+    /// Wider trail once move exceeds this fraction (e.g. 0.03 = 3%).
+    #[serde(default = "default_trail_ext_act")]
+    pub trailing_extended_activation_pct: f64,
+    #[serde(default = "default_trail_ext_stop")]
+    pub trailing_extended_stop_pct: f64,
+    /// Widest trail for large runners (pumps/dumps).
+    #[serde(default = "default_trail_run_act")]
+    pub trailing_runner_activation_pct: f64,
+    #[serde(default = "default_trail_run_stop")]
+    pub trailing_runner_stop_pct: f64,
+
     /// When false (default), the bot refuses to open a position on a symbol that
     /// already has an open position in the opposite direction (no hedging).
     #[serde(default)]
@@ -446,71 +489,6 @@ pub struct RiskConfig {
     /// 0.0 = disabled (no minimum). Default 5.0.
     #[serde(default = "default_min_profit_usdt")]
     pub min_profit_usdt: f64,
-    /// Max open positions for confluence strategy (separate slot).
-    #[serde(default = "default_max_confluence_positions")]
-    pub max_confluence_positions: u32,
-    /// Max open positions for volume_pump strategy (separate slot).
-    #[serde(default = "default_max_volume_pump_positions")]
-    pub max_volume_pump_positions: u32,
-}
-
-// ── Execution mode ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum EntryMode {
-    /// Immediate market fill on signal (original behaviour).
-    Market,
-    /// Place a limit order at `limit_offset_pct` above/below current price.
-    Limit,
-    /// Wait for a 1m sniper trigger (pullback / pin-bar) after the 15m setup
-    /// fires, then submit a limit order at the trigger price.
-    Sniper,
-}
-
-impl Default for EntryMode {
-    fn default() -> Self {
-        Self::Sniper
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SniperConfig {
-    /// How to enter confirmed setups.
-    #[serde(default)]
-    pub entry_mode: EntryMode,
-    /// Limit order offset from mark price (%): positive = more favourable.
-    /// e.g. 0.001 = 0.1% below mark for longs, 0.1% above for shorts.
-    #[serde(default = "default_limit_offset")]
-    pub limit_offset_pct: f64,
-    /// Seconds to wait for the limit order to fill before cancelling.
-    #[serde(default = "default_limit_ttl")]
-    pub limit_ttl_sec: u64,
-    /// Lookback bars (1m) to check for sniper trigger after HTF setup.
-    #[serde(default = "default_sniper_lookback")]
-    pub sniper_lookback_bars: u32,
-    /// Minimum wick-rejection ratio (0–1) on the 1m trigger candle (pin-bar).
-    #[serde(default = "default_sniper_rejection")]
-    pub sniper_min_wick_rejection: f64,
-    /// Maximum pullback allowed (fraction of SL distance) before trigger is invalid.
-    #[serde(default = "default_sniper_pullback")]
-    pub sniper_max_pullback_pct: f64,
-    /// Seconds an HTF setup stays valid, waiting for a 1m trigger.
-    #[serde(default = "default_sniper_expiry")]
-    pub htf_setup_expiry_sec: u64,
-}
-
-fn default_limit_offset() -> f64 { 0.001 }
-fn default_limit_ttl() -> u64 { 30 }
-fn default_sniper_lookback() -> u32 { 5 }
-fn default_sniper_rejection() -> f64 { 0.4 }
-fn default_sniper_pullback() -> f64 { 0.7 }
-fn default_sniper_expiry() -> u64 { 600 }
-
-impl Default for SniperConfig {
-    fn default() -> Self {
-        serde_json::from_str("{}").expect("SniperConfig default")
-    }
 }
 
 fn default_funding_abs() -> f64 {
@@ -541,8 +519,32 @@ fn default_min_margin() -> f64 {
     3.0
 }
 
-fn default_exposure() -> f64 {
-    0.15
+fn default_sl_pct() -> f64 {
+    0.018
+}
+
+fn default_trailing() -> f64 {
+    0.008
+}
+
+fn default_trail_act() -> f64 {
+    0.012
+}
+
+fn default_trail_ext_act() -> f64 {
+    0.03
+}
+
+fn default_trail_ext_stop() -> f64 {
+    0.014
+}
+
+fn default_trail_run_act() -> f64 {
+    0.05
+}
+
+fn default_trail_run_stop() -> f64 {
+    0.024
 }
 
 fn default_max_consec_losses() -> u32 {
@@ -569,14 +571,6 @@ fn default_min_profit_usdt() -> f64 {
     5.0
 }
 
-fn default_max_confluence_positions() -> u32 {
-    1
-}
-
-fn default_max_volume_pump_positions() -> u32 {
-    1
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionConfig {
     #[serde(default)]
@@ -585,6 +579,47 @@ pub struct ExecutionConfig {
     pub dry_run: bool,
     #[serde(default = "default_true")]
     pub sync_exchange_positions: bool,
+    /// Taker fee rate applied to paper round-trip (per side; close_position doubles it).
+    #[serde(default = "default_paper_fee_rate")]
+    pub paper_fee_rate: f64,
+    /// Adverse slippage on paper fills (fraction, e.g. 0.0005 = 0.05%).
+    #[serde(default = "default_paper_slippage")]
+    pub paper_slippage_pct: f64,
+    /// Starting paper equity when portfolio row is first created or reset.
+    #[serde(default = "default_paper_initial_equity")]
+    pub paper_initial_equity: f64,
+    /// On next startup, reset paper equity to `paper_initial_equity` (no open positions).
+    #[serde(default)]
+    pub paper_reset_on_start: bool,
+    /// In paper mode: ML/sentiment gates score only — do not hard-block entries.
+    #[serde(default = "default_true")]
+    pub paper_relax_gates: bool,
+    /// Limit order offset from mark price (fraction): more favourable side.
+    #[serde(default = "default_limit_offset")]
+    pub limit_offset_pct: f64,
+    /// Seconds to wait for a resting limit order to fill before cancelling.
+    #[serde(default = "default_limit_ttl")]
+    pub limit_ttl_sec: u64,
+}
+
+fn default_paper_fee_rate() -> f64 {
+    0.0006
+}
+
+fn default_paper_slippage() -> f64 {
+    0.0005
+}
+
+fn default_paper_initial_equity() -> f64 {
+    10_000.0
+}
+
+fn default_limit_offset() -> f64 {
+    0.001
+}
+
+fn default_limit_ttl() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -617,6 +652,46 @@ pub struct MlConfig {
     /// SGD weight for real trade losses — typically higher than wins.
     #[serde(default = "default_trade_loss_weight")]
     pub trade_loss_weight: f64,
+    /// Auto-enable hard gate when rolling accuracy exceeds this (0 = manual only).
+    #[serde(default = "default_gate_min_accuracy")]
+    pub gate_min_accuracy: f64,
+    /// Auto-disable hard gate when accuracy drops below this.
+    #[serde(default = "default_gate_disable_accuracy")]
+    pub gate_disable_accuracy: f64,
+    /// Minimum resolved samples before auto gate toggling.
+    #[serde(default = "default_gate_min_samples")]
+    pub gate_auto_min_samples: u32,
+    /// Minimum risk scale at gate threshold (fraction of max risk).
+    #[serde(default = "default_ml_risk_scale_min")]
+    pub ml_risk_scale_min: f64,
+    /// Maximum risk scale at high confidence.
+    #[serde(default = "default_ml_risk_scale_max")]
+    pub ml_risk_scale_max: f64,
+    /// Fractional-Kelly multiplier applied to the full-Kelly sizing estimate
+    /// (e.g. 0.5 = "half-Kelly" — a common safety margin against edge/odds
+    /// estimation error). Drives `suggested_risk_pct` / `suggested_leverage`.
+    #[serde(default = "default_kelly_fraction")]
+    pub kelly_fraction: f64,
+    /// Periodically re-train the GradientBoosting ONNX model offline via
+    /// `scripts/export_onnx.py` and hot-reload it into the live pipeline.
+    /// Requires a local Python env with `requirements.txt` installed — off
+    /// by default so the bot never depends on Python unless opted in.
+    #[serde(default)]
+    pub auto_retrain_enabled: bool,
+    /// Hours between retrain attempts.
+    #[serde(default = "default_retrain_interval_hours")]
+    pub retrain_interval_hours: u64,
+    /// Minimum newly-resolved signals (since the last retrain) required
+    /// before spending a retrain cycle.
+    #[serde(default = "default_retrain_min_new_samples")]
+    pub retrain_min_new_samples: u32,
+    /// Python interpreter used to run the export script (repo-root relative
+    /// paths, e.g. from a local venv, are resolved by the OS/shell as usual).
+    #[serde(default = "default_python_bin")]
+    pub python_bin: String,
+    /// Path to the offline retrain script, relative to the bot's working directory.
+    #[serde(default = "default_export_script_path")]
+    pub export_script_path: String,
 }
 
 impl MlConfig {
@@ -649,11 +724,106 @@ fn default_hard_gate() -> bool {
     false
 }
 
+fn default_gate_min_accuracy() -> f64 {
+    0.60
+}
+
+fn default_gate_disable_accuracy() -> f64 {
+    0.52
+}
+
+fn default_gate_min_samples() -> u32 {
+    150
+}
+
+fn default_ml_risk_scale_min() -> f64 {
+    0.35
+}
+
+fn default_ml_risk_scale_max() -> f64 {
+    1.0
+}
+
+fn default_kelly_fraction() -> f64 {
+    0.5
+}
+
+fn default_retrain_interval_hours() -> u64 {
+    6
+}
+
+fn default_retrain_min_new_samples() -> u32 {
+    30
+}
+
+fn default_python_bin() -> String {
+    "python3".into()
+}
+
+fn default_export_script_path() -> String {
+    "scripts/export_onnx.py".into()
+}
+
+/// Free news/sentiment feed — no paid API keys required.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentimentConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Poll interval for RSS / Fear&Greed / Reddit.
+    #[serde(default = "default_sentiment_poll_sec")]
+    pub poll_interval_sec: u64,
+    /// Block longs when global sentiment is below this (-1..1 scale).
+    #[serde(default = "default_sentiment_block_long")]
+    pub block_long_below: f64,
+    /// Block shorts when global sentiment is above this.
+    #[serde(default = "default_sentiment_block_short")]
+    pub block_short_above: f64,
+    /// Per-symbol sentiment threshold (absolute) to block.
+    #[serde(default = "default_symbol_sentiment_threshold")]
+    pub symbol_block_threshold: f64,
+    /// Exponential decay half-life for headline scores (seconds).
+    #[serde(default = "default_sentiment_half_life")]
+    pub decay_half_life_sec: f64,
+}
+
+fn default_sentiment_poll_sec() -> u64 {
+    300
+}
+
+fn default_sentiment_block_long() -> f64 {
+    -0.45
+}
+
+fn default_sentiment_block_short() -> f64 {
+    0.55
+}
+
+fn default_symbol_sentiment_threshold() -> f64 {
+    0.55
+}
+
+fn default_sentiment_half_life() -> f64 {
+    7200.0
+}
+
+impl Default for SentimentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_sec: default_sentiment_poll_sec(),
+            block_long_below: default_sentiment_block_long(),
+            block_short_above: default_sentiment_block_short(),
+            symbol_block_threshold: default_symbol_sentiment_threshold(),
+            decay_half_life_sec: default_sentiment_half_life(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearningConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Save confluence signals rejected by the hard ML gate for shadow training.
+    /// Save signals rejected by the hard ML gate for shadow training.
     #[serde(default = "default_true")]
     pub shadow_ml_rejects: bool,
     /// SGD weight for shadow-resolved ML-gate rejects (weaker than trade-blocked shadows).
@@ -665,15 +835,21 @@ pub struct LearningConfig {
     /// Drop new shadow saves when pending shadow queue exceeds this count.
     #[serde(default = "default_shadow_max_pending")]
     pub shadow_max_pending: u32,
-    /// Save confluence near-misses (score within margin of threshold) for shadow training.
-    #[serde(default)]
-    pub shadow_near_miss: bool,
-    /// Composite score margin below min_composite_score for near-miss shadow saves.
-    #[serde(default = "default_near_miss_margin")]
-    pub near_miss_margin: f64,
-    /// SGD weight for shadow-resolved confluence near-misses.
+    /// SGD weight for shadow-resolved near-misses (kept for historical rows).
     #[serde(default = "default_shadow_near_miss_weight")]
     pub shadow_near_miss_weight: f64,
+    /// SGD weight for shadow-resolved sentiment-gate rejects.
+    #[serde(default = "default_shadow_sentiment_weight")]
+    pub shadow_sentiment_weight: f64,
+    /// Run walk-forward parameter tuning on a schedule.
+    #[serde(default = "default_true")]
+    pub auto_tune_enabled: bool,
+    /// `suggest` logs recommendations; `apply` promotes challengers to the runtime overlay.
+    #[serde(default = "default_auto_tune_apply")]
+    pub auto_tune_apply: String,
+    /// Hours between auto-tune runs.
+    #[serde(default = "default_auto_tune_interval")]
+    pub auto_tune_interval_hours: u64,
 }
 
 fn default_shadow_ml_weight() -> f64 {
@@ -688,12 +864,20 @@ fn default_shadow_max_pending() -> u32 {
     500
 }
 
-fn default_near_miss_margin() -> f64 {
-    5.0
-}
-
 fn default_shadow_near_miss_weight() -> f64 {
     0.3
+}
+
+fn default_shadow_sentiment_weight() -> f64 {
+    0.4
+}
+
+fn default_auto_tune_apply() -> String {
+    "suggest".into()
+}
+
+fn default_auto_tune_interval() -> u64 {
+    6
 }
 
 impl Default for LearningConfig {
@@ -704,146 +888,12 @@ impl Default for LearningConfig {
             shadow_ml_reject_weight: default_shadow_ml_weight(),
             shadow_max_per_symbol_hour: default_shadow_per_symbol_hour(),
             shadow_max_pending: default_shadow_max_pending(),
-            shadow_near_miss: false,
-            near_miss_margin: default_near_miss_margin(),
             shadow_near_miss_weight: default_shadow_near_miss_weight(),
+            shadow_sentiment_weight: default_shadow_sentiment_weight(),
+            auto_tune_enabled: true,
+            auto_tune_apply: default_auto_tune_apply(),
+            auto_tune_interval_hours: default_auto_tune_interval(),
         }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScalpConfig {
-    #[serde(default)]
-    pub enabled: bool,
-}
-
-impl Default for ScalpConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
-}
-
-/// Volume-pump strategy: abnormal 1m volume + universe rank, fast limit entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PumpConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_pump_vol_surge")]
-    pub volume_surge_multiplier: f64,
-    #[serde(default = "default_pump_vol_z")]
-    pub volume_zscore_threshold: f64,
-    #[serde(default = "default_pump_price_min")]
-    pub price_change_pct_min: f64,
-    #[serde(default = "default_pump_price_max")]
-    pub price_change_pct_max: f64,
-    #[serde(default = "default_pump_ewma_span")]
-    pub ewma_span: u32,
-    #[serde(default = "default_pump_min_score")]
-    pub min_composite_score: f64,
-    #[serde(default = "default_pump_universe_rank")]
-    pub universe_rank_max: u32,
-    #[serde(default = "default_pump_min_turnover")]
-    pub min_24h_turnover_usdt: f64,
-    #[serde(default = "default_pump_max_turnover")]
-    pub max_24h_turnover_usdt: f64,
-    #[serde(default = "default_pump_cooldown")]
-    pub alert_cooldown_sec: u64,
-    #[serde(default = "default_pump_entry_limit")]
-    pub entry_mode: EntryMode,
-    #[serde(default = "default_limit_offset")]
-    pub limit_offset_pct: f64,
-    #[serde(default = "default_pump_limit_ttl")]
-    pub limit_ttl_sec: u64,
-    #[serde(default = "default_pump_sl")]
-    pub default_sl_pct: f64,
-    #[serde(default = "default_pump_tp_levels")]
-    pub tp_levels_pct: Vec<f64>,
-    #[serde(default = "default_pump_tp_fracs")]
-    pub tp_close_fractions: Vec<f64>,
-    #[serde(default = "default_pump_max_hold")]
-    pub max_hold_sec: u64,
-    #[serde(default = "default_pump_trailing")]
-    pub trailing_stop_pct: f64,
-    #[serde(default = "default_pump_trail_act")]
-    pub trailing_activation_pct: f64,
-    #[serde(default = "default_base_lev")]
-    pub base_leverage: u32,
-    #[serde(default = "default_moderate_lev")]
-    pub moderate_leverage: u32,
-    #[serde(default = "default_strong_lev")]
-    pub strong_leverage: u32,
-    #[serde(default = "default_max_volume_pump_positions")]
-    pub max_concurrent_positions: u32,
-    #[serde(default = "default_pump_min_profit")]
-    pub min_profit_usdt: f64,
-    #[serde(default = "default_pump_risk_pct")]
-    pub max_risk_per_trade: f64,
-    /// Two-phase flow: volume surge arms setup, confirmation gates fire entry.
-    #[serde(default = "default_true")]
-    pub confirmation_enabled: bool,
-    #[serde(default = "default_pump_confirm_ttl")]
-    pub confirmation_ttl_sec: u64,
-    #[serde(default = "default_true")]
-    pub require_breakout_or_shift: bool,
-    #[serde(default = "default_pump_breakout_lookback")]
-    pub breakout_lookback_bars: u32,
-    #[serde(default = "default_pump_breakout_min_pct")]
-    pub breakout_min_pct: f64,
-    #[serde(default = "default_pump_breakout_vol_mult")]
-    pub breakout_vol_mult: f64,
-    #[serde(default = "default_true")]
-    pub require_structure: bool,
-    #[serde(default = "default_true")]
-    pub require_market_structure_bias: bool,
-    #[serde(default = "default_pump_ms_lookback")]
-    pub market_structure_lookback_bars: u32,
-    #[serde(default = "default_true")]
-    pub htf_enabled: bool,
-    #[serde(default = "default_htf_interval")]
-    pub htf_interval: String,
-    #[serde(default = "default_htf_lookback")]
-    pub htf_lookback_bars: u32,
-    #[serde(default = "default_true")]
-    pub macro_filter_enabled: bool,
-    #[serde(default = "default_htf_interval")]
-    pub macro_htf_interval: String,
-    #[serde(default = "default_pump_macro_lookback")]
-    pub macro_htf_lookback_bars: u32,
-    #[serde(default = "default_pump_macro_min_move")]
-    pub macro_min_move_pct: f64,
-}
-
-fn default_pump_vol_surge() -> f64 { 4.0 }
-fn default_pump_vol_z() -> f64 { 2.5 }
-fn default_pump_price_min() -> f64 { 0.8 }
-fn default_pump_price_max() -> f64 { 8.0 }
-fn default_pump_ewma_span() -> u32 { 20 }
-fn default_pump_min_score() -> f64 { 68.0 }
-fn default_pump_confirm_ttl() -> u64 { 180 }
-fn default_pump_breakout_lookback() -> u32 { 20 }
-fn default_pump_breakout_min_pct() -> f64 { 0.0005 }
-fn default_pump_breakout_vol_mult() -> f64 { 1.5 }
-fn default_pump_ms_lookback() -> u32 { 48 }
-fn default_pump_macro_lookback() -> u32 { 48 }
-fn default_pump_macro_min_move() -> f64 { 0.5 }
-fn default_pump_universe_rank() -> u32 { 5 }
-fn default_pump_min_turnover() -> f64 { 500_000.0 }
-fn default_pump_max_turnover() -> f64 { 50_000_000.0 }
-fn default_pump_cooldown() -> u64 { 180 }
-fn default_pump_entry_limit() -> EntryMode { EntryMode::Limit }
-fn default_pump_limit_ttl() -> u64 { 15 }
-fn default_pump_sl() -> f64 { 0.012 }
-fn default_pump_tp_levels() -> Vec<f64> { vec![0.015, 0.03, 0.05] }
-fn default_pump_tp_fracs() -> Vec<f64> { vec![0.5, 0.3, 0.2] }
-fn default_pump_max_hold() -> u64 { 900 }
-fn default_pump_trailing() -> f64 { 0.008 }
-fn default_pump_trail_act() -> f64 { 0.01 }
-fn default_pump_min_profit() -> f64 { 1.0 }
-fn default_pump_risk_pct() -> f64 { 0.01 }
-
-impl Default for PumpConfig {
-    fn default() -> Self {
-        serde_json::from_str("{}").expect("PumpConfig default")
     }
 }
 
@@ -869,16 +919,54 @@ impl Default for WatchlistConfig {
 pub struct BacktestConfig {
     #[serde(default = "default_backtest_engine")]
     pub engine: String,
+    /// Phase 6 paper-acceptance gates — the minimum out-of-sample performance
+    /// required before enabling live trading. Checked by the `/backtest/acceptance`
+    /// endpoint against a decision-pipeline replay of stored resolved signals.
+    #[serde(default = "default_acceptance_min_trades")]
+    pub acceptance_min_trades: u32,
+    #[serde(default = "default_acceptance_min_win_rate")]
+    pub acceptance_min_win_rate: f64,
+    #[serde(default = "default_acceptance_min_profit_factor")]
+    pub acceptance_min_profit_factor: f64,
+    #[serde(default = "default_acceptance_min_expectancy")]
+    pub acceptance_min_expectancy: f64,
+    #[serde(default = "default_acceptance_max_drawdown")]
+    pub acceptance_max_drawdown: f64,
 }
 
 fn default_backtest_engine() -> String {
     "builtin".into()
 }
 
+fn default_acceptance_min_trades() -> u32 {
+    30
+}
+
+fn default_acceptance_min_win_rate() -> f64 {
+    0.50
+}
+
+fn default_acceptance_min_profit_factor() -> f64 {
+    1.2
+}
+
+fn default_acceptance_min_expectancy() -> f64 {
+    0.0
+}
+
+fn default_acceptance_max_drawdown() -> f64 {
+    0.25
+}
+
 impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
             engine: default_backtest_engine(),
+            acceptance_min_trades: default_acceptance_min_trades(),
+            acceptance_min_win_rate: default_acceptance_min_win_rate(),
+            acceptance_min_profit_factor: default_acceptance_min_profit_factor(),
+            acceptance_min_expectancy: default_acceptance_min_expectancy(),
+            acceptance_max_drawdown: default_acceptance_max_drawdown(),
         }
     }
 }

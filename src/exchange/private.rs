@@ -257,6 +257,52 @@ impl MexcPrivateClient {
             .await
     }
 
+    /// Cancel all TP/SL stop orders for a symbol (and optionally a position).
+    /// MEXC endpoint: POST /api/v1/private/stoporder/cancel_all
+    pub async fn cancel_all_stop_orders(
+        &self,
+        symbol: &str,
+        exchange_position_id: Option<i64>,
+    ) -> Result<Value> {
+        let mut payload = serde_json::json!({ "symbol": symbol });
+        if let Some(pid) = exchange_position_id {
+            payload["positionId"] = json!(pid);
+        }
+        self.signed_post("/api/v1/private/stoporder/cancel_all", &payload)
+            .await
+    }
+
+    /// Cancel both plan orders and stop/TP-SL orders for a symbol after close.
+    pub async fn cleanup_symbol_orders(
+        &self,
+        symbol: &str,
+        exchange_position_id: Option<i64>,
+    ) -> Value {
+        let mut results = serde_json::json!({ "symbol": symbol });
+        match self.cancel_all_plan_orders(symbol).await {
+            Ok(resp) => {
+                results["plan_orders"] = resp;
+            }
+            Err(exc) => {
+                warn!("cancel_all_plan_orders for {symbol} failed: {exc}");
+                results["plan_orders_error"] = json!(exc.to_string());
+            }
+        }
+        match self
+            .cancel_all_stop_orders(symbol, exchange_position_id)
+            .await
+        {
+            Ok(resp) => {
+                results["stop_orders"] = resp;
+            }
+            Err(exc) => {
+                warn!("cancel_all_stop_orders for {symbol} failed: {exc}");
+                results["stop_orders_error"] = json!(exc.to_string());
+            }
+        }
+        results
+    }
+
     /// Cancel a specific open order by order ID.
     /// MEXC endpoint: POST /api/v1/private/order/cancel
     pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<Value> {

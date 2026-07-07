@@ -1,12 +1,16 @@
 //! Reconcile local open positions with MEXC Futures — port of `position_sync.py`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tracing::info;
 
 use crate::config::AppConfig;
 use crate::db::Database;
+use crate::execution::cleanup_after_position_closed;
+use crate::exchange::rest::MexcRestClient;
+use crate::exchange::types::ContractInfo;
 use crate::exchange::MexcPrivateClient;
 use crate::models::PositionSide;
 
@@ -83,10 +87,124 @@ fn parse_exchange_position(raw: &Value) -> Option<ExchangeOpenPosition> {
     })
 }
 
+fn pricing_for_symbol(
+    symbol: &str,
+    contracts: Option<&HashMap<String, ContractInfo>>,
+    marks: &HashMap<String, f64>,
+) -> (f64, f64, f64) {
+    let (cs, fee) = if let Some(map) = contracts {
+        let cs = map
+            .get(symbol)
+            .map(|c| c.contract_size)
+            .filter(|&s| s > 0.0)
+            .unwrap_or(1.0);
+        let fee = map
+            .get(symbol)
+            .map(|c| c.taker_fee_rate)
+            .filter(|&r| r > 0.0)
+            .unwrap_or(0.0006);
+        (cs, fee)
+    } else {
+        (1.0, 0.0006)
+    };
+    let mark = marks.get(symbol).copied().unwrap_or(0.0);
+    (cs, fee, mark)
+}
+
+pub async fn fetch_mark_prices(config: &AppConfig) -> HashMap<String, f64> {
+    let mexc = Arc::new(config.mexc.clone());
+    let Ok(rest) = MexcRestClient::new(mexc) else {
+        return HashMap::new();
+    };
+    match rest.get_tickers().await {
+        Ok(tickers) => tickers
+            .into_iter()
+            .filter_map(|t| {
+                let price = if t.fair_price > 0.0 {
+                    t.fair_price
+                } else {
+                    t.last_price
+                };
+                if price > 0.0 {
+                    Some((t.symbol, price))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+async fn close_missing_position(
+    client: &MexcPrivateClient,
+    db: &Database,
+    pos: &Value,
+    reason: &str,
+    contract_size: f64,
+    fee_rate: f64,
+    mark_price: f64,
+    audit_message: &str,
+    audit_extra: Value,
+) -> Option<String> {
+    let id = pos.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    if id == 0 {
+        return None;
+    }
+    let symbol = pos
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let side = pos
+        .get("side")
+        .and_then(|v| v.as_str())
+        .unwrap_or("long")
+        .to_string();
+    let exchange_pos_id = pos.get("exchange_position_id").and_then(|v| v.as_i64());
+
+    match db
+        .close_position_synced(id, reason, contract_size, fee_rate, mark_price)
+        .await
+    {
+        Ok((pnl, exit_price)) => {
+            let mut payload = audit_extra;
+            if let Value::Object(ref mut m) = payload {
+                m.insert("position_id".into(), json!(id));
+                m.insert("symbol".into(), json!(symbol));
+                m.insert("side".into(), json!(side));
+                m.insert("pnl".into(), json!(pnl));
+                m.insert("exit_price".into(), json!(exit_price));
+                m.insert("reason".into(), json!(reason));
+                if let Some(strategy) = pos.get("strategy") {
+                    m.insert("strategy".into(), strategy.clone());
+                }
+            }
+            let _ = db
+                .log_event("exchange_position_closed", audit_message, Some(payload.clone()))
+                .await;
+            let _ = db
+                .log_event(
+                    "position_closed",
+                    &format!("Closed {symbol} ({reason})"),
+                    Some(payload),
+                )
+                .await;
+            cleanup_after_position_closed(client, &symbol, exchange_pos_id).await;
+            Some(symbol)
+        }
+        Err(exc) => {
+            tracing::warn!("Failed to close missing position {id} ({symbol}): {exc}");
+            None
+        }
+    }
+}
+
 pub async fn sync_exchange_positions(
     client: &MexcPrivateClient,
     db: &Database,
     config: &AppConfig,
+    contracts: Option<&HashMap<String, ContractInfo>>,
 ) -> Value {
     if !client.has_credentials() {
         return json!({
@@ -116,6 +234,7 @@ pub async fn sync_exchange_positions(
 
     let sl_pct = config.risk.default_sl_pct;
     let default_leverage = config.risk.max_leverage as i32;
+    let marks = fetch_mark_prices(config).await;
 
     for raw in &raw_positions {
         let Some(ep) = parse_exchange_position(raw) else {
@@ -191,8 +310,16 @@ pub async fn sync_exchange_positions(
                 if sl_opt.is_some() || tp_opt.is_some() {
                     let _ = db.update_position_sl_tp(bot_id, sl_opt, tp_opt.as_deref()).await;
                 }
-                deduped += close_duplicate_exchange_rows(db, bot_id, &ep.symbol, side_to_str(ep.side), ep.exchange_id)
-                    .await;
+                deduped += close_duplicate_exchange_rows(
+                    db,
+                    bot_id,
+                    &ep.symbol,
+                    side_to_str(ep.side),
+                    ep.exchange_id,
+                    contracts,
+                    &marks,
+                )
+                .await;
                 let _ = db
                     .log_event(
                         "exchange_position_linked",
@@ -273,9 +400,10 @@ pub async fn sync_exchange_positions(
         }
     }
 
-    deduped += dedupe_symbol_side_rows(db, &seen_symbol_side).await;
+    deduped += dedupe_symbol_side_rows(db, &seen_symbol_side, contracts, &marks).await;
 
     let mut closed = 0usize;
+    let mut closed_symbols: Vec<String> = Vec::new();
     let open = db.get_open_positions().await.unwrap_or_default();
     for pos in &open {
         if pos.get("paper").and_then(|v| v.as_bool()).unwrap_or(true) {
@@ -283,40 +411,54 @@ pub async fn sync_exchange_positions(
         }
         let symbol = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let side = pos.get("side").and_then(|v| v.as_str()).unwrap_or("long").to_string();
-        let id = pos.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
 
         if let Some(exchange_id) = pos.get("exchange_position_id").and_then(|v| v.as_i64()) {
             if !seen_ids.contains(&exchange_id) {
-                if db.close_position_synced(id, "exchange_closed").await.is_ok() {
-                    let _ = db
-                        .log_event(
-                            "exchange_position_closed",
-                            &format!("Position gone on MEXC: {symbol}"),
-                            Some(json!({ "position_id": id, "exchange_position_id": exchange_id })),
-                        )
-                        .await;
+                let (cs, fee, mark) = pricing_for_symbol(&symbol, contracts, &marks);
+                if let Some(sym) = close_missing_position(
+                    client,
+                    db,
+                    pos,
+                    "exchange_closed",
+                    cs,
+                    fee,
+                    mark,
+                    &format!("Position gone on MEXC: {symbol}"),
+                    json!({ "exchange_position_id": exchange_id }),
+                )
+                .await
+                {
                     closed += 1;
+                    closed_symbols.push(sym);
                 }
             }
             continue;
         }
 
         if !seen_symbol_side.contains(&(symbol.clone(), side.clone())) {
-            if db.close_position_synced(id, "exchange_closed").await.is_ok() {
-                let _ = db
-                    .log_event(
-                        "exchange_position_closed",
-                        &format!("Bot position closed on MEXC: {symbol}"),
-                        Some(json!({ "position_id": id })),
-                    )
-                    .await;
+            let (cs, fee, mark) = pricing_for_symbol(&symbol, contracts, &marks);
+            if let Some(sym) = close_missing_position(
+                client,
+                db,
+                pos,
+                "exchange_closed",
+                cs,
+                fee,
+                mark,
+                &format!("Bot position closed on MEXC: {symbol}"),
+                json!({}),
+            )
+            .await
+            {
                 closed += 1;
+                closed_symbols.push(sym);
             }
         }
     }
 
     let exchange_count = seen_ids.len();
-    let healed = heal_stuck_live_positions(client, db).await;
+    let (healed, healed_symbols) = heal_stuck_live_positions(client, db, contracts, &marks).await;
+    closed_symbols.extend(healed_symbols);
     json!({
         "exchange_count": exchange_count,
         "imported": imported,
@@ -325,6 +467,7 @@ pub async fn sync_exchange_positions(
         "deduped": deduped,
         "closed": closed,
         "healed": healed,
+        "closed_symbols": closed_symbols,
         "synced": exchange_count,
         "message": format!(
             "Synced with MEXC — {exchange_count} on exchange, {imported} imported, {updated} updated, {closed} closed locally, {healed} healed"
@@ -334,13 +477,18 @@ pub async fn sync_exchange_positions(
 
 /// Close live DB rows that are still `open` but absent from MEXC (failed rollbacks,
 /// dry-run ghosts, manual exchange closes the sync pass missed).
-pub async fn heal_stuck_live_positions(client: &MexcPrivateClient, db: &Database) -> usize {
+pub async fn heal_stuck_live_positions(
+    client: &MexcPrivateClient,
+    db: &Database,
+    contracts: Option<&HashMap<String, ContractInfo>>,
+    marks: &HashMap<String, f64>,
+) -> (usize, Vec<String>) {
     if !client.has_credentials() {
-        return 0;
+        return (0, Vec::new());
     }
     let raw_positions = match client.get_open_positions().await {
         Ok(p) => p,
-        Err(_) => return 0,
+        Err(_) => return (0, Vec::new()),
     };
 
     let mut seen_symbol_side: HashSet<(String, String)> = HashSet::new();
@@ -354,6 +502,7 @@ pub async fn heal_stuck_live_positions(client: &MexcPrivateClient, db: &Database
     }
 
     let mut healed = 0usize;
+    let mut healed_symbols: Vec<String> = Vec::new();
     let open = db.get_open_positions().await.unwrap_or_default();
     for pos in &open {
         if pos.get("paper").and_then(|v| v.as_bool()).unwrap_or(true) {
@@ -386,18 +535,25 @@ pub async fn heal_stuck_live_positions(client: &MexcPrivateClient, db: &Database
         }
 
         let reason = "phantom_heal";
-        if db.close_position_synced(id, reason).await.is_ok() {
-            let _ = db
-                .log_event(
-                    "exchange_position_closed",
-                    &format!("Healed stuck position not on MEXC: {symbol}"),
-                    Some(json!({ "position_id": id, "reason": reason })),
-                )
-                .await;
+        let (cs, fee, mark) = pricing_for_symbol(&symbol, contracts, marks);
+        if let Some(sym) = close_missing_position(
+            client,
+            db,
+            pos,
+            reason,
+            cs,
+            fee,
+            mark,
+            &format!("Healed stuck position not on MEXC: {symbol}"),
+            json!({}),
+        )
+        .await
+        {
             healed += 1;
+            healed_symbols.push(sym);
         }
     }
-    healed
+    (healed, healed_symbols)
 }
 
 /// Run once at startup to reconcile the local position DB against MEXC.
@@ -419,7 +575,7 @@ pub async fn reconcile_on_boot(
         return;
     }
     tracing::info!("Boot reconciliation: comparing DB positions with MEXC exchange…");
-    let result = sync_exchange_positions(client, db, config).await;
+    let result = sync_exchange_positions(client, db, config, None).await;
     tracing::info!(
         "Boot reconciliation complete: {}",
         result.get("message").and_then(|v| v.as_str()).unwrap_or("done")
@@ -439,6 +595,8 @@ async fn close_duplicate_exchange_rows(
     symbol: &str,
     side: &str,
     exchange_id: i64,
+    contracts: Option<&HashMap<String, ContractInfo>>,
+    marks: &HashMap<String, f64>,
 ) -> usize {
     let mut removed = 0usize;
     let open = db.get_open_positions().await.unwrap_or_default();
@@ -456,7 +614,12 @@ async fn close_duplicate_exchange_rows(
         if pos.get("source").and_then(|v| v.as_str()) == Some("exchange")
             && pos.get("exchange_position_id").and_then(|v| v.as_i64()) == Some(exchange_id)
         {
-            if db.close_position_synced(id, "deduped").await.is_ok() {
+            let (cs, fee, mark) = pricing_for_symbol(symbol, contracts, marks);
+            if db
+                .close_position_synced(id, "deduped", cs, fee, mark)
+                .await
+                .is_ok()
+            {
                 removed += 1;
             }
         }
@@ -464,7 +627,12 @@ async fn close_duplicate_exchange_rows(
     removed
 }
 
-async fn dedupe_symbol_side_rows(db: &Database, seen: &HashSet<(String, String)>) -> usize {
+async fn dedupe_symbol_side_rows(
+    db: &Database,
+    seen: &HashSet<(String, String)>,
+    contracts: Option<&HashMap<String, ContractInfo>>,
+    marks: &HashMap<String, f64>,
+) -> usize {
     let mut removed = 0usize;
     for (symbol, side) in seen {
         let rows: Vec<Value> = db
@@ -500,7 +668,12 @@ async fn dedupe_symbol_side_rows(db: &Database, seen: &HashSet<(String, String)>
                     let _ = db.set_exchange_position_id(keep_id, eid).await;
                 }
             }
-            if db.close_position_synced(dup_id, "deduped").await.is_ok() {
+            let (cs, fee, mark) = pricing_for_symbol(symbol, contracts, marks);
+            if db
+                .close_position_synced(dup_id, "deduped", cs, fee, mark)
+                .await
+                .is_ok()
+            {
                 removed += 1;
             }
         }

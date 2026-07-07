@@ -102,16 +102,16 @@
   <div class="card">
     <div class="logo">MX</div>
     <h1>MEXC Trading Bot</h1>
-    <p class="subtitle">First launch may take a minute while components initialize.</p>
+    <p class="subtitle">First launch may take a moment — Ollama (AI layer) will be installed automatically if missing.</p>
     <p class="status" id="status"><span class="spinner"></span>Starting…</p>
     <div class="progress-track">
       <div class="progress-bar" id="progress"></div>
     </div>
-    <p class="step-label" id="step-label">Step 1 of 4</p>
+    <p class="step-label" id="step-label">Step 1 of 5</p>
     <div class="error" id="error"></div>
   </div>
   <script>
-    const STEPS = 4;
+    const STEPS = 5;
     window.setStartupStatus = function (message, step) {
       const status = document.getElementById('status');
       const progress = document.getElementById('progress');

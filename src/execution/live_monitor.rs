@@ -22,7 +22,8 @@ use tracing::{info, warn};
 
 use crate::config::SharedAppConfig;
 use crate::db::Database;
-use crate::execution::trailing::{TrailingTrack, update_trailing, update_trailing_simple};
+use crate::execution::cleanup_after_position_closed;
+use crate::execution::trailing::{TrailingTrack, update_trailing};
 use crate::exchange::{ContractInfo, MexcPrivateClient, TickerSnapshot};
 use crate::models::PositionSide;
 use crate::risk::RiskManager;
@@ -88,26 +89,29 @@ impl LivePositionMonitor {
             .unwrap_or(0.0006)
     }
 
-    /// Cancel all open plan orders (SL/TP triggers) for a symbol on MEXC.
-    /// Fire-and-forget — logs a warning on failure but never blocks the close path.
-    async fn cancel_plan_orders(&self, symbol: &str) {
+    /// Cancel all open plan + stop orders for a symbol on MEXC.
+    async fn cleanup_symbol_orders(&self, symbol: &str, exchange_pos_id: Option<i64>) {
+        cleanup_after_position_closed(&self.client, symbol, exchange_pos_id).await;
+    }
+
+    async fn position_on_exchange(&self, symbol: &str, side: &str) -> Option<bool> {
         if !self.client.has_credentials() {
-            return;
+            return None;
         }
-        match self.client.cancel_all_plan_orders(symbol).await {
-            Ok(resp) => {
-                let ok = resp.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
-                if !ok {
-                    warn!(
-                        "cancel_all_plan_orders for {symbol} returned non-success: {}",
-                        resp
-                    );
-                } else {
-                    tracing::info!("Cancelled all plan orders for {symbol}");
-                }
+        let raw = self.client.get_open_positions().await.ok()?;
+        let want_long = side == "long";
+        let found = raw.iter().any(|p| {
+            if p.get("symbol").and_then(|v| v.as_str()) != Some(symbol) {
+                return false;
             }
-            Err(e) => warn!("cancel_all_plan_orders for {symbol} failed: {e}"),
-        }
+            let hold = p.get("holdVol").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if hold <= 0.0 {
+                return false;
+            }
+            let is_long = p.get("positionType").and_then(|v| v.as_i64()) == Some(1);
+            is_long == want_long
+        });
+        Some(found)
     }
 
     /// Called on every WS ticker batch.  Returns a list of close events.
@@ -155,7 +159,7 @@ impl LivePositionMonitor {
             let strategy = pos
                 .get("strategy")
                 .and_then(|v| v.as_str())
-                .unwrap_or("confluence")
+                .unwrap_or("ai")
                 .to_string();
 
             // ── Adaptive trailing stop (widens on large pumps/dumps) ───────
@@ -168,19 +172,7 @@ impl LivePositionMonitor {
                 if track.stop <= 0.0 && sl > 0.0 {
                     track.stop = sl;
                 }
-                sl = if strategy == "volume_pump" {
-                    let p = &cfg.pump;
-                    update_trailing_simple(
-                        &side,
-                        entry,
-                        price,
-                        track,
-                        p.trailing_activation_pct,
-                        p.trailing_stop_pct,
-                    )
-                } else {
-                    update_trailing(&side, entry, price, track, &cfg.confluence)
-                };
+                sl = update_trailing(&side, entry, price, track, &cfg.risk);
                 if (sl - prev_sl).abs() > 1e-10 {
                     let _ = self.db.update_position_sl_tp(id, Some(sl), None).await;
                 }
@@ -266,15 +258,15 @@ impl LivePositionMonitor {
                         ).await;
                         events.push(json!({"position_id": id, "symbol": symbol, "reason": "take_profit", "level": level, "pnl": pnl}));
                         self.trailing_stops.remove(&id);
-                        self.cancel_plan_orders(&symbol).await;
+                        self.cleanup_symbol_orders(&symbol, exchange_pos_id).await;
                         closed_full = true;
                         break;
                     } else {
                         // Partial close: update remaining_size in DB.
                         let new_remaining = (remaining - close_vol).max(0.0);
-                        let _ = self.db.partial_close_position(id, new_remaining, price).await;
                         let side_enum = if side == "long" { PositionSide::Long } else { PositionSide::Short };
                         let partial_pnl = compute_pnl(entry, price, close_vol, cs, fee_rate, &side_enum);
+                        let _ = self.db.partial_close_position(id, new_remaining, price, partial_pnl).await;
                         let _ = risk.update_pnl(partial_pnl).await;
                         let _ = self.db.log_event(
                             "position_partial_tp",
@@ -361,8 +353,7 @@ impl LivePositionMonitor {
                 ).await;
                 events.push(json!({"position_id": id, "symbol": symbol, "reason": reason, "pnl": pnl}));
                 self.trailing_stops.remove(&id);
-                // Cancel all dangling SL/TP plan orders so they don't re-trigger.
-                self.cancel_plan_orders(&symbol).await;
+                self.cleanup_symbol_orders(&symbol, exchange_pos_id).await;
             } else {
                 warn!("SL market close failed for {symbol}: {:?}", result.get("error"));
                 let _ = self.db.log_event(
@@ -370,6 +361,10 @@ impl LivePositionMonitor {
                     &format!("SL close failed for {symbol} ({reason})"),
                     Some(result),
                 ).await;
+                if self.position_on_exchange(&symbol, &side).await == Some(false) {
+                    info!("Position {symbol} already closed on exchange — cleaning up orders");
+                    self.cleanup_symbol_orders(&symbol, exchange_pos_id).await;
+                }
             }
         }
 

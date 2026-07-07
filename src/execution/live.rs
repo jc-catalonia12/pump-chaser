@@ -220,17 +220,10 @@ impl LiveTrader {
         // MEXC type 5 = market, type 1 = limit.
         let is_limit = matches!(signal.entry_mode.as_str(), "limit" | "sniper");
         let order_type = if is_limit { 1 } else { 5 };
-        let (offset, limit_ttl) = if signal.strategy == "volume_pump" {
-            (
-                cfg.pump.limit_offset_pct,
-                cfg.pump.limit_ttl_sec,
-            )
-        } else {
-            (
-                cfg.sniper.limit_offset_pct,
-                cfg.sniper.limit_ttl_sec,
-            )
-        };
+        let (offset, limit_ttl) = (
+            cfg.execution.limit_offset_pct,
+            cfg.execution.limit_ttl_sec,
+        );
         let limit_price = if is_limit {
             let base = if signal.limit_entry_price > 0.0 {
                 signal.limit_entry_price
@@ -345,8 +338,18 @@ impl LiveTrader {
                                             .and_then(|v| v.as_i64())
                                             .is_some();
                                         if !filled {
+                                            let entry = p
+                                                .get("entry_price")
+                                                .and_then(|v| v.as_f64())
+                                                .unwrap_or(0.0);
                                             let _ = db_clone
-                                                .close_position_synced(pending_pos_id, "limit_ttl_expired")
+                                                .close_position_synced(
+                                                    pending_pos_id,
+                                                    "limit_ttl_expired",
+                                                    1.0,
+                                                    0.0,
+                                                    entry,
+                                                )
                                                 .await;
                                         }
                                     }
@@ -708,13 +711,23 @@ impl LiveTrader {
             &self.client,
             &self.db,
             &cfg,
+            Some(&self.contracts),
         )
         .await
     }
 
     /// Close open live rows that are not on the exchange (e.g. failed rollbacks).
     pub async fn heal_phantom_open_positions(&self) -> usize {
-        crate::execution::position_sync::heal_stuck_live_positions(&self.client, &self.db).await
+        let cfg = self.config.read().unwrap().clone();
+        let marks = crate::execution::position_sync::fetch_mark_prices(&cfg).await;
+        let (healed, _) = crate::execution::position_sync::heal_stuck_live_positions(
+            &self.client,
+            &self.db,
+            Some(&self.contracts),
+            &marks,
+        )
+        .await;
+        healed
     }
 
     fn apply_precision(&self, symbol: &str, mut payload: Value) -> Value {

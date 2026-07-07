@@ -8,6 +8,32 @@ use crate::signals::zones::{build_zones, Zone};
 
 pub const DATA_SOURCE: &str = "mexc_perpetual";
 
+const CHART_KLINE_TIMEOUT_SECS: u64 = 8;
+
+pub fn kline_interval_secs(interval: &str) -> i64 {
+    match interval {
+        "Min1" => 60,
+        "Min5" => 300,
+        "Min15" => 900,
+        "Min30" => 1800,
+        "Min60" | "Hour1" => 3600,
+        "Hour4" => 14_400,
+        "Day1" => 86_400,
+        _ => 60,
+    }
+}
+
+/// Clamp chart start so we never request more than `max_bars` of history.
+pub fn clamp_chart_start_ts(start_ts: i64, max_bars: usize, interval: &str) -> i64 {
+    if start_ts <= 0 {
+        return start_ts;
+    }
+    let bar_sec = kline_interval_secs(interval);
+    let max_window = max_bars as i64 * bar_sec;
+    let earliest = chrono::Utc::now().timestamp() - max_window;
+    start_ts.max(earliest)
+}
+
 pub fn bars_to_chart_payload(bars: &[KlineBar]) -> Vec<Value> {
     bars.iter()
         .map(|b| {
@@ -239,11 +265,17 @@ pub async fn load_chart_bars(
     interval: &str,
     bars: usize,
 ) -> Vec<KlineBar> {
-    // Always try a fresh pull so the chart shows the latest (still-forming) candle
-    // on each refresh. The scanner cache is only a fallback when the live request
-    // fails or returns too little data.
-    let mut klines = match exchange.get_klines(symbol, interval).await {
-        Ok(fetched) if fetched.len() >= 30 || fetched.len() >= cached.len() => fetched,
+    // Try a fresh pull with a short timeout; fall back to scanner cache on slow networks.
+    let fresh = tokio::time::timeout(
+        std::time::Duration::from_secs(CHART_KLINE_TIMEOUT_SECS),
+        exchange.get_klines(symbol, interval),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
+
+    let mut klines = match fresh {
+        Some(fetched) if fetched.len() >= 30 || fetched.len() >= cached.len() => fetched,
         _ => cached.to_vec(),
     };
 
@@ -268,15 +300,28 @@ pub async fn load_chart_bars_from_time(
     start_ts: i64,
     max_bars: usize,
 ) -> Vec<KlineBar> {
+    let start_ts = clamp_chart_start_ts(start_ts, max_bars, interval);
     let end_ts = chrono::Utc::now().timestamp();
-    let mut klines = match exchange.get_klines_range(symbol, interval, start_ts, end_ts).await {
-        Ok(fetched) if !fetched.is_empty() => fetched,
+    let ranged = tokio::time::timeout(
+        std::time::Duration::from_secs(CHART_KLINE_TIMEOUT_SECS),
+        exchange.get_klines_range(symbol, interval, start_ts, end_ts),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
+
+    let mut klines = match ranged {
+        Some(fetched) if !fetched.is_empty() => fetched,
         _ => cached
             .iter()
             .filter(|b| b.timestamp >= start_ts)
             .cloned()
             .collect(),
     };
+
+    if klines.is_empty() {
+        klines = load_chart_bars(exchange, cached, symbol, interval, max_bars).await;
+    }
 
     if klines.len() > max_bars {
         klines = klines[klines.len() - max_bars..].to_vec();
@@ -361,4 +406,18 @@ pub fn parse_signal_start_ts(signal: &Value) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(ts_str)
         .ok()
         .map(|dt| dt.timestamp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_chart_start_limits_window() {
+        let now = chrono::Utc::now().timestamp();
+        let old = now - 7 * 86_400;
+        let clamped = clamp_chart_start_ts(old, 120, "Min1");
+        assert!(clamped > old);
+        assert!(clamped >= now - 120 * 60 - 5);
+    }
 }

@@ -1,25 +1,30 @@
 //! Technical feature engineering — mirrors Python `ml/features.py` (pandas-only path).
 //!
-//! Feature layout (FEATURE_DIM = 15):
-//!   0  rsi_14           — RSI(14), range ~0..100
-//!   1  ema_ratio        — ema9/ema21 - 1 (scale-independent trend direction)
-//!   2  ema_slope_pct    — (ema9_now - ema9_5bars_ago) / close (momentum %)
-//!   3  macd_hist        — MACD histogram (12/26/9)
-//!   4  atr_pct          — ATR(14) / close
-//!   5  bb_width         — (upper-lower) / mid Bollinger
-//!   6  volume_z         — volume Z-score vs 20-bar rolling mean
-//!   7  return_1         — 1-bar % return
-//!   8  return_5         — 5-bar % return
-//!   9  hl_range_pct     — (high-low) / close
-//!  10  composite_score  — signal composite score 0..1 (normalised from 0..100)
-//!  11  zone_score       — signal zone score 0..1
-//!  12  volume_surge     — volume_surge_ratio / 10.0, capped at 2.0
-//!  13  side_long        — 1.0 = long, 0.0 = short
-//!  14  price_chg_abs    — |price_change_pct|, capped at 0.10
+//! Feature layout (FEATURE_DIM = 33):
+//!   0-9   technical indicators (RSI, EMA, MACD, ATR, BB, volume, returns)
+//!  10-14  signal context (composite, zone, volume surge, side, move %)
+//!  15     is_volume_pump (legacy, always 0 now that "ai" is the only strategy)
+//!  16     hour_sin (cyclical time)
+//!  17     hour_cos
+//!  18     btc_htf_move_pct (normalized, clamped)
+//!  19     global_sentiment (-1..1)
+//!  20     symbol_htf_move_pct (own higher-timeframe move, normalized)
+//!  21     rel_strength_vs_btc (symbol HTF move minus BTC HTF move, normalized)
+//!  22     vol_regime_ratio (ATR% expansion/contraction vs ~14 bars ago)
+//!  23     orderflow_body_ratio (candle body/range pressure proxy, last 5 bars)
+//!  24     orderflow_volume_imbalance (up-vol vs down-vol skew, last 10 bars)
+//!  25     funding_rate (normalized, clamped)
+//!  26     symbol_sentiment (-1..1, per-symbol news score)
+//!  27-30  LLM regime one-hot: trending, chop, high_vol, risk_off (Phase 4 fills these in)
+//!  31     llm_btc_bias (-1..1, Phase 4 fills this in)
+//!  32     llm_confidence (0..1, Phase 4 fills this in)
+
+use chrono::{Timelike, Utc};
+use serde_json::Value;
 
 use crate::exchange::KlineBar;
 
-pub const FEATURE_COLUMNS: [&str; 15] = [
+pub const FEATURE_COLUMNS: [&str; 33] = [
     "rsi_14",
     "ema_ratio",
     "ema_slope_pct",
@@ -35,9 +40,54 @@ pub const FEATURE_COLUMNS: [&str; 15] = [
     "volume_surge",
     "side_long",
     "price_chg_abs",
+    "is_volume_pump",
+    "hour_sin",
+    "hour_cos",
+    "btc_htf_move_pct",
+    "global_sentiment",
+    "symbol_htf_move_pct",
+    "rel_strength_vs_btc",
+    "vol_regime_ratio",
+    "orderflow_body_ratio",
+    "orderflow_volume_imbalance",
+    "funding_rate",
+    "symbol_sentiment",
+    "regime_trending",
+    "regime_chop",
+    "regime_high_vol",
+    "regime_risk_off",
+    "llm_btc_bias",
+    "llm_confidence",
 ];
 
-pub const FEATURE_DIM: usize = FEATURE_COLUMNS.len(); // 15
+/// Extra context for building signal-level features: cross-asset, funding,
+/// sentiment, and (from Phase 4 onward) local-LLM regime classification.
+/// All fields default to neutral/zero so callers that don't have a signal
+/// yet (e.g. bars-only feature backfill) degrade gracefully.
+#[derive(Debug, Clone, Default)]
+pub struct MlFeatureContext {
+    pub btc_htf_move_pct: f64,
+    pub global_sentiment: f64,
+    pub symbol_htf_move_pct: f64,
+    pub funding_rate: f64,
+    pub symbol_sentiment: f64,
+    pub regime: MarketRegime,
+}
+
+/// Local-LLM market regime read (Phase 4). Until that phase is wired in,
+/// this stays at its default (all false / zero) and the corresponding
+/// feature slots simply carry no signal yet.
+#[derive(Debug, Clone, Default)]
+pub struct MarketRegime {
+    pub trending: bool,
+    pub chop: bool,
+    pub high_vol: bool,
+    pub risk_off: bool,
+    pub btc_bias: f64,
+    pub confidence: f64,
+}
+
+pub const FEATURE_DIM: usize = FEATURE_COLUMNS.len(); // 33
 
 /// Older ONNX exports (pre v15 features) expect 10 technical columns with
 /// absolute `ema_9` / `ema_21` at indices 1–2 instead of `ema_ratio` / `ema_slope_pct`.
@@ -124,6 +174,7 @@ impl TechnicalFeatureBuilder {
             return vec![0.0; FEATURE_DIM];
         }
 
+        let open: Vec<f64> = bars.iter().map(|b| b.open).collect();
         let close: Vec<f64> = bars.iter().map(|b| b.close).collect();
         let high: Vec<f64> = bars.iter().map(|b| b.high).collect();
         let low: Vec<f64> = bars.iter().map(|b| b.low).collect();
@@ -240,6 +291,60 @@ impl TechnicalFeatureBuilder {
             })
             .collect();
 
+        // Volatility regime: current 14-bar ATR% vs ATR% ~14 bars back. >0 means
+        // volatility is expanding, <0 means it's contracting.
+        let vol_regime_ratio: Vec<f64> = (0..n)
+            .map(|i| {
+                if i < 14 {
+                    return f64::NAN;
+                }
+                let now = atr_pct[i];
+                let prior = atr_pct[i - 14];
+                if now.is_finite() && prior.is_finite() && prior.abs() > 1e-9 {
+                    (now / prior - 1.0).clamp(-1.0, 1.0)
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect();
+
+        // Order-flow proxy #1: signed candle body / range averaged over the last
+        // 5 bars (no aggressor-side data available from klines, so this stands
+        // in as a buying-vs-selling pressure signal).
+        let orderflow_body_ratio: Vec<f64> = (0..n)
+            .map(|i| {
+                let start = i.saturating_sub(4);
+                let mut sum = 0.0;
+                let mut count = 0.0;
+                for j in start..=i {
+                    let range = high[j] - low[j];
+                    if range > 1e-12 {
+                        sum += (close[j] - open[j]) / range;
+                        count += 1.0;
+                    }
+                }
+                if count > 0.0 { (sum / count).clamp(-1.0, 1.0) } else { f64::NAN }
+            })
+            .collect();
+
+        // Order-flow proxy #2: up-bar vs down-bar volume skew over the last 10 bars.
+        let orderflow_volume_imbalance: Vec<f64> = (0..n)
+            .map(|i| {
+                let start = i.saturating_sub(9);
+                let mut up = 0.0;
+                let mut down = 0.0;
+                for j in start..=i {
+                    if close[j] >= open[j] {
+                        up += volume[j];
+                    } else {
+                        down += volume[j];
+                    }
+                }
+                let total = up + down;
+                if total > 1e-9 { ((up - down) / total).clamp(-1.0, 1.0) } else { f64::NAN }
+            })
+            .collect();
+
         let i = idx.unwrap_or(n - 1);
         vec![
             nan_to_zero(rsi_14[i]),
@@ -258,6 +363,24 @@ impl TechnicalFeatureBuilder {
             0.0, // volume_surge
             0.0, // side_long
             0.0, // price_chg_abs
+            0.0, // is_volume_pump (legacy)
+            0.0, // hour_sin
+            0.0, // hour_cos
+            0.0, // btc_htf_move_pct
+            0.0, // global_sentiment
+            0.0, // symbol_htf_move_pct
+            0.0, // rel_strength_vs_btc
+            nan_to_zero(vol_regime_ratio[i]),
+            nan_to_zero(orderflow_body_ratio[i]),
+            nan_to_zero(orderflow_volume_imbalance[i]),
+            0.0, // funding_rate
+            0.0, // symbol_sentiment
+            0.0, // regime_trending
+            0.0, // regime_chop
+            0.0, // regime_high_vol
+            0.0, // regime_risk_off
+            0.0, // llm_btc_bias
+            0.0, // llm_confidence
         ]
     }
 
@@ -278,9 +401,8 @@ impl TechnicalFeatureBuilder {
         normalize_feature_vector(Some(&vec), LEGACY_ONNX_FEATURE_DIM)
     }
 
-    /// Build a 15-feature vector incorporating both bar technicals and signal context.
-    /// Features 0-9: technical indicators from klines (or zeros if klines unavailable).
-    /// Features 10-14: signal-level context (composite/zone scores, volume surge, side, move %).
+    /// Build the full `FEATURE_DIM`-wide vector incorporating bar technicals,
+    /// signal context, and cross-asset/funding/sentiment/regime extras from `ctx`.
     pub fn signal_features(
         bars: Option<&[KlineBar]>,
         composite_score: f64,
@@ -288,6 +410,8 @@ impl TechnicalFeatureBuilder {
         volume_surge_ratio: f64,
         price_change_pct: f64,
         side_long: bool,
+        strategy: &str,
+        ctx: &MlFeatureContext,
     ) -> Vec<f64> {
         let mut tech = if let Some(b) = bars {
             if b.len() >= 10 {
@@ -308,14 +432,52 @@ impl TechnicalFeatureBuilder {
             tech.resize(FEATURE_DIM, 0.0);
         }
 
-        // Overwrite context features (10-14) with signal-level values.
         tech[10] = (composite_score / 100.0).clamp(0.0, 1.0);
         tech[11] = (zone_score / 100.0).clamp(0.0, 1.0);
         tech[12] = (volume_surge_ratio / 10.0).clamp(0.0, 2.0);
         tech[13] = if side_long { 1.0 } else { 0.0 };
         tech[14] = price_change_pct.abs().clamp(0.0, 0.10);
+        tech[15] = if strategy == "volume_pump" { 1.0 } else { 0.0 };
+
+        let hour = Utc::now().hour() as f64;
+        let angle = 2.0 * std::f64::consts::PI * hour / 24.0;
+        tech[16] = angle.sin();
+        tech[17] = angle.cos();
+        tech[18] = (ctx.btc_htf_move_pct / 5.0).clamp(-1.0, 1.0);
+        tech[19] = ctx.global_sentiment.clamp(-1.0, 1.0);
+        tech[20] = (ctx.symbol_htf_move_pct / 5.0).clamp(-1.0, 1.0);
+        let rel_strength = ctx.symbol_htf_move_pct - ctx.btc_htf_move_pct;
+        tech[21] = (rel_strength / 5.0).clamp(-1.0, 1.0);
+        // 22-24 (vol_regime_ratio, orderflow_body_ratio, orderflow_volume_imbalance)
+        // already come from the bar-technical block above.
+        tech[25] = (ctx.funding_rate / 0.003).clamp(-1.0, 1.0);
+        tech[26] = ctx.symbol_sentiment.clamp(-1.0, 1.0);
+        tech[27] = if ctx.regime.trending { 1.0 } else { 0.0 };
+        tech[28] = if ctx.regime.chop { 1.0 } else { 0.0 };
+        tech[29] = if ctx.regime.high_vol { 1.0 } else { 0.0 };
+        tech[30] = if ctx.regime.risk_off { 1.0 } else { 0.0 };
+        tech[31] = ctx.regime.btc_bias.clamp(-1.0, 1.0);
+        tech[32] = ctx.regime.confidence.clamp(0.0, 1.0);
 
         tech
+    }
+
+    /// Backfill signal-context features 10-14 from a stored signal payload.
+    pub fn enrich_context_from_payload(features: &mut [f64], sig: &Value) {
+        if features.len() < FEATURE_DIM {
+            return;
+        }
+        let composite = sig.get("composite_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let zone = sig.get("zone_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let vol_surge = sig.get("volume_surge_ratio").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let price_chg = sig.get("price_change_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let strategy = sig.get("strategy").and_then(|v| v.as_str()).unwrap_or("");
+        features[10] = (composite / 100.0).clamp(0.0, 1.0);
+        features[11] = (zone / 100.0).clamp(0.0, 1.0);
+        features[12] = (vol_surge / 10.0).clamp(0.0, 2.0);
+        features[13] = if price_chg >= 0.0 { 1.0 } else { 0.0 };
+        features[14] = price_chg.abs().clamp(0.0, 0.10);
+        features[15] = if strategy == "volume_pump" { 1.0 } else { 0.0 };
     }
 }
 
@@ -366,7 +528,21 @@ mod tests {
                 amount: 0.0,
             })
             .collect();
-        let fv = TechnicalFeatureBuilder::signal_features(Some(&bars), 75.0, 65.0, 3.5, 0.02, true);
+        let ctx = MlFeatureContext {
+            btc_htf_move_pct: 1.2,
+            global_sentiment: 0.3,
+            symbol_htf_move_pct: 2.0,
+            funding_rate: 0.0015,
+            symbol_sentiment: 0.5,
+            regime: MarketRegime {
+                trending: true,
+                confidence: 0.8,
+                ..Default::default()
+            },
+        };
+        let fv = TechnicalFeatureBuilder::signal_features(
+            Some(&bars), 75.0, 65.0, 3.5, 0.02, true, "volume_pump", &ctx,
+        );
         assert_eq!(fv.len(), FEATURE_DIM);
         // composite_score = 75/100 = 0.75
         assert!((fv[10] - 0.75).abs() < 1e-9);
@@ -378,5 +554,22 @@ mod tests {
         assert_eq!(fv[13], 1.0);
         // price_chg_abs = 0.02
         assert!((fv[14] - 0.02).abs() < 1e-9);
+        // btc_htf_move_pct = 1.2/5 = 0.24
+        assert!((fv[18] - 0.24).abs() < 1e-9);
+        // global_sentiment
+        assert!((fv[19] - 0.3).abs() < 1e-9);
+        // symbol_htf_move_pct = 2.0/5 = 0.4
+        assert!((fv[20] - 0.4).abs() < 1e-9);
+        // rel_strength_vs_btc = (2.0 - 1.2)/5 = 0.16
+        assert!((fv[21] - 0.16).abs() < 1e-9);
+        // funding_rate = 0.0015/0.003 = 0.5
+        assert!((fv[25] - 0.5).abs() < 1e-9);
+        // symbol_sentiment
+        assert!((fv[26] - 0.5).abs() < 1e-9);
+        // regime_trending one-hot
+        assert_eq!(fv[27], 1.0);
+        assert_eq!(fv[28], 0.0);
+        // llm_confidence
+        assert!((fv[32] - 0.8).abs() < 1e-9);
     }
 }
