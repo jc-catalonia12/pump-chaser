@@ -159,6 +159,23 @@ impl Database {
             let _ = sqlx::query(stmt).execute(&self.pool).await;
         }
 
+        // Remove duplicate headlines (same URL or same source+title when URL is empty).
+        let _ = sqlx::query(
+            r#"DELETE FROM news_items
+               WHERE id NOT IN (
+                 SELECT MIN(id) FROM news_items
+                 GROUP BY COALESCE(NULLIF(trim(url), ''), source || '::' || title)
+               )"#,
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_news_items_dedup
+               ON news_items (COALESCE(NULLIF(trim(url), ''), source || '::' || title))"#,
+        )
+        .execute(&self.pool)
+        .await;
+
         let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portfolio_state WHERE id = 1")
             .fetch_one(&self.pool)
             .await?;

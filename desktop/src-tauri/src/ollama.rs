@@ -171,34 +171,66 @@ fn _install_for_os(progress: impl Fn(&str)) -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "windows")]
+const OLLAMA_WINDOWS_INSTALLER_URL: &str = "https://ollama.com/download/OllamaSetup.exe";
+
+/// True if `path` looks like a Windows PE executable (not an HTML error page saved as .exe).
+#[cfg(target_os = "windows")]
+fn is_valid_windows_installer(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    // Real OllamaSetup.exe is tens of MB; HTML landing pages are tiny.
+    if meta.len() < 5 * 1024 * 1024 {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    bytes.len() >= 2 && bytes[0] == b'M' && bytes[1] == b'Z'
+}
+
+#[cfg(target_os = "windows")]
 fn _install_for_os(progress: impl Fn(&str)) -> Result<PathBuf, String> {
-    // Ollama on Windows installs to %LOCALAPPDATA%\Programs\Ollama — no UAC needed.
+    // Ollama on Windows uses Inno Setup — NOT the HTML page at /download/windows.
     progress("Downloading Ollama installer…");
     let tmp = std::env::temp_dir().join("OllamaSetup.exe");
-    // Use PowerShell Invoke-WebRequest for the download.
+    let url = OLLAMA_WINDOWS_INSTALLER_URL;
+    let ps_script = format!(
+        "$ProgressPreference = 'SilentlyContinue'; \
+         $uri = '{url}'; \
+         $out = '{}'; \
+         Invoke-WebRequest -Uri $uri -OutFile $out -UseBasicParsing;",
+        tmp.display().to_string().replace('\'', "''")
+    );
     let dl = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "Invoke-WebRequest -Uri 'https://ollama.com/download/windows' -OutFile '{}'",
-                tmp.display()
-            ),
-        ])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
         .status()
         .map_err(|e| format!("PowerShell unavailable: {e}"))?;
     if !dl.success() {
-        return Err("Ollama download failed via PowerShell".into());
+        return Err(format!(
+            "Ollama download failed (expected 64-bit installer from {url})"
+        ));
+    }
+    if !is_valid_windows_installer(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(
+            "Downloaded file is not a valid Ollama installer (got HTML or a truncated file). \
+             Check your network connection and try again."
+                .into(),
+        );
     }
     progress("Installing Ollama (silent)…");
+    // Inno Setup silent flags (official install.ps1) — /S is for NSIS and does not work here.
     let status = Command::new(&tmp)
-        .arg("/S") // NSIS silent install flag
+        .args(["/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES"])
         .status()
         .map_err(|e| format!("OllamaSetup.exe failed to start: {e}"))?;
     let _ = std::fs::remove_file(&tmp);
     if !status.success() {
-        return Err("Ollama installer exited with error".into());
+        return Err(format!(
+            "Ollama installer exited with status {}",
+            status.code().unwrap_or(-1)
+        ));
     }
     // Give the installer a moment to write the binary.
     std::thread::sleep(Duration::from_secs(3));
@@ -327,5 +359,35 @@ impl OllamaHandle {
 impl Default for OllamaHandle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn rejects_html_saved_as_exe() {
+        let dir = std::env::temp_dir().join("ollama_install_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("fake.exe");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"<!DOCTYPE html><html>").unwrap();
+        assert!(!is_valid_windows_installer(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn accepts_mz_header_and_min_size() {
+        let dir = std::env::temp_dir().join("ollama_install_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("fake_pe.exe");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let mut buf = vec![b'M', b'Z'];
+        buf.resize(5 * 1024 * 1024 + 1, 0);
+        f.write_all(&buf).unwrap();
+        assert!(is_valid_windows_installer(&path));
+        let _ = std::fs::remove_file(&path);
     }
 }

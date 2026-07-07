@@ -1486,7 +1486,7 @@ function applySnapshot(snapshot) {
       lastScanFeedKey = scanKey;
     }
     const sigPreview = (snap.signals || []).slice(0, 8);
-    const sigKey = sigPreview.map((s) => `${s.id}|${s.generated_at}|${s.symbol}`).join(";");
+    const sigKey = sigPreview.map((s) => `${s.id ?? s.signal_id ?? ""}|${s.generated_at}|${s.symbol}`).join(";");
     if (tradingActive && sigKey !== lastSignalsPreviewKey) {
       lastSignalsPreviewKey = sigKey;
       renderSignalsTable($("#trading-signals-preview"), sigPreview, { limit: 8, timeCompact: true });
@@ -2235,8 +2235,26 @@ function newsTimestamp(item) {
   return Number.isFinite(t) ? t : 0;
 }
 
+function newsDedupKey(item) {
+  const url = String(item?.url || "").trim();
+  if (url) return `url:${url}`;
+  return `st:${item?.source || ""}|${item?.title || ""}`;
+}
+
+function dedupeNewsItems(items) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const key = newsDedupKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
 function sortNewsLatestFirst(items) {
-  return [...items].sort((a, b) => newsTimestamp(b) - newsTimestamp(a));
+  return dedupeNewsItems([...items].sort((a, b) => newsTimestamp(b) - newsTimestamp(a)));
 }
 
 function renderNewsSlide(item) {
@@ -2511,11 +2529,12 @@ async function fetchFngHistory() {
 async function loadDashboardMarket() {
   if (!$("#panel-trading")?.classList.contains("active")) return;
   try {
-    const [status, newsResp, fngHistory, llmStatus] = await Promise.all([
+    const [status, newsResp, fngHistory, llmStatus, signalsResp] = await Promise.all([
       apiGet("/sentiment/status").catch(() => ({})),
       apiGet("/sentiment/news?limit=20").catch(() => ({ items: [] })),
       fetchFngHistory(),
       apiGet("/llm/status").catch(() => ({})),
+      apiGet("/signals?limit=8&offset=0").catch(() => ({ signals: [] })),
     ]);
     renderDashboardGreedMeter(status, fngHistory);
     renderDashboardRegime(llmStatus);
@@ -2524,6 +2543,12 @@ async function loadDashboardMarket() {
     dashboardNewsItems = sortNewsLatestFirst(fromDb.length ? fromDb : fromMem).slice(0, 20);
     dashboardNewsPage = 0;
     renderDashboardNewsFeed();
+    const sigPreview = (signalsResp.signals || []).slice(0, 8);
+    if (sigPreview.length) {
+      lastSignalsPreviewKey = null;
+      renderSignalsTable($("#trading-signals-preview"), sigPreview, { limit: 8, timeCompact: true });
+      lastSignalsPreviewKey = sigPreview.map((s) => `${s.id ?? s.signal_id ?? ""}|${s.generated_at}|${s.symbol}`).join(";");
+    }
   } catch (e) {
     const feed = $("#dash-news-feed");
     if (feed) feed.innerHTML = `<div class="news-feed-empty">${escapeHtml(e.message || "Failed to load")}</div>`;
