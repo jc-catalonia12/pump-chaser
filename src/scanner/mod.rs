@@ -1093,17 +1093,6 @@ impl ScannerInner {
                     self.cfg().llm.poll_interval_sec
                 );
             }
-            {
-                let live = self.live.lock().await;
-                if live.has_credentials() {
-                    drop(live);
-                    let heal_inner = self.clone();
-                    guard.push(tokio::spawn(async move {
-                        heal_inner.phantom_heal_loop().await;
-                    }));
-                    info!("Phantom position heal loop started (every 45s)");
-                }
-            }
         }
 
         let _ = self.db.log_event("scanner", "Scanner started", None).await;
@@ -1273,33 +1262,6 @@ impl ScannerInner {
     /// Background loop: periodically classify the market regime via the local
     /// Ollama LLM. The cached result feeds ML feature slots 27–32. Offline or
     /// misbehaving Ollama degrades to a neutral regime — never blocks trading.
-    /// Periodically close DB rows that are not on the exchange (failed rollbacks).
-    /// Runs off the snapshot/ticker hot-path so UI snapshots never block on heal.
-    async fn phantom_heal_loop(&self) {
-        const INTERVAL_SEC: i64 = 45;
-        while self.running.load(Ordering::SeqCst) {
-            for _ in 0..INTERVAL_SEC {
-                if !self.running.load(Ordering::SeqCst) {
-                    return;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            }
-            let live = self.live.lock().await;
-            if !live.has_credentials() {
-                continue;
-            }
-            let healed = live.heal_phantom_open_positions().await;
-            drop(live);
-            if healed > 0 {
-                info!("Auto-healed {healed} phantom live position(s) not on MEXC");
-                let mut risk = self.risk.write().await;
-                let _ = risk.reconcile_pnl_from_db().await;
-                drop(risk);
-                self.cached_open_positions.store(-1, Ordering::Relaxed);
-            }
-        }
-    }
-
     async fn llm_regime_loop(&self) {
         while self.running.load(Ordering::SeqCst) {
             let inputs = self.build_regime_inputs().await;
@@ -2098,6 +2060,15 @@ impl ScannerInner {
         }
     }
 
+    /// Whether live trading is active — never blocks on live-trader mutex.
+    fn trading_is_live(&self) -> bool {
+        if let Ok(live) = self.live.try_lock() {
+            return live.is_live();
+        }
+        // Live trader busy (order in flight) — treat as paper to avoid queueing.
+        false
+    }
+
     /// Lightweight scan entry when the position book is full — skips ML/DB signal work.
     async fn record_capacity_reject(&self, signal: &PumpSignal, ticker: &TickerSnapshot) {
         let max = self.cfg().risk.max_concurrent_positions;
@@ -2365,14 +2336,9 @@ impl ScannerInner {
             )
             .await;
         }
-        let event_msg = format!(
-            "Signal: {} score={:.1}",
-            signal.symbol, signal.composite_score
-        );
-        let _ = self
-            .db
-            .log_event("signal", &event_msg, Some(payload))
-            .await;
+        // Scan feed + in-memory buffer already surface new signals. Skip the
+        // audit_log "signal" row here — it duplicated trade_blocked toasts and
+        // bloated every WS snapshot with heavy JSON payloads.
 
         // Gate execution when the WS feed is stale — prices may be stale too.
         let stale_threshold = self.cfg().risk.ws_stale_sec as i64;
@@ -2400,12 +2366,21 @@ impl ScannerInner {
         // risk.prepare / exchange REST calls / risk.commit to minimize lock
         // contention. Neither path blocks the ticker loop because emit_signal
         // is always called from a spawned background task (see process_tickers).
-        let is_live = self.live.lock().await.is_live();
+        let is_live = self.trading_is_live();
         let mode = if is_live { "live" } else { "paper" };
 
         let open_result = if !is_live {
             // Paper: only risk.write() — no live-trader mutex (contract lookup is best-effort).
-            let mut risk = self.risk.write().await;
+            let mut risk = match self.risk.try_write() {
+                Ok(r) => r,
+                Err(_) => {
+                    debug!("Skipping paper open for {} — risk lock busy", signal.symbol);
+                    if let Some(id) = signal.signal_id {
+                        let _ = self.db.set_signal_reject_reason(id, "risk_busy").await;
+                    }
+                    return;
+                }
+            };
             match risk.try_open_from_signal(&signal, true).await {
                 Ok(Some(id)) => {
                     let contract_max = if let Ok(live) = self.live.try_lock() {
@@ -2425,7 +2400,16 @@ impl ScannerInner {
             // Live: split locks so risk.write() is never held during REST calls.
             // Step 1 — prepare (brief risk.write(), DB ops only).
             let mut prepared = {
-                let mut risk = self.risk.write().await;
+                let mut risk = match self.risk.try_write() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        debug!("Skipping live open for {} — risk lock busy", signal.symbol);
+                        if let Some(id) = signal.signal_id {
+                            let _ = self.db.set_signal_reject_reason(id, "risk_busy").await;
+                        }
+                        return;
+                    }
+                };
                 match risk.prepare_open_from_signal(&signal).await {
                     Ok(Some(p)) => p,
                     Ok(None) => {
@@ -2463,7 +2447,16 @@ impl ScannerInner {
 
             // Step 3 — commit position to DB (brief risk.write(), fast).
             let commit_result = {
-                let mut risk = self.risk.write().await;
+                let mut risk = match self.risk.try_write() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!(
+                            "Risk lock busy after live fill for {} — position may need manual reconcile",
+                            signal.symbol
+                        );
+                        return;
+                    }
+                };
                 risk.commit_open_from_signal(&signal, false, &prepared).await
             };
 

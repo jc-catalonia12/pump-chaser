@@ -26,7 +26,7 @@ let dashboardNewsPage = 0;
 let dashboardNewsAutoTimer = null;
 const DASHBOARD_NEWS_PER_PAGE = 1;
 const DASHBOARD_NEWS_AUTO_MS = 7000;
-const NEWS_TABLE_PER_PAGE = 8;
+const NEWS_TABLE_PER_PAGE = 5;
 let pnlDailyChart = null;
 let pnlCumChart = null;
 let balanceHistoryChart = null;
@@ -595,6 +595,7 @@ function setNotificationsOpen(open) {
   panel?.classList.toggle("hidden", !open);
   btn?.setAttribute("aria-expanded", open ? "true" : "false");
   if (open) {
+    renderNotificationPanel(window.__lastActivityEvents || []);
     markNotificationsSeen({ all: true });
     updateNotificationBadge(0);
   } else {
@@ -1004,8 +1005,12 @@ function healthSignature(health = {}, risk = {}) {
   ].join("|");
 }
 
-function activitySignature(events) {
-  return (events || []).map((e) => `${e.id}:${e.seen ? 1 : 0}`).join(",");
+function activitySignature(events, unreadCount) {
+  const top = (events || [])
+    .slice(0, NOTIF_PANEL_LIMIT)
+    .map((e) => `${e.id}:${e.seen ? 1 : 0}`)
+    .join(",");
+  return `${unreadCount ?? activityUnreadCount}|${top}`;
 }
 
 function pnlSignature(positions) {
@@ -1018,7 +1023,12 @@ function renderActivity(events, unreadCount) {
   window.__lastActivityEvents = events || [];
   if (unreadCount != null) activityUnreadCount = unreadCount;
   maybeToastNewEvents(events);
-  renderNotificationPanel(events);
+  updateNotificationBadge(activityUnreadCount);
+  // Rebuilding the notification list on every 2 s WS tick is expensive when the
+  // panel is closed — badge + toasts are enough until the user opens it.
+  if (notificationsOpen || notifModalOpen) {
+    renderNotificationPanel(events);
+  }
 }
 
 function sideFromSignal(s) {
@@ -1459,23 +1469,29 @@ function applySnapshot(snapshot) {
       }
     }
 
-    const actSig = activitySignature(snap.activity);
+    const actSig = activitySignature(snap.activity, snap.activity_unread);
     if (actSig !== lastActivitySig) {
       lastActivitySig = actSig;
       renderActivity(snap.activity, snap.activity_unread);
     }
+    const tradingActive = $("#panel-trading")?.classList.contains("active");
     const scanKey = (snap.scan_events || [])
       .slice(0, 20)
       .map((r) => `${r.scanned_at}|${r.symbol}|${r.action}|${r.message}`)
       .join(";");
-    if (scanKey !== lastScanFeedKey) {
+    if (tradingActive && scanKey !== lastScanFeedKey) {
+      lastScanFeedKey = scanKey;
       renderLiveScan(snap.scan_events, snap.health, snap.signals);
+    } else if (!tradingActive) {
+      lastScanFeedKey = scanKey;
     }
     const sigPreview = (snap.signals || []).slice(0, 8);
     const sigKey = sigPreview.map((s) => `${s.id}|${s.generated_at}|${s.symbol}`).join(";");
-    if (sigKey !== lastSignalsPreviewKey) {
+    if (tradingActive && sigKey !== lastSignalsPreviewKey) {
       lastSignalsPreviewKey = sigKey;
       renderSignalsTable($("#trading-signals-preview"), sigPreview, { limit: 8, timeCompact: true });
+    } else if (!tradingActive) {
+      lastSignalsPreviewKey = sigKey;
     }
     $("#last-updated").textContent = fmtManilaTime(new Date());
   });
@@ -2213,6 +2229,16 @@ function fmtTimeAgo(iso) {
   return `${days}d ago`;
 }
 
+function newsTimestamp(item) {
+  const raw = item?.published_at || item?.created_at;
+  const t = raw ? Date.parse(raw) : NaN;
+  return Number.isFinite(t) ? t : 0;
+}
+
+function sortNewsLatestFirst(items) {
+  return [...items].sort((a, b) => newsTimestamp(b) - newsTimestamp(a));
+}
+
 function renderNewsSlide(item) {
   const score = Number(item.score);
   const scoreCls = sentimentScoreClass(score);
@@ -2495,7 +2521,8 @@ async function loadDashboardMarket() {
     renderDashboardRegime(llmStatus);
     const fromDb = newsResp.items || [];
     const fromMem = status.headlines || [];
-    dashboardNewsItems = (fromDb.length ? fromDb : fromMem).slice(0, 20);
+    dashboardNewsItems = sortNewsLatestFirst(fromDb.length ? fromDb : fromMem).slice(0, 20);
+    dashboardNewsPage = 0;
     renderDashboardNewsFeed();
   } catch (e) {
     const feed = $("#dash-news-feed");
@@ -2639,70 +2666,150 @@ function renderPromotionPanel(payload) {
   </div>`;
 }
 
+function renderTrainingSentimentHeadlineRow(item) {
+  const score = Number(item.score);
+  const scoreCls = sentimentScoreClass(score);
+  const scoreLabel = Number.isFinite(score) ? (score >= 0 ? `+${score.toFixed(2)}` : score.toFixed(2)) : "—";
+  const symbols = Array.isArray(item.symbols) ? item.symbols : [];
+  const symHtml = symbols.length
+    ? symbols.slice(0, 4).map((s) => `<span class="news-symbol-chip">${escapeHtml(s)}</span>`).join("")
+    : "—";
+  const url = item.url ? escapeHtml(item.url) : "";
+  const title = escapeHtml(item.title || "Untitled");
+  const titleHtml = url
+    ? `<a href="${url}" target="_blank" rel="noopener noreferrer" title="${title}">${title}</a>`
+    : `<span title="${title}">${title}</span>`;
+  const age = fmtTimeAgo(item.published_at || item.created_at) || "—";
+  return `<tr>
+    <td class="news-col-source">${escapeHtml(item.source || "—")}</td>
+    <td class="news-col-title">${titleHtml}</td>
+    <td class="training-sentiment-symbols-cell">${symHtml}</td>
+    <td class="news-col-score"><span class="news-feed-score ${scoreCls}">${scoreLabel}</span></td>
+    <td class="news-col-age">${age}</td>
+  </tr>`;
+}
+
 function renderSentimentPanel(s, llmStatus = {}) {
   const stats = $("#training-sentiment-stats");
+  const symbolsEl = $("#training-sentiment-symbols");
   const headlines = $("#training-sentiment-headlines");
+  const symbolCountEl = $("#training-sentiment-symbol-count");
+  const headlineCountEl = $("#training-sentiment-headline-count");
   const badge = $("#training-sentiment-score");
   const g = Number(s.global_score ?? 0);
   if (badge) {
     badge.textContent = `News ${formatSentimentScore(g)}`;
     badge.className = "tag " + (g > 0.2 ? "tag-ok" : g < -0.2 ? "tag-warn" : "");
   }
+
+  const fgi = fearGreedMeta(s.fear_greed);
+  const fgiColor = FGI_COLORS[fgi.className] || "var(--text)";
+  const markerLeft = clampPct(((g + 1) / 2) * 100);
+  const { label: regimeLabel, cls: regimeCls, title: regimeTitle } = regimeSummary(llmStatus);
+  const modelTag = llmStatus.available && llmStatus.model ? llmStatus.model : "—";
+  const updatedAt = s.updated_at ? fmtManilaDateTime(s.updated_at) : "—";
+  const newsBias = g > 0.2 ? "Bullish" : g < -0.2 ? "Bearish" : "Neutral";
+  const newsBiasCls = g > 0.2 ? "positive" : g < -0.2 ? "negative" : "";
+
   if (stats) {
-    const fgi = fearGreedMeta(s.fear_greed);
-    const fgiColor = FGI_COLORS[fgi.className] || "var(--text)";
-    const markerLeft = clampPct(((g + 1) / 2) * 100);
-    stats.innerHTML = `<div class="training-sentiment-compact">
-      <div class="training-sentiment-scores">
-        <div class="training-sentiment-score-block">
-          <span class="training-sentiment-score-label">Fear &amp; Greed</span>
-          <span class="training-sentiment-score-val mono" style="color:${fgiColor}">${fgi.value != null ? Math.round(fgi.value) : "—"}</span>
-          <span class="hint">${fgi.label}</span>
-        </div>
-        <div class="training-sentiment-score-block">
-          <span class="training-sentiment-score-label">News sentiment</span>
-          <span class="training-sentiment-score-val mono ${g > 0.2 ? "positive" : g < -0.2 ? "negative" : ""}">${formatSentimentScore(g)}</span>
-        </div>
-        <div class="training-sentiment-meta">
-          <span>${s.headline_count ?? 0} headlines</span>
-          <span>${Object.keys(s.symbol_scores || {}).length} symbols</span>
-        </div>
-      </div>
-      <div class="sentiment-bar-track" aria-hidden="true">
-        <div class="sentiment-bar-marker" style="left:${markerLeft}%"></div>
-      </div>
-      ${(() => {
-        const { label, cls, title } = regimeSummary(llmStatus);
-        const modelTag = llmStatus.available && llmStatus.model ? ` · ${escapeHtml(llmStatus.model)}` : "";
-        return `<div class="sentiment-mini-row">
-          <span class="hint">LLM regime${modelTag}</span>
-          <span class="sentiment-pill${cls}" title="${escapeHtml(title)}">${escapeHtml(label)}</span>
-        </div>`;
-      })()}
-    </div>`;
+    stats.innerHTML = `<table class="data sentiment-overview-table">
+      <tbody>
+        <tr>
+          <td>Fear &amp; Greed</td>
+          <td class="mono" style="color:${fgiColor}">${fgi.value != null ? Math.round(fgi.value) : "—"}</td>
+          <td class="hint-cell">${escapeHtml(fgi.label)}</td>
+        </tr>
+        <tr>
+          <td>News sentiment</td>
+          <td class="mono ${newsBiasCls}">${formatSentimentScore(g)}</td>
+          <td class="${newsBiasCls}">${newsBias}</td>
+        </tr>
+        <tr>
+          <td>LLM regime</td>
+          <td colspan="2"><span class="sentiment-pill${regimeCls}" title="${escapeHtml(regimeTitle)}">${escapeHtml(regimeLabel)}</span></td>
+        </tr>
+        <tr>
+          <td>Ollama model</td>
+          <td colspan="2" class="mono hint-cell">${escapeHtml(modelTag)}</td>
+        </tr>
+        <tr>
+          <td>Last updated</td>
+          <td colspan="2">${updatedAt}</td>
+        </tr>
+        <tr class="sentiment-bar-row">
+          <td colspan="3">
+            <div class="sentiment-bar-track sentiment-bar-track--table" aria-hidden="true" title="Bearish ← → Bullish">
+              <div class="sentiment-bar-marker" style="left:${markerLeft}%"></div>
+            </div>
+          </td>
+        </tr>
+      </tbody>
+    </table>`;
   }
+
+  const symbolScores = s.symbol_scores && typeof s.symbol_scores === "object" ? s.symbol_scores : {};
+  const symbolRows = Object.entries(symbolScores)
+    .map(([symbol, score]) => ({ symbol, score: Number(score) }))
+    .filter((row) => Number.isFinite(row.score))
+    .sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
+
+  if (symbolCountEl) {
+    symbolCountEl.textContent = symbolRows.length
+      ? `${symbolRows.length} symbol${symbolRows.length === 1 ? "" : "s"}`
+      : "No symbol scores";
+  }
+
+  if (symbolsEl) {
+    if (!symbolRows.length) {
+      symbolsEl.innerHTML = '<span class="empty">No per-symbol scores yet — starts when headlines mention tickers</span>';
+    } else {
+      symbolsEl.innerHTML = `<table class="data sentiment-symbol-table">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th class="col-num">Score</th>
+            <th>Bias</th>
+          </tr>
+        </thead>
+        <tbody>${symbolRows.map((row) => {
+          const cls = sentimentScoreClass(row.score);
+          const bias = row.score > 0.15 ? "Bullish" : row.score < -0.15 ? "Bearish" : "Neutral";
+          const biasCls = row.score > 0.15 ? "positive" : row.score < -0.15 ? "negative" : "";
+          const scoreLabel = row.score >= 0 ? `+${row.score.toFixed(2)}` : row.score.toFixed(2);
+          return `<tr>
+            <td><strong class="mono">${escapeHtml(row.symbol)}</strong></td>
+            <td class="col-num"><span class="news-feed-score ${cls}">${scoreLabel}</span></td>
+            <td class="${biasCls}">${bias}</td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table>`;
+    }
+  }
+
+  const items = sortNewsLatestFirst(s.headlines || []).slice(0, 10);
+  if (headlineCountEl) {
+    headlineCountEl.textContent = items.length
+      ? `Top ${items.length} of ${s.headline_count ?? items.length}`
+      : "No headlines";
+  }
+
   if (headlines) {
-    const items = (s.headlines || []).slice(0, 4);
     if (!items.length) {
-      headlines.innerHTML = '<span class="empty">No headlines yet</span>';
+      headlines.innerHTML = '<span class="empty">No headlines yet — starts when the scanner runs</span>';
       return;
     }
-    headlines.innerHTML = items.map((h) => {
-      const score = Number(h.score);
-      const cls = score > 0.15 ? "up" : score < -0.15 ? "down" : "flat";
-      const url = h.url ? escapeHtml(h.url) : "";
-      const title = escapeHtml(h.title || "");
-      const titleHtml = url
-        ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${title}</a>`
-        : title;
-      return `<div class="headline-card">
-        <span class="headline-card-score ${cls}">${Number.isFinite(score) ? score.toFixed(2) : "—"}</span>
-        <div class="headline-card-body">
-          <div class="headline-card-source">${escapeHtml(h.source || "news")}</div>
-          <p class="headline-card-title">${titleHtml}</p>
-        </div>
-      </div>`;
-    }).join("");
+    headlines.innerHTML = `<table class="data news-table training-sentiment-headlines-table">
+      <thead>
+        <tr>
+          <th class="news-col-source">Source</th>
+          <th class="news-col-title">Headline</th>
+          <th>Symbols</th>
+          <th class="news-col-score">Score</th>
+          <th class="news-col-age">Age</th>
+        </tr>
+      </thead>
+      <tbody>${items.map(renderTrainingSentimentHeadlineRow).join("")}</tbody>
+    </table>`;
   }
 }
 
@@ -4012,6 +4119,231 @@ function initTelegramControls() {
   });
 }
 
+// ── Bot assistant (floating co-pilot) ─────────────────────────────────────────
+
+let botAssistantOpen = false;
+let botAssistantHistory = [];
+let botAssistantBusy = false;
+let botAssistantDidDrag = false;
+let botAssistantDrag = null;
+
+const BOT_ASSISTANT_WELCOME =
+  "Hi! I'm your Pump Chaser co-pilot. Ask me about scanner status, open positions, why trades are blocked, risk/pause state, sentiment, or training progress.";
+const BOT_ASSISTANT_POS_KEY = "bot-assistant-fab-left";
+const BOT_ASSISTANT_DRAG_THRESHOLD = 8;
+const BOT_ASSISTANT_EDGE_MARGIN = 12;
+const BOT_ASSISTANT_FAB_BOTTOM = 18;
+const BOT_ASSISTANT_PANEL_GAP = 14;
+
+function clampBotAssistantFabLeft(leftPx, fab) {
+  const w = fab?.offsetWidth || 58;
+  const max = Math.max(BOT_ASSISTANT_EDGE_MARGIN, window.innerWidth - w - BOT_ASSISTANT_EDGE_MARGIN);
+  return Math.min(Math.max(BOT_ASSISTANT_EDGE_MARGIN, leftPx), max);
+}
+
+function syncBotAssistantPanelPosition(fab, panel) {
+  if (!fab || !panel) return;
+  const margin = BOT_ASSISTANT_EDGE_MARGIN;
+  const fabLeft = fab.offsetLeft;
+  const panelW = panel.offsetWidth || Math.min(352, window.innerWidth - margin * 2);
+  let panelLeft = fabLeft;
+  if (panelLeft + panelW > window.innerWidth - margin) {
+    panelLeft = window.innerWidth - panelW - margin;
+  }
+  panelLeft = Math.max(margin, panelLeft);
+  panel.style.left = `${panelLeft}px`;
+  panel.style.right = "auto";
+  panel.style.bottom = `${BOT_ASSISTANT_FAB_BOTTOM + fab.offsetHeight + BOT_ASSISTANT_PANEL_GAP}px`;
+}
+
+function setBotAssistantFabLeft(fab, panel, leftPx, { save = false } = {}) {
+  if (!fab) return leftPx;
+  const clamped = clampBotAssistantFabLeft(leftPx, fab);
+  fab.style.left = `${clamped}px`;
+  fab.style.right = "auto";
+  fab.style.bottom = `${BOT_ASSISTANT_FAB_BOTTOM}px`;
+  syncBotAssistantPanelPosition(fab, panel);
+  if (save) {
+    try {
+      localStorage.setItem(BOT_ASSISTANT_POS_KEY, String(Math.round(clamped)));
+    } catch {
+      /* private mode */
+    }
+  }
+  return clamped;
+}
+
+function restoreBotAssistantPosition(fab, panel) {
+  if (!fab) return;
+  let left = BOT_ASSISTANT_EDGE_MARGIN;
+  try {
+    const saved = localStorage.getItem(BOT_ASSISTANT_POS_KEY);
+    if (saved != null && saved !== "") left = Number(saved);
+  } catch {
+    /* ignore */
+  }
+  if (!Number.isFinite(left)) left = BOT_ASSISTANT_EDGE_MARGIN;
+  requestAnimationFrame(() => setBotAssistantFabLeft(fab, panel, left, { save: false }));
+}
+
+function initBotAssistantDrag(fab, panel) {
+  const onPointerDown = (ev) => {
+    if (ev.button !== 0) return;
+    botAssistantDidDrag = false;
+    botAssistantDrag = {
+      pointerId: ev.pointerId,
+      startX: ev.clientX,
+      startLeft: fab.offsetLeft,
+    };
+    fab.classList.add("dragging");
+    fab.setPointerCapture(ev.pointerId);
+  };
+
+  const onPointerMove = (ev) => {
+    if (!botAssistantDrag || botAssistantDrag.pointerId !== ev.pointerId) return;
+    const dx = ev.clientX - botAssistantDrag.startX;
+    if (Math.abs(dx) > BOT_ASSISTANT_DRAG_THRESHOLD) botAssistantDidDrag = true;
+    if (!botAssistantDidDrag) return;
+    ev.preventDefault();
+    setBotAssistantFabLeft(fab, panel, botAssistantDrag.startLeft + dx, { save: false });
+  };
+
+  const onPointerEnd = (ev) => {
+    if (!botAssistantDrag || botAssistantDrag.pointerId !== ev.pointerId) return;
+    if (botAssistantDidDrag) {
+      setBotAssistantFabLeft(fab, panel, fab.offsetLeft, { save: true });
+    }
+    botAssistantDrag = null;
+    fab.classList.remove("dragging");
+    try {
+      fab.releasePointerCapture(ev.pointerId);
+    } catch {
+      /* already released */
+    }
+  };
+
+  fab.addEventListener("pointerdown", onPointerDown);
+  fab.addEventListener("pointermove", onPointerMove);
+  fab.addEventListener("pointerup", onPointerEnd);
+  fab.addEventListener("pointercancel", onPointerEnd);
+
+  window.addEventListener("resize", () => {
+    setBotAssistantFabLeft(fab, panel, fab.offsetLeft, { save: true });
+  });
+}
+
+function appendAssistantMessage(role, text, { pending = false } = {}) {
+  const list = $("#bot-assistant-messages");
+  if (!list) return null;
+  const el = document.createElement("div");
+  el.className = `bot-assistant-msg bot-assistant-msg-${role}${pending ? " pending" : ""}`;
+  el.innerHTML =
+    role === "assistant"
+      ? `<div class="bot-assistant-msg-avatar" aria-hidden="true">🤖</div><div class="bot-assistant-msg-body">${escapeHtml(text)}</div>`
+      : `<div class="bot-assistant-msg-body">${escapeHtml(text)}</div>`;
+  list.appendChild(el);
+  list.scrollTop = list.scrollHeight;
+  return el;
+}
+
+function setBotAssistantOpen(open) {
+  botAssistantOpen = open;
+  const panel = $("#bot-assistant-panel");
+  const fab = $("#bot-assistant-fab");
+  panel?.classList.toggle("hidden", !open);
+  panel?.setAttribute("aria-hidden", open ? "false" : "true");
+  fab?.setAttribute("aria-expanded", open ? "true" : "false");
+  fab?.classList.toggle("open", open);
+  if (open) {
+    const list = $("#bot-assistant-messages");
+    if (list && !list.children.length) {
+      appendAssistantMessage("assistant", BOT_ASSISTANT_WELCOME);
+    }
+    syncBotAssistantPanelPosition(fab, panel);
+    $("#bot-assistant-input")?.focus();
+  }
+}
+
+async function sendBotAssistantMessage(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed || botAssistantBusy) return;
+  const input = $("#bot-assistant-input");
+  const sendBtn = $("#bot-assistant-send");
+  botAssistantBusy = true;
+  if (input) input.disabled = true;
+  if (sendBtn) sendBtn.disabled = true;
+
+  appendAssistantMessage("user", trimmed);
+  botAssistantHistory.push({ role: "user", content: trimmed });
+  const pending = appendAssistantMessage("assistant", "Thinking…", { pending: true });
+
+  try {
+    const res = await apiPost("/assistant/chat", {
+      message: trimmed,
+      history: botAssistantHistory.slice(-10),
+    });
+    const reply = res.reply || "No reply.";
+    if (pending) {
+      pending.classList.remove("pending");
+      const body = pending.querySelector(".bot-assistant-msg-body");
+      if (body) body.textContent = reply;
+    }
+    botAssistantHistory.push({ role: "assistant", content: reply });
+    if (botAssistantHistory.length > 20) botAssistantHistory = botAssistantHistory.slice(-20);
+  } catch (e) {
+    if (pending) {
+      pending.classList.remove("pending");
+      const body = pending.querySelector(".bot-assistant-msg-body");
+      if (body) body.textContent = e.message || "Request failed.";
+    }
+  } finally {
+    botAssistantBusy = false;
+    if (input) {
+      input.disabled = false;
+      input.focus();
+    }
+    if (sendBtn) sendBtn.disabled = false;
+  }
+}
+
+function initBotAssistant() {
+  const fab = $("#bot-assistant-fab");
+  const panel = $("#bot-assistant-panel");
+  const closeBtn = $("#bot-assistant-close");
+  const form = $("#bot-assistant-form");
+  if (!fab || !panel) return;
+
+  restoreBotAssistantPosition(fab, panel);
+  initBotAssistantDrag(fab, panel);
+
+  fab.addEventListener("click", () => {
+    if (botAssistantDidDrag) {
+      botAssistantDidDrag = false;
+      return;
+    }
+    setBotAssistantOpen(panel.classList.contains("hidden"));
+  });
+  closeBtn?.addEventListener("click", () => setBotAssistantOpen(false));
+
+  form?.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const input = $("#bot-assistant-input");
+    const val = input?.value || "";
+    if (input) input.value = "";
+    sendBotAssistantMessage(val);
+  });
+
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && botAssistantOpen) setBotAssistantOpen(false);
+  });
+
+  document.addEventListener("click", (ev) => {
+    if (!botAssistantOpen) return;
+    if (ev.target.closest("#bot-assistant-panel") || ev.target.closest("#bot-assistant-fab")) return;
+    setBotAssistantOpen(false);
+  });
+}
+
 // ── Tauri in-app update banner ────────────────────────────────────────────────
 // Called by the Tauri desktop backend via win.eval(...) when a newer version is
 // available on GitHub Releases.  Works only when running inside the Tauri app;
@@ -4069,6 +4401,7 @@ async function init() {
   initTelegramControls();
   initDashboardMarketControls();
   initUpdateBanner();
+  initBotAssistant();
   await loadUserProfile();
   await refreshSnapshotHttp();
   await loadBalanceHistory();

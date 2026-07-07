@@ -662,6 +662,14 @@ pub async fn llm_regime_status(State(state): State<Arc<AppState>>) -> Json<Value
     Json(scanner.llm_regime_status().await)
 }
 
+pub async fn assistant_chat(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<crate::ai::AssistantChatRequest>,
+) -> Json<crate::ai::AssistantChatResponse> {
+    let config = state.config.clone();
+    Json(crate::ai::assistant::chat(state, config, body).await)
+}
+
 pub async fn sentiment_news(State(state): State<Arc<AppState>>, Query(q): Query<LimitQuery>) -> Json<Value> {
     let items = state.db.get_recent_news(q.limit).await.unwrap_or_default();
     Json(json!({ "items": items }))
@@ -1279,7 +1287,19 @@ pub async fn build_live_snapshot(state: Arc<AppState>) -> Value {
         }
     }
     let positions = scanner.get_open_positions_live().await;
-    let activity = state.db.get_trade_activity(15).await.unwrap_or_default();
+    let activity: Vec<Value> = state
+        .db
+        .get_trade_activity(10)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut row| {
+            if let Value::Object(ref mut m) = row {
+                m.remove("payload");
+            }
+            row
+        })
+        .collect();
     let activity_unread = state.db.count_unread_activity().await.unwrap_or(0);
     // Use scanner memory buffer — avoids a DB query on every 3 s UI snapshot tick.
     let signals = scanner.get_latest_signals(30).await;

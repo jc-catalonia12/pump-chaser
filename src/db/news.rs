@@ -35,7 +35,7 @@ impl Database {
     pub async fn get_recent_news(&self, limit: i64) -> Result<Vec<Value>> {
         let rows = sqlx::query(
             "SELECT source, title, url, score, symbols, published_at, created_at \
-             FROM news_items ORDER BY id DESC LIMIT ?",
+             FROM news_items ORDER BY published_at DESC, id DESC LIMIT ?",
         )
         .bind(limit)
         .fetch_all(self.pool())
