@@ -43,24 +43,22 @@ fn event_label(event_key: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// Human-readable label for a strategy id (`confluence`, `volume_pump`, …).
+/// Human-readable label for a strategy id (`ai`, plus legacy ids in old trade rows).
 fn fmt_strategy(strategy: &str) -> String {
-    match strategy {
-        "confluence" => "Confluence".into(),
-        "volume_pump" => "Volume Pump".into(),
-        "scalp" => "Scalp".into(),
-        other => other
-            .split('_')
-            .map(|w| {
-                let mut c = w.chars();
-                match c.next() {
-                    None => String::new(),
-                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
+    if strategy == "ai" {
+        return "AI".into();
     }
+    strategy
+        .split('_')
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Human-readable label for an exit/close reason string.
@@ -455,9 +453,8 @@ mod tests {
 
     #[test]
     fn fmt_strategy_labels() {
-        assert_eq!(fmt_strategy("confluence"), "Confluence");
+        assert_eq!(fmt_strategy("ai"), "AI");
         assert_eq!(fmt_strategy("volume_pump"), "Volume Pump");
-        assert_eq!(fmt_strategy("scalp"), "Scalp");
     }
 
     #[test]
@@ -465,12 +462,12 @@ mod tests {
         let details = json!({
             "symbol": "BILL_USDT",
             "side": "LONG",
-            "strategy": "volume_pump",
+            "strategy": "ai",
             "entry_price": 0.00123,
             "margin_usdt": 5.0,
         });
         let text = build_trade_message("position_opened", Some(&details));
-        assert!(text.contains("Volume Pump"));
+        assert!(text.contains("AI"));
         assert!(text.contains("Strategy"));
     }
 

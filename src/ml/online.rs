@@ -45,6 +45,20 @@ pub struct OnlineModelState {
     /// Stored feature dimension so we can detect model/code mismatch on load.
     #[serde(default)]
     pub feature_dim: usize,
+    /// Platt scaling: calibrated = sigmoid(platt_a * raw_logit + platt_b)
+    #[serde(default)]
+    pub platt_a: f64,
+    #[serde(default = "default_platt_b")]
+    pub platt_b: f64,
+    /// Rolling average R on wins for EV thresholding.
+    #[serde(default)]
+    pub avg_win_r: f64,
+    #[serde(default)]
+    pub avg_loss_r: f64,
+}
+
+fn default_platt_b() -> f64 {
+    0.0
 }
 
 impl Default for OnlineModelState {
@@ -63,6 +77,10 @@ impl Default for OnlineModelState {
             l2: DEFAULT_L2,
             updated_at: String::new(),
             feature_dim: FEATURE_DIM,
+            platt_a: 1.0,
+            platt_b: 0.0,
+            avg_win_r: 1.0,
+            avg_loss_r: 1.0,
         }
     }
 }
@@ -146,12 +164,96 @@ impl OnlineClassifier {
 
     /// Predict win probability for a raw (un-standardized) feature vector.
     pub fn predict_proba(&self, raw: &[f64]) -> f64 {
+        self.calibrated_proba(self.raw_logit(raw))
+    }
+
+    fn raw_logit(&self, raw: &[f64]) -> f64 {
         let z = self.standardize(raw);
         let mut acc = self.state.bias;
         for i in 0..FEATURE_DIM {
             acc += self.state.weights[i] * z[i];
         }
-        sigmoid(acc)
+        acc
+    }
+
+    /// Calibrated probability via Platt scaling on the raw logit.
+    pub fn calibrated_proba(&self, raw_logit: f64) -> f64 {
+        let a = if self.state.platt_a.abs() < 1e-9 {
+            1.0
+        } else {
+            self.state.platt_a
+        };
+        sigmoid(a * raw_logit + self.state.platt_b)
+    }
+
+    /// Re-fit Platt scaling on recent hard-label outcomes (every 50 samples).
+    fn maybe_refit_platt(&mut self) {
+        if self.state.recent_outcomes.len() < 30 {
+            return;
+        }
+        if self.state.samples % 50 != 0 {
+            return;
+        }
+        let mut logits = Vec::new();
+        let mut labels = Vec::new();
+        for &[proba, label] in &self.state.recent_outcomes {
+            if label >= 0.9 || label <= 0.1 {
+                let p = proba.clamp(1e-6, 1.0 - 1e-6);
+                let logit = (p / (1.0 - p)).ln();
+                logits.push(logit);
+                labels.push(if label >= 0.5 { 1.0 } else { 0.0 });
+            }
+        }
+        if logits.len() < 20 {
+            return;
+        }
+        let mut a = self.state.platt_a.max(0.1);
+        let mut b = self.state.platt_b;
+        for _ in 0..80 {
+            let mut grad_a = 0.0;
+            let mut grad_b = 0.0;
+            for (&logit, &y) in logits.iter().zip(labels.iter()) {
+                let p = sigmoid(a * logit + b);
+                let err = p - y;
+                grad_a += err * logit;
+                grad_b += err;
+            }
+            let n = logits.len() as f64;
+            a -= 0.05 * grad_a / n;
+            b -= 0.05 * grad_b / n;
+        }
+        self.state.platt_a = a.clamp(0.1, 5.0);
+        self.state.platt_b = b.clamp(-3.0, 3.0);
+    }
+
+    /// Track rolling R-multiples for EV-based threshold selection.
+    pub fn record_r_outcome(&mut self, r_multiple: f64, won: bool) {
+        let alpha = 0.05;
+        if won && r_multiple > 0.0 {
+            self.state.avg_win_r = (1.0 - alpha) * self.state.avg_win_r + alpha * r_multiple;
+        } else if !won {
+            let loss_r = r_multiple.abs().max(0.5);
+            self.state.avg_loss_r = (1.0 - alpha) * self.state.avg_loss_r + alpha * loss_r;
+        }
+    }
+
+    /// Auto threshold maximizing expected value: p * avg_win_r - (1-p) * avg_loss_r.
+    pub fn auto_threshold(&self, floor: f64) -> f64 {
+        let win_r = self.state.avg_win_r.max(0.1);
+        let loss_r = self.state.avg_loss_r.max(0.1);
+        let ev_thresh = loss_r / (win_r + loss_r);
+        ev_thresh.clamp(floor, 0.85)
+    }
+
+    /// Rolling average R-multiple realized on winning trades (floored at 0.1
+    /// so downstream Kelly-fraction math never divides by ~zero).
+    pub fn avg_win_r(&self) -> f64 {
+        self.state.avg_win_r.max(0.1)
+    }
+
+    /// Rolling average R-multiple magnitude realized on losing trades.
+    pub fn avg_loss_r(&self) -> f64 {
+        self.state.avg_loss_r.max(0.1)
     }
 
     /// Online update — binary label. Convenience wrapper around `update_soft`.
@@ -191,7 +293,7 @@ impl OnlineClassifier {
         for i in 0..FEATURE_DIM {
             acc += self.state.weights[i] * z[i];
         }
-        let proba = sigmoid(acc);
+        let proba = self.calibrated_proba(acc);
 
         // 3. Track rolling (proba, label) pairs for threshold-aware accuracy.
         self.state.recent_outcomes.push([proba, label]);
@@ -218,6 +320,7 @@ impl OnlineClassifier {
             self.state.losses += 1;
         }
         self.state.updated_at = chrono::Utc::now().to_rfc3339();
+        self.maybe_refit_platt();
 
         self.save();
         proba
@@ -290,6 +393,10 @@ impl OnlineClassifier {
             "ready": self.is_ready(min_samples),
             "min_samples": min_samples,
             "learning_rate": self.state.lr,
+            "platt_a": round4(self.state.platt_a),
+            "platt_b": round4(self.state.platt_b),
+            "avg_win_r": round4(self.state.avg_win_r),
+            "avg_loss_r": round4(self.state.avg_loss_r),
             "updated_at": self.state.updated_at,
         })
     }

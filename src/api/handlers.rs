@@ -77,7 +77,6 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "exchanges": exchanges,
         "user_data_dir": cfg.storage.sqlite_path,
         "trading_mode": cfg.trading.mode,
-        "scalp_enabled": cfg.scalp.enabled,
         "watchlist": scanner.get_watchlist_settings().await,
     });
     if let (Some(b), Some(m)) = (body.as_object_mut(), crate::version::build_metadata().as_object()) {
@@ -211,16 +210,18 @@ pub async fn wallet(State(state): State<Arc<AppState>>) -> Json<Value> {
             state.db.clone(),
             secrets.clone(),
         );
-        if let Ok(balance) = live.get_wallet_balance().await {
-            let wallet_equity = balance.anchor_equity();
-            return Json(json!({
-                "currency": "USDT",
-                "equity": wallet_equity,
-                "available": balance.available,
-                "source": "live",
-                "paper_trading": secrets.paper_trading,
-                "live_trading": live.is_live(),
-            }));
+        if live.is_live() {
+            if let Ok(balance) = live.get_wallet_balance().await {
+                let wallet_equity = balance.anchor_equity();
+                return Json(json!({
+                    "currency": "USDT",
+                    "equity": wallet_equity,
+                    "available": balance.available,
+                    "source": "live",
+                    "paper_trading": secrets.paper_trading,
+                    "live_trading": true,
+                }));
+            }
         }
     }
 
@@ -337,8 +338,10 @@ pub async fn signals_chart(
     let cfg = cfg(&state).await;
     let interval = cfg.scanner.kline_interval.clone();
     let bars_n = q.bars.clamp(30, 500) as usize;
-    let scanner = state.scanner.read().await;
-    let cached = scanner.get_symbol_klines(symbol).await;
+    let cached = {
+        let scanner = state.scanner.read().await;
+        scanner.get_symbol_klines(symbol).await
+    };
     let exchange = match crate::exchange::MexcClient::new(state.config.clone()) {
         Ok(c) => c,
         Err(e) => return Json(json!({ "error": e.to_string() })),
@@ -353,7 +356,8 @@ pub async fn signals_chart(
 
     // Anchor klines from before the signal so entry/exit markers stay visible.
     let lookback_sec = 30 * 60_i64;
-    let start_ts = crate::charts::parse_signal_start_ts(&signal).unwrap_or(0) - lookback_sec;
+    let raw_start = crate::charts::parse_signal_start_ts(&signal).unwrap_or(0) - lookback_sec;
+    let start_ts = crate::charts::clamp_chart_start_ts(raw_start, bars_n, &interval);
     let kline_bars = if start_ts > 0 {
         crate::charts::load_chart_bars_from_time(
             &exchange,
@@ -399,7 +403,7 @@ pub async fn signals_chart(
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0)
                     > 0.0;
-                let max_hold = cfg.confluence.max_hold_sec as i64;
+                let max_hold = cfg.trading.max_hold_sec as i64;
                 if entry > 0.0 && sl > 0.0 && tp > 0.0 {
                     if let Some(exit) = crate::charts::resolve_signal_exit_from_bars(
                         &kline_bars,
@@ -557,12 +561,12 @@ pub async fn position_chart(
         .unwrap_or_else(|| cfg.scanner.kline_interval.clone());
     let bars_n = q.bars.clamp(30, 500) as usize;
 
-    let scanner = state.scanner.read().await;
-    // Prefer live-enriched position (mark, unrealized PnL); fall back to DB row.
-    let position = scanner
-        .get_position_live(position_id)
-        .await
-        .unwrap_or(db_pos);
+    let (cached, position) = {
+        let scanner = state.scanner.read().await;
+        let cached = scanner.get_symbol_klines(&symbol).await;
+        let position = scanner.enrich_position_for_chart(db_pos).await;
+        (cached, position)
+    };
 
     let signal = if let Some(sig_id) = position.get("signal_id").and_then(|v| v.as_i64()) {
         state.db.get_signal_by_id(sig_id).await.ok().flatten()
@@ -570,7 +574,6 @@ pub async fn position_chart(
         None
     };
 
-    let cached = scanner.get_symbol_klines(&symbol).await;
     let exchange = match crate::exchange::MexcClient::new(state.config.clone()) {
         Ok(c) => c,
         Err(e) => return Json(json!({ "error": e.to_string() })),
@@ -647,6 +650,32 @@ pub async fn learning_status(State(state): State<Arc<AppState>>) -> Json<Value> 
 pub async fn learning_reload(State(state): State<Arc<AppState>>) -> Json<Value> {
     let scanner = state.scanner.read().await;
     Json(scanner.reload_learning_params().await)
+}
+
+pub async fn sentiment_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let scanner = state.scanner.read().await;
+    Json(scanner.sentiment_status().await)
+}
+
+pub async fn llm_regime_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let scanner = state.scanner.read().await;
+    Json(scanner.llm_regime_status().await)
+}
+
+pub async fn sentiment_news(State(state): State<Arc<AppState>>, Query(q): Query<LimitQuery>) -> Json<Value> {
+    let items = state.db.get_recent_news(q.limit).await.unwrap_or_default();
+    Json(json!({ "items": items }))
+}
+
+pub async fn tuner_history(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let scanner = state.scanner.read().await;
+    Json(scanner.param_evolution_history().await)
+}
+
+pub async fn promotion_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let metrics = state.db.promotion_metrics().await.unwrap_or(json!({}));
+    let overlay = state.db.get_strategy_overlay().await.unwrap_or(json!({}));
+    Json(json!({ "metrics": metrics, "param_overlay": overlay }))
 }
 
 pub async fn audit(State(state): State<Arc<AppState>>, Query(q): Query<LimitQuery>) -> Json<Value> {
@@ -727,6 +756,14 @@ pub async fn kill_switch_deactivate(State(state): State<Arc<AppState>>) -> Json<
     Json(scanner.deactivate_kill_switch().await)
 }
 
+pub async fn circuit_breaker_reset(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let mut risk = state.risk.write().await;
+    match risk.reset_circuit_breaker().await {
+        Ok(()) => Json(json!({ "ok": true, "message": "Circuit breaker reset — trading resumed" })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
 // --- Settings ---
 
 pub async fn user_settings_get(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -744,9 +781,9 @@ pub async fn user_settings_put(
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let patch = body.get("values").cloned().unwrap_or(body);
-    let prev_mexc = {
+    let (prev_mexc, prev_paper_equity) = {
         let cfg = state.config.read().unwrap().clone();
-        cfg.mexc.clone()
+        (cfg.mexc.clone(), cfg.execution.paper_initial_equity)
     };
     let mut updated = {
         let cfg = state.config.read().unwrap().clone();
@@ -766,12 +803,42 @@ pub async fn user_settings_put(
         let scanner = state.scanner.read().await;
         scanner.on_config_updated(prev_mexc).await;
     }
+
+    let new_paper_equity = updated.execution.paper_initial_equity;
+    let paper_equity_applied = if (new_paper_equity - prev_paper_equity).abs() > 0.001 {
+        let secrets = state.secrets.read().await;
+        let paper_mode = secrets.paper_trading || !updated.execution.live_trading_enabled;
+        drop(secrets);
+        if paper_mode {
+            let open = state.db.count_open_positions().await.unwrap_or(0);
+            if open == 0 {
+                let mut risk = state.risk.write().await;
+                match risk.reset_paper_equity(new_paper_equity).await {
+                    Ok(()) => true,
+                    Err(exc) => {
+                        tracing::warn!(error = %exc, "failed to apply paper starting equity after settings save");
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     Json(json!({
         "ok": true,
         "config_path": settings_file_path().display().to_string(),
         "values": user_settings_values(&updated),
         "live_trading_enabled": updated.execution.live_trading_enabled,
         "applied_live": true,
+        "paper_equity_applied": paper_equity_applied,
+        "paper_equity_blocked_open_positions": !paper_equity_applied
+            && (new_paper_equity - prev_paper_equity).abs() > 0.001,
         "scanner_restart_recommended": false,
     }))
 }
@@ -938,7 +1005,7 @@ pub async fn ml_history(State(state): State<Arc<AppState>>) -> Json<Value> {
             "shadow_ml_reject_weight": cfg.learning.shadow_ml_reject_weight,
             "shadow_near_miss_weight": cfg.learning.shadow_near_miss_weight,
         },
-        "feature_columns": crate::ml::features::FEATURE_COLUMNS,
+        "feature_columns": crate::ml::features::FEATURE_COLUMNS.as_slice(),
     }))
 }
 
@@ -1097,6 +1164,35 @@ pub async fn backtest(
     Json(crate::backtest::Backtester::new().run_json(&signals, ml_threshold, fee_pct, risk_pct))
 }
 
+/// Phase 6 pre-live gate: replay stored resolved signals through the Phase 5
+/// decision engine (neutral regime) and evaluate the paper-acceptance gates.
+/// `passed == true` means the strategy has cleared every configured minimum.
+pub async fn backtest_acceptance(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let cfg = cfg(&state).await;
+    let fee_pct = body.get("fee_pct").and_then(|v| v.as_f64()).unwrap_or(0.001);
+    let risk_pct = body
+        .get("risk_pct")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(cfg.risk.max_risk_per_trade);
+    let limit = body.get("limit").and_then(|v| v.as_i64()).unwrap_or(2000);
+
+    let signals = match state.db.get_resolved_signals_with_features(limit).await {
+        Ok(s) => s,
+        Err(e) => return Json(json!({ "error": e.to_string() })),
+    };
+    let metrics =
+        crate::backtest::Backtester::new().run_decision_json(&signals, &cfg.decision, fee_pct, risk_pct);
+    let acceptance = crate::backtest::acceptance_gate(&metrics, &cfg.backtest);
+    Json(json!({
+        "metrics": metrics,
+        "acceptance": acceptance,
+        "live_trading_enabled": cfg.execution.live_trading_enabled,
+    }))
+}
+
 pub async fn walk_forward(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -1171,11 +1267,13 @@ pub async fn live_snapshot(State(state): State<Arc<AppState>>) -> Json<Value> {
             state.db.clone(),
             secrets.clone(),
         );
-        if let Ok(balance) = live.get_wallet_balance().await {
-            let wallet_equity = balance.anchor_equity();
-            wallet["equity"] = json!(wallet_equity);
-            wallet["available"] = json!(balance.available);
-            wallet["source"] = json!("live");
+        if live.is_live() {
+            if let Ok(balance) = live.get_wallet_balance().await {
+                let wallet_equity = balance.anchor_equity();
+                wallet["equity"] = json!(wallet_equity);
+                wallet["available"] = json!(balance.available);
+                wallet["source"] = json!("live");
+            }
         }
     }
     let positions = scanner.get_open_positions_live().await;

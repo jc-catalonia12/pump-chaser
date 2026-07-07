@@ -1,6 +1,6 @@
 [package]
 name = "mexc-trading-bot-desktop"
-version = "0.1.6"
+version = "0.1.7"
 description = "MEXC Trading Bot — Tauri desktop shell"
 edition = "2021"
 rust-version = "1.85"
@@ -11,6 +11,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 mexc-trading-bot = { path = "../.." }
 tauri = { version = "2", features = [] }
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 url = "2"
 

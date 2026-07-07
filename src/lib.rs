@@ -4,6 +4,7 @@
 //! Rust handles scanner, risk, signals, execution, and API;
 //! Python ML training remains optional via PyO3 (`ml-python` feature).
 
+pub mod ai;
 pub mod api;
 pub mod app_state;
 pub mod backtest;
@@ -18,6 +19,7 @@ pub mod ml;
 pub mod models;
 pub mod risk;
 pub mod scanner;
+pub mod sentiment;
 pub mod server;
 pub mod signals;
 pub mod user_settings;

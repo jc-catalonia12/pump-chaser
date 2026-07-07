@@ -19,6 +19,13 @@ const $$ = (sel) => document.querySelectorAll(sel);
 let ws = null;
 let wsReconnectTimer = null;
 let pollTimer = null;
+let marketPollTimer = null;
+let dashboardNewsItems = [];
+let dashboardNewsPage = 0;
+let dashboardNewsAutoTimer = null;
+const DASHBOARD_NEWS_PER_PAGE = 1;
+const DASHBOARD_NEWS_AUTO_MS = 7000;
+const NEWS_TABLE_PER_PAGE = 8;
 let pnlDailyChart = null;
 let pnlCumChart = null;
 let balanceHistoryChart = null;
@@ -41,10 +48,9 @@ function pnlClass(n) {
 
 function fmtStrategyLabel(strategy) {
   const s = (strategy || "").toLowerCase();
-  if (s === "confluence") return "Confluence";
-  if (s === "volume_pump") return "Volume Pump";
-  if (s === "scalp") return "Scalp";
+  if (s === "ai") return "AI";
   if (!s) return "—";
+  // Legacy strategy ids from old trade rows fall through to title case.
   return s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
@@ -256,7 +262,7 @@ function toastFromEvent(event) {
   if (type === "signal") {
     const sym = symbol || symbolFromTradeMessage(event.message);
     return {
-      title: "Confluence Signal",
+      title: "Signal",
       message: sym || event.message || "New setup",
       tone: "accent",
       iconType: "signal",
@@ -371,7 +377,7 @@ function isToastEventEnabled(event) {
   if (!TOAST_TRADE_TYPES.has(type)) return false;
   const pref = toastPreferenceKey(event);
   if (!DEFAULT_TOAST_EVENT_KEYS.includes(pref)) {
-    // Strategy signals (confluence / volume pump) — always toast when enabled globally.
+    // Strategy signals — always toast when enabled globally.
     return true;
   }
   return toastEventKeys.has(pref);
@@ -433,10 +439,14 @@ function maybeToastNewEvents(events) {
     })
     .sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
 
-  fresh.forEach((e) => {
-    const spec = toastFromEvent(e);
-    if (spec) showTradeToast(spec);
-  });
+  // If the window was hidden (minimised) we skip toasts for accumulated events
+  // to avoid a flood of notifications on restore. The badge still updates.
+  if (!document.hidden) {
+    fresh.forEach((e) => {
+      const spec = toastFromEvent(e);
+      if (spec) showTradeToast(spec);
+    });
+  }
 
   if (maxId > lastToastEventId) lastToastEventId = maxId;
 }
@@ -736,13 +746,16 @@ async function saveSettings() {
     const res = await apiPut("/config/settings", { values: patch });
     if (res.error) throw new Error(res.error);
     settingsValues = res.values || settingsValues;
-    showFeedback(
-      fb,
-      res.scanner_restart_recommended
-        ? "Saved. Restart the scanner if you changed MEXC API URLs."
-        : "Settings saved and applied live.",
-      true,
-    );
+    let msg = res.scanner_restart_recommended
+      ? "Saved. Restart the scanner if you changed MEXC API URLs."
+      : "Settings saved and applied live.";
+    if (res.paper_equity_applied) {
+      msg = "Settings saved. Paper equity updated to your new starting value.";
+    } else if (res.paper_equity_blocked_open_positions) {
+      msg =
+        "Settings saved. Close open paper positions before changing starting equity.";
+    }
+    showFeedback(fb, msg, true);
     if (res.live_trading_enabled != null) {
       liveTradingEnabled = !!res.live_trading_enabled;
     }
@@ -780,55 +793,66 @@ function renderMetrics(snapshot) {
   const health = snapshot.health || {};
   const wallet = snapshot.wallet || {};
 
-  const equity = wallet.equity ?? risk.equity;
-  if (equity != null && !Number.isNaN(Number(equity))) {
-    latestEquity = Number(equity);
+  const baseEquity = wallet.equity ?? risk.equity;
+  if (baseEquity != null && !Number.isNaN(Number(baseEquity))) {
+    latestEquity = Number(baseEquity);
   }
-  const daily = risk.daily_pnl;
-  const dailyPct = risk.daily_pnl_pct;
+
+  // Sum unrealized P&L from all open positions to show live equity & daily P&L.
+  const openPositions = snapshot.positions || [];
+  let totalUnrealized = 0;
+  for (const p of openPositions) {
+    totalUnrealized += Number(p.unrealized_pnl || 0);
+  }
+  const equity = baseEquity != null ? Number(baseEquity) + totalUnrealized : baseEquity;
+
+  const realizedDaily = Number(risk.daily_pnl ?? 0);
+  const daily = realizedDaily + totalUnrealized;
+  const equityBase = Number(baseEquity ?? risk.equity ?? 0) || 1;
+  const dailyPct = (daily / equityBase) * 100;
+
   const liveMode = !!health.live_trading;
   const dryRun = !!health.dry_run;
   const ordersLive = !!health.exchange_orders_enabled;
 
-  $("#hdr-equity").textContent = fmtUsd(equity);
+  const hdrEquity = $("#hdr-equity");
+  hdrEquity.textContent = fmtUsd(equity);
+  if (totalUnrealized !== 0) {
+    hdrEquity.title = `Base: ${fmtUsd(baseEquity)}  |  Unrealized: ${totalUnrealized > 0 ? "+" : ""}${fmtUsd(totalUnrealized)}`;
+  } else {
+    hdrEquity.title = "";
+  }
 
   const hdrDaily = $("#hdr-daily-pnl");
   hdrDaily.textContent = `${fmtUsd(daily)} (${fmtPct(dailyPct)})`;
   hdrDaily.className = "hmetric-value mono" + pnlClass(daily);
 
   const maxPos = risk.max_positions ?? 5;
-  const openConf = risk.open_confluence_positions ?? 0;
-  const maxConf = risk.max_confluence_positions ?? 1;
-  const openPump = risk.open_volume_pump_positions ?? 0;
-  const maxPump = risk.max_volume_pump_positions ?? 1;
   const posText = `${risk.open_positions ?? 0} / ${maxPos}`;
   $("#m-positions").textContent = posText;
   $("#hdr-positions").textContent = posText;
   const slotsEl = $("#m-positions-slots");
   if (slotsEl) {
-    slotsEl.textContent = `Conf ${openConf}/${maxConf} · Pump ${openPump}/${maxPump}`;
+    slotsEl.textContent = "";
   }
 
-  // Aggregate unrealized PnL across the open positions in the snapshot, plus a
-  // blended ROI% (total PnL relative to total margin used).
-  const openPositions = snapshot.positions || [];
+  // Aggregate unrealized PnL across the open positions (openPositions already
+  // computed above for header equity), plus a blended ROI% for the widget.
   const pnlEl = $("#m-positions-pnl");
   if (pnlEl) {
     if (openPositions.length) {
-      let totalPnl = 0;
       let totalMargin = 0;
       for (const p of openPositions) {
-        totalPnl += Number(p.unrealized_pnl || 0);
         const csize = Number(p.contract_size || 1) || 1;
         const sz = Number(p.remaining_size ?? p.size ?? 0) * csize;
         const entry = Number(p.entry_price || 0);
         const lev = Number(p.leverage || 1) || 1;
         totalMargin += (entry * sz) / lev;
       }
-      const totalPct = totalMargin > 0 ? (totalPnl / totalMargin) * 100 : 0;
-      const sign = totalPnl > 0 ? "+" : totalPnl < 0 ? "-" : "";
-      pnlEl.textContent = `${sign}${fmtUsd(Math.abs(totalPnl))} (${totalPct > 0 ? "+" : ""}${totalPct.toFixed(2)}%)`;
-      pnlEl.className = "kpi-sub mono" + pnlClass(totalPnl);
+      const totalPct = totalMargin > 0 ? (totalUnrealized / totalMargin) * 100 : 0;
+      const sign = totalUnrealized > 0 ? "+" : totalUnrealized < 0 ? "-" : "";
+      pnlEl.textContent = `${sign}${fmtUsd(Math.abs(totalUnrealized))} (${totalPct > 0 ? "+" : ""}${totalPct.toFixed(2)}%)`;
+      pnlEl.className = "kpi-sub mono" + pnlClass(totalUnrealized);
     } else {
       pnlEl.textContent = "—";
       pnlEl.className = "kpi-sub mono";
@@ -858,7 +882,7 @@ function renderMetrics(snapshot) {
   const consec = risk.consecutive_losses || 0;
   $("#m-drawdown").textContent = consec > 0 ? `${ddBase} · ${consec}L streak` : ddBase;
 
-  const strategy = health.trading_mode || "confluence";
+  const strategy = health.trading_mode || "ai";
   let modeLabel = liveMode ? "Live" : "Paper";
   if (liveMode && dryRun) modeLabel = "Live · Dry run";
   else if (liveMode && ordersLive) modeLabel = "Live";
@@ -879,7 +903,7 @@ function renderMetrics(snapshot) {
     }
   }
 
-  $("#hdr-strategy").textContent = strategy;
+  $("#hdr-strategy").textContent = fmtStrategyLabel(strategy);
   const hdrMode = $("#hdr-mode");
   if (hdrMode) {
     hdrMode.textContent = modeLabel;
@@ -896,6 +920,12 @@ function renderMetrics(snapshot) {
 
   $("#btn-start").disabled = !!health.scanner_running && !risk.kill_switch;
   $("#btn-stop").disabled = !health.scanner_running;
+
+  // Show "Reset Circuit Breaker" button only while the circuit breaker is active.
+  const cbBtn = $("#btn-reset-circuit-breaker");
+  if (cbBtn) {
+    cbBtn.classList.toggle("hidden", !risk.circuit_breaker_active);
+  }
 }
 
 function renderActivity(events, unreadCount) {
@@ -1071,14 +1101,25 @@ function renderSignalsTable(container, signals, { limit, page, pageSize, clickab
 
   container.classList.remove("empty");
   const tableClass = timeCompact ? "data signals-preview-table" : "data";
+  const fmtEv = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || v == null) return "—";
+    const cls = n > 0 ? "positive" : n < 0 ? "negative" : "";
+    return `<span class="mono ${cls}">${n >= 0 ? "+" : ""}${n.toFixed(2)}R</span>`;
+  };
+  const fmtRr = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) && v != null && n > 0 ? `<span class="mono">${n.toFixed(2)}</span>` : "—";
+  };
   container.innerHTML = `
     <table class="${tableClass}">
       <thead>
         <tr>
           <th>Symbol</th>
           <th>Score</th>
-          <th>Strategy</th>
           <th>ML %</th>
+          <th title="Decision-engine expected value (R multiples)">EV</th>
+          <th title="Reward : risk at signal time">R:R</th>
           <th>Outcome</th>
           <th class="col-time">Time</th>
           ${clickable ? "<th></th>" : ""}
@@ -1091,15 +1132,17 @@ function renderSignalsTable(container, signals, { limit, page, pageSize, clickab
             const timeLabel = timeCompact ? fmtManilaTime(at) : fmtManilaDateTime(at);
             const timeTitle = timeCompact ? fmtManilaDateTime(at) : "";
             const rowClass = clickable ? 'class="clickable"' : "";
+            const reason = s.decision_reason ? escapeHtml(s.decision_reason) : "";
             const data = clickable
               ? `data-symbol="${s.symbol}" data-generated-at="${at}"`
               : "";
             return `
-          <tr ${rowClass} ${data}>
+          <tr ${rowClass} ${data}${reason ? ` title="${reason}"` : ""}>
             <td><strong>${s.symbol || "—"}</strong></td>
             <td>${scoreBar(signalScore(s))}</td>
-            <td><span class="tag">${s.strategy || "—"}</span></td>
             <td>${s.setup_probability_pct != null ? `<span class="mono">${s.setup_probability_pct}%</span>` : "—"}</td>
+            <td>${fmtEv(s.expected_value_r)}</td>
+            <td>${fmtRr(s.reward_risk)}</td>
             <td class="${outcomeClass(s.outcome)}">${s.outcome || "pending"}</td>
             <td class="mono col-time"${timeTitle ? ` title="${timeTitle}"` : ""}>${timeLabel}</td>
             ${clickable ? '<td><button type="button" class="btn btn-sm btn-ghost">Chart</button></td>' : ""}
@@ -1291,16 +1334,28 @@ function renderPositionsHistoryTable(container, positions) {
     </table>`;
 }
 
+// Debounce applySnapshot so a burst of WS messages or HTTP poll catch-up
+// ticks (e.g. after unminimising) collapses into a single DOM update.
+let _applySnapshotTimer = null;
+let _pendingSnapshot = null;
 function applySnapshot(snapshot) {
   if (!snapshot || snapshot.error) return;
-  renderMetrics(snapshot);
-  setStatusPill(snapshot.health, snapshot.risk);
-  syncTradingModeUI(snapshot.health || {});
-  renderActivity(snapshot.activity, snapshot.activity_unread);
-  renderLiveScan(snapshot.scan_events, snapshot.health, snapshot.signals);
-  renderSignalsTable($("#trading-signals-preview"), snapshot.signals, { limit: 8, timeCompact: true });
-  syncOpenPositions(snapshot.positions);
-  $("#last-updated").textContent = fmtManilaTime(new Date());
+  _pendingSnapshot = snapshot;
+  if (_applySnapshotTimer) return; // already scheduled
+  _applySnapshotTimer = requestAnimationFrame(() => {
+    _applySnapshotTimer = null;
+    const snap = _pendingSnapshot;
+    _pendingSnapshot = null;
+    if (!snap) return;
+    renderMetrics(snap);
+    setStatusPill(snap.health, snap.risk);
+    syncTradingModeUI(snap.health || {});
+    renderActivity(snap.activity, snap.activity_unread);
+    renderLiveScan(snap.scan_events, snap.health, snap.signals);
+    renderSignalsTable($("#trading-signals-preview"), snap.signals, { limit: 8, timeCompact: true });
+    syncOpenPositions(snap.positions);
+    $("#last-updated").textContent = fmtManilaTime(new Date());
+  });
 }
 
 let lastPositionsSig = null;
@@ -1435,7 +1490,10 @@ function renderCredentialsState(creds = {}, hasCreds = false) {
   }
 }
 
+let snapshotFetchInFlight = false;
 async function refreshSnapshotHttp() {
+  if (snapshotFetchInFlight) return;
+  snapshotFetchInFlight = true;
   try {
     const data = await apiGet("/live/snapshot");
     applySnapshot(data);
@@ -1443,6 +1501,8 @@ async function refreshSnapshotHttp() {
   } catch {
     setWsUi(false);
     setStatusPill({ error: true });
+  } finally {
+    snapshotFetchInFlight = false;
   }
 }
 
@@ -1459,7 +1519,13 @@ function setWsUi(connected) {
 }
 
 function connectWebSocket() {
+  // Cancel any pending reconnect before starting a new connection.
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
   if (ws) {
+    ws.onclose = null; // suppress the onclose reconnect for this intentional close
     ws.close();
     ws = null;
   }
@@ -1467,6 +1533,7 @@ function connectWebSocket() {
   ws = new WebSocket(`${proto}//${window.location.host}/ws`);
   ws.onopen = () => setWsUi(true);
   ws.onmessage = (ev) => {
+    if (document.hidden) return; // don't process WS messages while minimised
     try {
       applySnapshot(JSON.parse(ev.data));
       setWsUi(true);
@@ -1485,9 +1552,24 @@ function connectWebSocket() {
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(() => {
+    if (document.hidden) return;
     if ($("#auto-refresh")?.checked) refreshSnapshotHttp();
   }, 2000);
+  if (marketPollTimer) clearInterval(marketPollTimer);
+  marketPollTimer = setInterval(() => {
+    if (document.hidden) return;
+    if ($("#panel-trading")?.classList.contains("active")) loadDashboardMarket();
+  }, 60000);
 }
+
+// When the window is restored after being minimised/hidden for a while,
+// do exactly one refresh instead of a burst of throttled interval catch-up.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    // Small delay so the Tauri webview has finished painting before we hit the network.
+    setTimeout(() => refreshSnapshotHttp(), 200);
+  }
+});
 
 // Live candle refresh for the open Overlay chart (TradingView streams on its own).
 const CHART_REFRESH_MS = 5000;
@@ -1749,14 +1831,20 @@ async function loadReadinessTab() {
     const killOn = !!risk.kill_switch;
     const paused = !!risk.trading_paused;
 
+    // Aggregate setup stats across all strategy rows (legacy rows + "ai").
     const strategies = statsResp.strategies || [];
-    const conf = strategies.find((s) => (s.strategy || "").toLowerCase() === "confluence") || {};
-    const confSetupResolved = Number(conf.total_resolved || conf.resolved || 0);
-    const confSetupWinRate = Number(conf.win_rate || 0);
-    const confTrade = learning.confluence_trade_stats || {};
-    const confTradeCount = Number(confTrade.total || confTrade.total_trades || 0);
-    const confTradeWinRate = Number(confTrade.win_rate || 0);
-    const confProfitFactor = Number(confTrade.profit_factor || 0);
+    let setupResolved = 0;
+    let setupWins = 0;
+    for (const s of strategies) {
+      const resolved = Number(s.total_resolved || s.resolved || 0);
+      setupResolved += resolved;
+      setupWins += Number(s.wins ?? resolved * Number(s.win_rate || 0));
+    }
+    const setupWinRate = setupResolved > 0 ? setupWins / setupResolved : 0;
+    const trade = learning.trade_stats || {};
+    const tradeCount = Number(trade.total || trade.total_trades || 0);
+    const tradeWinRate = Number(trade.win_rate || 0);
+    const profitFactor = Number(trade.profit_factor || 0);
     const dailyPnlUsd = Number(risk.daily_pnl || 0);
     const dailyPnlPct = Number(risk.daily_pnl_pct || 0);
 
@@ -1767,24 +1855,24 @@ async function loadReadinessTab() {
         `scanner=${scannerOn ? "on" : "off"}, kill=${killOn ? "on" : "off"}`,
         "scanner on, kill off"
       ),
-      gateRow("Confluence setup sample size", confSetupResolved >= 50, String(confSetupResolved), ">= 50"),
+      gateRow("Setup sample size", setupResolved >= 50, String(setupResolved), ">= 50"),
       gateRow(
-        "Confluence setup win rate",
-        confSetupWinRate >= 0.5,
-        `${(confSetupWinRate * 100).toFixed(1)}%`,
+        "Setup win rate",
+        setupWinRate >= 0.5,
+        `${(setupWinRate * 100).toFixed(1)}%`,
         ">= 50%"
       ),
-      gateRow("Closed confluence trades", confTradeCount >= 30, String(confTradeCount), ">= 30"),
+      gateRow("Closed trades", tradeCount >= 30, String(tradeCount), ">= 30"),
       gateRow(
-        "Confluence profit factor",
-        confProfitFactor >= 1.2,
-        confProfitFactor.toFixed(2),
+        "Profit factor",
+        profitFactor >= 1.2,
+        profitFactor.toFixed(2),
         ">= 1.20"
       ),
       gateRow(
-        "Confluence trade win rate",
-        confTradeWinRate >= 0.5,
-        `${(confTradeWinRate * 100).toFixed(1)}%`,
+        "Trade win rate",
+        tradeWinRate >= 0.5,
+        `${(tradeWinRate * 100).toFixed(1)}%`,
         ">= 50%"
       ),
       gateRow(
@@ -1818,8 +1906,8 @@ async function loadReadinessTab() {
 
     $("#rd-phase").textContent = phase;
     $("#rd-score").textContent = `${passed}/${total}`;
-    $("#rd-setup-wr").textContent = `${(confSetupWinRate * 100).toFixed(1)}%`;
-    $("#rd-pf").textContent = confProfitFactor.toFixed(2);
+    $("#rd-setup-wr").textContent = `${(setupWinRate * 100).toFixed(1)}%`;
+    $("#rd-pf").textContent = profitFactor.toFixed(2);
     $("#rd-progress").style.width = `${progress * 100}%`;
 
     const ring = $("#rd-score-ring");
@@ -1845,8 +1933,6 @@ async function loadReadinessTab() {
         <tr><td>Execution</td><td>${liveMode ? "LIVE" : "PAPER"}</td></tr>
         <tr><td>Max risk / trade</td><td>${Number(risk.max_risk_per_trade_pct || 0).toFixed(2)}%</td></tr>
         <tr><td>Open positions</td><td>${risk.open_positions || 0}/${risk.max_positions || 0}</td></tr>
-        <tr><td>Confluence slots</td><td>${risk.open_confluence_positions ?? 0}/${risk.max_confluence_positions ?? 1}</td></tr>
-        <tr><td>Volume pump slots</td><td>${risk.open_volume_pump_positions ?? 0}/${risk.max_volume_pump_positions ?? 1}</td></tr>
       </tbody></table>`;
 
     renderModelLearning(learning.model || {});
@@ -1895,12 +1981,456 @@ function pctText(v) {
     : `${(Number(v) * 100).toFixed(1)}%`;
 }
 
+function clampPct(n) {
+  return Math.max(0, Math.min(100, Number(n) || 0));
+}
+
+function fearGreedMeta(value) {
+  const v = Number(value);
+  if (!Number.isFinite(v)) {
+    return { label: "No data", className: "fg-neutral", pct: 50, value: null };
+  }
+  const pct = clampPct(v);
+  if (v <= 24) return { label: "Extreme Fear", className: "fg-extreme-fear", pct, value: v };
+  if (v <= 44) return { label: "Fear", className: "fg-fear", pct, value: v };
+  if (v <= 55) return { label: "Neutral", className: "fg-neutral", pct, value: v };
+  if (v <= 75) return { label: "Greed", className: "fg-greed", pct, value: v };
+  return { label: "Extreme Greed", className: "fg-extreme-greed", pct, value: v };
+}
+
+function fgArcPath(cx, cy, r, startPct, endPct) {
+  const toRad = (pct) => Math.PI * (1 - pct / 100);
+  const a1 = toRad(startPct);
+  const a2 = toRad(endPct);
+  const x1 = cx + r * Math.cos(a1);
+  const y1 = cy - r * Math.sin(a1);
+  const x2 = cx + r * Math.cos(a2);
+  const y2 = cy - r * Math.sin(a2);
+  const sweep = endPct - startPct > 50 ? 1 : 0;
+  return `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${r} ${r} 0 ${sweep} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`;
+}
+
+function renderGreedMeterHtml(fearGreed) {
+  const meta = fearGreedMeta(fearGreed);
+  const cx = 110;
+  const cy = 96;
+  const r = 76;
+  const valueText = meta.value == null ? "—" : Math.round(meta.value);
+  const segments = [
+    [0, 25, "#ef4444"],
+    [25, 45, "#f97316"],
+    [45, 55, "#64748b"],
+    [55, 75, "#34d399"],
+    [75, 100, "#22c55e"],
+  ];
+  const gap = 0.8;
+  const arcs = segments
+    .map(
+      ([start, end, color]) =>
+        `<path d="${fgArcPath(cx, cy, r, start + gap, end - gap)}" fill="none" stroke="${color}" stroke-width="13" stroke-linecap="round" class="fg-arc-seg"/>`
+    )
+    .join("");
+
+  let needle = "";
+  if (meta.value != null) {
+    const tipR = r - 22;
+    const rot = meta.pct * 1.8 - 90;
+    needle = `<g class="fg-needle-wrap" transform="rotate(${rot} ${cx} ${cy})">
+      <line x1="${cx}" y1="${cy}" x2="${cx}" y2="${cy - tipR}" class="fg-needle"/>
+    </g>
+    <circle cx="${cx}" cy="${cy}" r="6" class="fg-hub"/>`;
+  }
+
+  return `<div class="fg-gauge ${meta.className}">
+    <svg viewBox="0 0 220 122" class="fg-gauge-svg" role="img" aria-label="Fear and Greed Index ${valueText}, ${meta.label}">
+      <path d="${fgArcPath(cx, cy, r, 0, 100)}" fill="none" stroke="rgba(148,163,184,0.12)" stroke-width="15" stroke-linecap="round"/>
+      ${arcs}
+      <text x="20" y="${cy + 20}" class="fg-gauge-tick">FEAR</text>
+      <text x="200" y="${cy + 20}" text-anchor="end" class="fg-gauge-tick">GREED</text>
+      ${needle}
+    </svg>
+    <div class="fg-readout">
+      <span class="fg-value mono">${valueText}</span>
+      <span class="fg-status">${meta.label}</span>
+    </div>
+  </div>`;
+}
+
+function sentimentScoreClass(score) {
+  const n = Number(score);
+  if (!Number.isFinite(n)) return "flat";
+  if (n > 0.15) return "bullish";
+  if (n < -0.15) return "bearish";
+  return "flat";
+}
+
+function formatSentimentScore(score) {
+  const n = Number(score);
+  if (!Number.isNaN(n)) {
+    const sign = n > 0 ? "+" : "";
+    return `${sign}${n.toFixed(2)}`;
+  }
+  return "—";
+}
+
+function fmtTimeAgo(iso) {
+  if (!iso) return "";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "";
+  const diffSec = Math.max(0, (Date.now() - then) / 1000);
+  if (diffSec < 90) return "just now";
+  const mins = Math.round(diffSec / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.round(hrs / 24);
+  return `${days}d ago`;
+}
+
+function renderNewsSlide(item) {
+  const score = Number(item.score);
+  const scoreCls = sentimentScoreClass(score);
+  const scoreLabel = Number.isFinite(score) ? score.toFixed(2) : "—";
+  const symbols = Array.isArray(item.symbols) ? item.symbols : [];
+  const url = item.url ? escapeHtml(item.url) : "";
+  const title = escapeHtml(item.title || "Untitled");
+  const titleHtml = url
+    ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${title}</a>`
+    : title;
+  const age = fmtTimeAgo(item.published_at || item.created_at);
+  return `<article class="news-slide">
+    <div class="news-slide-meta">
+      <span class="news-slide-source">${escapeHtml(item.source || "news")}</span>
+      ${age ? `<span class="news-slide-age">${age}</span>` : ""}
+      <span class="news-slide-score ${scoreCls}">${scoreLabel}</span>
+    </div>
+    <h3 class="news-slide-title">${titleHtml}</h3>
+    ${symbols.length ? `<div class="news-slide-symbols">${symbols.slice(0, 6).map((s) => `<span class="news-symbol-chip">${escapeHtml(s)}</span>`).join("")}</div>` : ""}
+  </article>`;
+}
+
+function stopDashboardNewsAutoplay() {
+  if (dashboardNewsAutoTimer) {
+    clearInterval(dashboardNewsAutoTimer);
+    dashboardNewsAutoTimer = null;
+  }
+}
+
+function restartCarouselProgress() {
+  const bar = $("#dash-news-progress");
+  const carousel = $("#dash-news-carousel");
+  if (carousel) carousel.style.setProperty("--news-auto-ms", `${DASHBOARD_NEWS_AUTO_MS}ms`);
+  if (!bar) return;
+  bar.classList.remove("hidden");
+  bar.classList.remove("anim");
+  void bar.offsetWidth;
+  bar.classList.add("anim");
+}
+
+function startDashboardNewsAutoplay() {
+  stopDashboardNewsAutoplay();
+  const pageCount = Math.ceil(dashboardNewsItems.length / DASHBOARD_NEWS_PER_PAGE);
+  if (pageCount <= 1) {
+    $("#dash-news-progress")?.classList.add("hidden");
+    return;
+  }
+  restartCarouselProgress();
+  dashboardNewsAutoTimer = setInterval(() => {
+    dashboardNewsPage = (dashboardNewsPage + 1) % pageCount;
+    renderDashboardNewsCarousel({ autoplay: true });
+  }, DASHBOARD_NEWS_AUTO_MS);
+}
+
+function goDashboardNewsPage(delta) {
+  const pageCount = Math.max(1, Math.ceil(dashboardNewsItems.length / NEWS_TABLE_PER_PAGE));
+  dashboardNewsPage = (dashboardNewsPage + delta + pageCount) % pageCount;
+  renderDashboardNewsFeed();
+}
+
+function renderDashboardNewsCarousel({ autoplay = false } = {}) {
+  const carousel = $("#dash-news-carousel");
+  const track = $("#dash-news-track");
+  const dots = $("#dash-news-dots");
+  const counter = $("#dash-news-counter");
+  const prevBtn = $("#dash-news-prev");
+  const nextBtn = $("#dash-news-next");
+  const viewport = track?.parentElement;
+  if (!track || !viewport) return;
+
+  const items = dashboardNewsItems;
+  const pageCount = Math.max(1, Math.ceil(items.length / DASHBOARD_NEWS_PER_PAGE));
+
+  if (!items.length) {
+    stopDashboardNewsAutoplay();
+    track.innerHTML = "";
+    track.style.transform = "";
+    if (dots) dots.innerHTML = "";
+    if (counter) counter.textContent = "0 items";
+    carousel?.classList.remove("news-carousel--live");
+    viewport.innerHTML = '<div class="news-carousel-empty">No headlines yet — starts when the scanner runs</div>';
+    prevBtn?.setAttribute("disabled", "disabled");
+    nextBtn?.setAttribute("disabled", "disabled");
+    $("#dash-news-progress")?.classList.add("hidden");
+    return;
+  }
+
+  if (!viewport.querySelector(".news-carousel-track")) {
+    viewport.innerHTML = `<div id="dash-news-track" class="news-carousel-track"></div><div id="dash-news-progress" class="news-carousel-progress anim"></div>`;
+  }
+  const liveTrack = $("#dash-news-track");
+  if (!liveTrack) return;
+
+  dashboardNewsPage = ((dashboardNewsPage % pageCount) + pageCount) % pageCount;
+  carousel?.classList.add("news-carousel--live");
+
+  const slides = [];
+  for (let p = 0; p < pageCount; p += 1) {
+    const chunk = items.slice(p * DASHBOARD_NEWS_PER_PAGE, (p + 1) * DASHBOARD_NEWS_PER_PAGE);
+    slides.push(`<div class="news-carousel-page" data-page="${p}">${chunk.map(renderNewsSlide).join("")}</div>`);
+  }
+  liveTrack.innerHTML = slides.join("");
+  liveTrack.style.transform = `translate3d(-${dashboardNewsPage * 100}%, 0, 0)`;
+
+  const MAX_DOTS = 8;
+  if (dots) {
+    if (pageCount <= MAX_DOTS) {
+      dots.classList.remove("news-dots--bar");
+      dots.innerHTML = Array.from({ length: pageCount }, (_, i) =>
+        `<button type="button" class="news-dot ${i === dashboardNewsPage ? "active" : ""}" data-page="${i}" aria-label="Headline ${i + 1} of ${pageCount}" aria-current="${i === dashboardNewsPage ? "true" : "false"}"></button>`
+      ).join("");
+    } else {
+      dots.classList.add("news-dots--bar");
+      const fillPct = clampPct(((dashboardNewsPage + 1) / pageCount) * 100);
+      dots.innerHTML = `<div class="news-dots-track" data-seek-track title="Jump to headline"><div class="news-dots-fill" style="width:${fillPct}%"></div></div>`;
+    }
+  }
+  if (counter) counter.textContent = `${dashboardNewsPage + 1} / ${pageCount}`;
+  prevBtn?.toggleAttribute("disabled", pageCount <= 1);
+  nextBtn?.toggleAttribute("disabled", pageCount <= 1);
+
+  if (!autoplay) startDashboardNewsAutoplay();
+  else restartCarouselProgress();
+}
+
+const FGI_COLORS = {
+  "fg-extreme-fear": "#ef4444",
+  "fg-fear": "#f97316",
+  "fg-neutral": "#94a3b8",
+  "fg-greed": "#34d399",
+  "fg-extreme-greed": "#22c55e",
+};
+
+function renderGreedWidgetHtml(currentValue, fngHistory = []) {
+  const meta = fearGreedMeta(currentValue);
+  const color = FGI_COLORS[meta.className] || "var(--text)";
+  const valueText = meta.value == null ? "—" : Math.round(meta.value);
+
+  const periods = [
+    { label: "Yesterday", idx: 1 },
+    { label: "1 Week", idx: 6 },
+    { label: "1 Month", idx: 29 },
+  ];
+
+  const historyHtml = fngHistory.length
+    ? `<div class="greed-history-row">${periods.map(({ label, idx }) => {
+        const entry = fngHistory[idx];
+        const m = entry ? fearGreedMeta(entry.value) : null;
+        const c = m ? (FGI_COLORS[m.className] || "var(--muted)") : "var(--muted)";
+        return `<div class="greed-history-item">
+          <span class="greed-history-period">${label}</span>
+          <span class="greed-history-val" style="color:${c}">${m ? Math.round(m.value) : "—"}</span>
+          <span class="greed-history-lbl">${m ? m.label : "—"}</span>
+        </div>`;
+      }).join("")}</div>`
+    : "";
+
+  return `<div class="greed-gauge-num" style="color:${color}">${valueText}</div>
+    <div class="greed-gauge-label" style="color:${color}">${meta.label}</div>
+    ${historyHtml}`;
+}
+
+function renderDashboardGreedMeter(status = {}, fngHistory = []) {
+  const widget = document.getElementById("dash-greed-widget");
+  if (widget) {
+    widget.innerHTML = renderGreedWidgetHtml(status.fear_greed, fngHistory);
+  }
+  const globalEl = $("#dash-global-sentiment");
+  if (globalEl) {
+    const g = Number(status.global_score ?? 0);
+    globalEl.textContent = formatSentimentScore(g);
+    globalEl.className = "sentiment-pill mono" + (g > 0.2 ? " positive" : g < -0.2 ? " negative" : "");
+  }
+}
+
+/// Human label for the local-LLM market regime (Phase 4/7).
+function regimeSummary(llm = {}) {
+  const r = llm.regime || {};
+  if (llm.enabled === false) return { label: "Disabled", cls: "", title: "LLM regime layer disabled in settings" };
+  if (!llm.available) {
+    return {
+      label: "Neutral (offline)",
+      cls: "",
+      title: llm.last_error ? `Ollama offline — trading on ML alone. ${llm.last_error}` : "Ollama offline — trading on ML alone",
+    };
+  }
+  const parts = [];
+  if (r.trending) parts.push("Trending");
+  if (r.chop) parts.push("Chop");
+  if (r.high_vol) parts.push("High vol");
+  if (r.risk_off) parts.push("Risk-off");
+  if (!parts.length) parts.push("Neutral");
+  const bias = Number(r.btc_bias ?? 0);
+  const conf = Number(r.confidence ?? 0);
+  const biasLabel = bias > 0.15 ? "bullish" : bias < -0.15 ? "bearish" : "flat";
+  return {
+    label: `${parts.join(" · ")} · ${biasLabel} ${(conf * 100).toFixed(0)}%`,
+    cls: bias > 0.15 ? " positive" : bias < -0.15 ? " negative" : "",
+    title: `BTC bias ${bias >= 0 ? "+" : ""}${bias.toFixed(2)} · confidence ${(conf * 100).toFixed(0)}% · updated ${llm.updated_at || "—"}`,
+  };
+}
+
+function renderDashboardRegime(llm = {}) {
+  const el = $("#dash-llm-regime");
+  if (!el) return;
+  const { label, cls, title } = regimeSummary(llm);
+  el.textContent = label;
+  el.className = "sentiment-pill" + cls;
+  el.title = title;
+}
+
+function renderNewsFeedRow(item) {
+  const score = Number(item.score);
+  const scoreCls = sentimentScoreClass(score);
+  const scoreLabel = Number.isFinite(score) ? (score >= 0 ? `+${score.toFixed(2)}` : score.toFixed(2)) : "—";
+  const url = item.url ? escapeHtml(item.url) : "";
+  const title = escapeHtml(item.title || "Untitled");
+  const titleHtml = url
+    ? `<a href="${url}" target="_blank" rel="noopener noreferrer" title="${title}">${title}</a>`
+    : `<span title="${title}">${title}</span>`;
+  const age = fmtTimeAgo(item.published_at || item.created_at) || "—";
+  return `<tr>
+    <td class="news-col-source">${escapeHtml(item.source || "—")}</td>
+    <td class="news-col-title">${titleHtml}</td>
+    <td class="news-col-score"><span class="news-feed-score ${scoreCls}">${scoreLabel}</span></td>
+    <td class="news-col-age">${age}</td>
+  </tr>`;
+}
+
+function renderDashboardNewsFeed() {
+  const tbody = document.getElementById("dash-news-tbody");
+  const counter = $("#dash-news-counter");
+  const info = $("#dash-news-info");
+  const prevBtn = $("#dash-news-prev");
+  const nextBtn = $("#dash-news-next");
+  const pagination = $("#dash-news-pagination");
+  if (!tbody) return;
+
+  const items = dashboardNewsItems;
+  const pageCount = Math.max(1, Math.ceil(items.length / NEWS_TABLE_PER_PAGE));
+  dashboardNewsPage = Math.min(Math.max(0, dashboardNewsPage), pageCount - 1);
+
+  if (counter) counter.textContent = items.length ? `${items.length} items` : "—";
+
+  if (!items.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="news-feed-empty">No headlines yet — starts when the scanner runs</td></tr>';
+    if (pagination) pagination.classList.add("hidden");
+    return;
+  }
+
+  const start = dashboardNewsPage * NEWS_TABLE_PER_PAGE;
+  tbody.innerHTML = items.slice(start, start + NEWS_TABLE_PER_PAGE).map(renderNewsFeedRow).join("");
+  if (info) info.textContent = `${start + 1}–${Math.min(start + NEWS_TABLE_PER_PAGE, items.length)} of ${items.length}`;
+  if (prevBtn) prevBtn.toggleAttribute("disabled", dashboardNewsPage === 0);
+  if (nextBtn) nextBtn.toggleAttribute("disabled", dashboardNewsPage >= pageCount - 1);
+  if (pagination) pagination.classList.toggle("hidden", pageCount <= 1);
+}
+
+async function fetchFngHistory() {
+  try {
+    const resp = await fetch("https://api.alternative.me/fng/?limit=30&format=json");
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return (data.data || []).map((d) => ({ value: Number(d.value), label: d.value_classification }));
+  } catch {
+    return [];
+  }
+}
+
+async function loadDashboardMarket() {
+  if (!$("#panel-trading")?.classList.contains("active")) return;
+  try {
+    const [status, newsResp, fngHistory, llmStatus] = await Promise.all([
+      apiGet("/sentiment/status").catch(() => ({})),
+      apiGet("/sentiment/news?limit=20").catch(() => ({ items: [] })),
+      fetchFngHistory(),
+      apiGet("/llm/status").catch(() => ({})),
+    ]);
+    renderDashboardGreedMeter(status, fngHistory);
+    renderDashboardRegime(llmStatus);
+    const fromDb = newsResp.items || [];
+    const fromMem = status.headlines || [];
+    dashboardNewsItems = (fromDb.length ? fromDb : fromMem).slice(0, 20);
+    renderDashboardNewsFeed();
+  } catch (e) {
+    const feed = $("#dash-news-feed");
+    if (feed) feed.innerHTML = `<div class="news-feed-empty">${escapeHtml(e.message || "Failed to load")}</div>`;
+  }
+}
+
+function initDashboardMarketControls() {
+  $("#dash-news-prev")?.addEventListener("click", () => goDashboardNewsPage(-1));
+  $("#dash-news-next")?.addEventListener("click", () => goDashboardNewsPage(1));
+  $("#dash-news-dots")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-page]");
+    if (btn) {
+      dashboardNewsPage = Number(btn.dataset.page) || 0;
+      renderDashboardNewsCarousel();
+      startDashboardNewsAutoplay();
+      return;
+    }
+    const track = ev.target.closest("[data-seek-track]");
+    if (track) {
+      const rect = track.getBoundingClientRect();
+      const ratio = clampPct(((ev.clientX - rect.left) / Math.max(1, rect.width)) * 100) / 100;
+      const pageCount = Math.max(1, Math.ceil(dashboardNewsItems.length / DASHBOARD_NEWS_PER_PAGE));
+      dashboardNewsPage = Math.min(pageCount - 1, Math.floor(ratio * pageCount));
+      renderDashboardNewsCarousel();
+      startDashboardNewsAutoplay();
+    }
+  });
+  const carousel = $("#dash-news-carousel");
+  carousel?.addEventListener("mouseenter", stopDashboardNewsAutoplay);
+  carousel?.addEventListener("mouseleave", startDashboardNewsAutoplay);
+  carousel?.addEventListener("focusin", stopDashboardNewsAutoplay);
+  carousel?.addEventListener("focusout", startDashboardNewsAutoplay);
+
+  let touchStartX = 0;
+  carousel?.addEventListener("touchstart", (ev) => {
+    touchStartX = ev.changedTouches[0]?.clientX ?? 0;
+    stopDashboardNewsAutoplay();
+  }, { passive: true });
+  carousel?.addEventListener("touchend", (ev) => {
+    const dx = (ev.changedTouches[0]?.clientX ?? 0) - touchStartX;
+    if (Math.abs(dx) > 40) goDashboardNewsPage(dx < 0 ? 1 : -1);
+    else startDashboardNewsAutoplay();
+  }, { passive: true });
+}
+
 async function loadTrainingTab() {
   clearTrainingError();
   setTrainingLoading(true);
   try {
-    const data = await apiGet("/ml/history");
+    const [data, sentiment, promotion, tuner, llmStatus] = await Promise.all([
+      apiGet("/ml/history"),
+      apiGet("/sentiment/status").catch(() => ({})),
+      apiGet("/promotion/status").catch(() => ({})),
+      apiGet("/tuner/history").catch(() => ({ runs: [] })),
+      apiGet("/llm/status").catch(() => ({})),
+    ]);
     renderTrainingModels(data);
+    renderPromotionPanel(promotion);
+    renderSentimentPanel(sentiment, llmStatus);
+    renderTunerHistory(tuner);
     try {
       await renderTrainingChartsDeferred(data.history || [], data.rolling_7d || []);
     } catch (chartErr) {
@@ -1911,6 +2441,201 @@ async function loadTrainingTab() {
   } finally {
     setTrainingLoading(false);
   }
+}
+
+function renderPromotionPanel(payload) {
+  const el = $("#training-promotion-stats");
+  const badge = $("#training-promotion-badge");
+  const card = $("#training-promotion-card");
+  if (!el) return;
+  const m = payload.metrics || {};
+  const c = m.criteria || {};
+  const ready = !!m.live_promotion_ready;
+  const minTrades = Number(c.min_trades ?? 300);
+  const minPf = Number(c.min_profit_factor ?? 1.3);
+  const minWr = 0.45;
+  const resolved = Number(m.resolved_trades ?? 0);
+  const pf = Number(m.profit_factor ?? 0);
+  const wr = Number(m.win_rate ?? 0);
+  const halts = Number(m.drawdown_halts_30d ?? 0);
+
+  if (badge) {
+    badge.textContent = ready ? "Ready" : "Paper";
+    badge.className = "tag " + (ready ? "tag-ok" : "");
+  }
+  card?.classList.toggle("promo-ready", ready);
+
+  const criteria = [
+    {
+      label: "Resolved trades",
+      current: `${resolved}`,
+      target: `≥ ${minTrades}`,
+      pct: clampPct((resolved / minTrades) * 100),
+      pass: resolved >= minTrades,
+    },
+    {
+      label: "Profit factor",
+      current: pf.toFixed(2),
+      target: `≥ ${minPf}`,
+      pct: clampPct((pf / minPf) * 100),
+      pass: pf >= minPf,
+    },
+    {
+      label: "Win rate",
+      current: pctText(wr),
+      target: `≥ ${(minWr * 100).toFixed(0)}%`,
+      pct: clampPct((wr / minWr) * 100),
+      pass: wr >= minWr,
+    },
+    {
+      label: "Drawdown halts (30d)",
+      current: String(halts),
+      target: "0",
+      pct: halts === 0 ? 100 : 20,
+      pass: halts === 0,
+    },
+  ];
+
+  el.innerHTML = `<div class="promo-panel ${ready ? "promo-ready" : ""}">
+    <div class="promo-hero">
+      <div class="promo-icon">${ready ? "✓" : "◎"}</div>
+      <div>
+        <h3 class="promo-title">${ready ? "Ready for live review" : "Keep paper trading"}</h3>
+        <p class="promo-sub">${ready ? "Core promotion gates passed — review risk before enabling live." : "Build sample size and stability before live capital."}</p>
+      </div>
+    </div>
+    <div class="promo-criteria">
+      ${criteria.map((row) => `<div class="criterion-row ${row.pass ? "pass" : "fail"}">
+        <div class="criterion-head"><span>${row.label}</span><span class="mono">${row.current} <span class="hint">/ ${row.target}</span></span></div>
+        <div class="criterion-bar"><span style="width:${row.pct}%"></span></div>
+      </div>`).join("")}
+    </div>
+  </div>`;
+}
+
+function renderSentimentPanel(s, llmStatus = {}) {
+  const stats = $("#training-sentiment-stats");
+  const headlines = $("#training-sentiment-headlines");
+  const badge = $("#training-sentiment-score");
+  const g = Number(s.global_score ?? 0);
+  if (badge) {
+    badge.textContent = `News ${formatSentimentScore(g)}`;
+    badge.className = "tag " + (g > 0.2 ? "tag-ok" : g < -0.2 ? "tag-warn" : "");
+  }
+  if (stats) {
+    const fgi = fearGreedMeta(s.fear_greed);
+    const fgiColor = FGI_COLORS[fgi.className] || "var(--text)";
+    const markerLeft = clampPct(((g + 1) / 2) * 100);
+    stats.innerHTML = `<div class="training-sentiment-compact">
+      <div class="training-sentiment-scores">
+        <div class="training-sentiment-score-block">
+          <span class="training-sentiment-score-label">Fear &amp; Greed</span>
+          <span class="training-sentiment-score-val mono" style="color:${fgiColor}">${fgi.value != null ? Math.round(fgi.value) : "—"}</span>
+          <span class="hint">${fgi.label}</span>
+        </div>
+        <div class="training-sentiment-score-block">
+          <span class="training-sentiment-score-label">News sentiment</span>
+          <span class="training-sentiment-score-val mono ${g > 0.2 ? "positive" : g < -0.2 ? "negative" : ""}">${formatSentimentScore(g)}</span>
+        </div>
+        <div class="training-sentiment-meta">
+          <span>${s.headline_count ?? 0} headlines</span>
+          <span>${Object.keys(s.symbol_scores || {}).length} symbols</span>
+        </div>
+      </div>
+      <div class="sentiment-bar-track" aria-hidden="true">
+        <div class="sentiment-bar-marker" style="left:${markerLeft}%"></div>
+      </div>
+      ${(() => {
+        const { label, cls, title } = regimeSummary(llmStatus);
+        const modelTag = llmStatus.available && llmStatus.model ? ` · ${escapeHtml(llmStatus.model)}` : "";
+        return `<div class="sentiment-mini-row">
+          <span class="hint">LLM regime${modelTag}</span>
+          <span class="sentiment-pill${cls}" title="${escapeHtml(title)}">${escapeHtml(label)}</span>
+        </div>`;
+      })()}
+    </div>`;
+  }
+  if (headlines) {
+    const items = (s.headlines || []).slice(0, 4);
+    if (!items.length) {
+      headlines.innerHTML = '<span class="empty">No headlines yet</span>';
+      return;
+    }
+    headlines.innerHTML = items.map((h) => {
+      const score = Number(h.score);
+      const cls = score > 0.15 ? "up" : score < -0.15 ? "down" : "flat";
+      const url = h.url ? escapeHtml(h.url) : "";
+      const title = escapeHtml(h.title || "");
+      const titleHtml = url
+        ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${title}</a>`
+        : title;
+      return `<div class="headline-card">
+        <span class="headline-card-score ${cls}">${Number.isFinite(score) ? score.toFixed(2) : "—"}</span>
+        <div class="headline-card-body">
+          <div class="headline-card-source">${escapeHtml(h.source || "news")}</div>
+          <p class="headline-card-title">${titleHtml}</p>
+        </div>
+      </div>`;
+    }).join("");
+  }
+}
+
+function formatTunerParams(params) {
+  if (!params || typeof params !== "object") return "—";
+  const parts = [];
+  const score = params.min_composite_score;
+  const thr = params.supervised_threshold;
+  const sl = params.default_sl_pct;
+  if (score != null && !Number.isNaN(Number(score))) parts.push(`Score ${Number(score)}`);
+  if (thr != null && !Number.isNaN(Number(thr))) parts.push(`Gate ${(Number(thr) * 100).toFixed(0)}%`);
+  if (sl != null && !Number.isNaN(Number(sl))) parts.push(`SL ${(Number(sl) * 100).toFixed(1)}%`);
+  return parts.length ? parts.join(" · ") : "—";
+}
+
+function formatTunerPct(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "—";
+  return `${(n * 100).toFixed(1)}%`;
+}
+
+function renderTunerHistory(payload) {
+  const el = $("#training-tuner-history");
+  if (!el) return;
+  const runs = payload.runs || [];
+  if (!runs.length) {
+    el.innerHTML = '<span class="empty">No tuner runs yet — runs every 6h when enabled</span>';
+    return;
+  }
+  el.innerHTML = `<table class="data tuner-table">
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Challenger</th>
+        <th class="col-num">Test WR</th>
+        <th class="col-num">Return</th>
+        <th class="col-num">Trades</th>
+        <th class="col-num">Score</th>
+        <th>Result</th>
+      </tr>
+    </thead>
+    <tbody>${runs.map((r) => {
+      const oos = r.oos_metrics || {};
+      const promoted = !!r.promoted;
+      const testWr = oos.test_win_rate;
+      const testRet = oos.test_return_pct;
+      const trades = oos.test_n ?? oos.test_trades;
+      const score = oos.score;
+      return `<tr class="${promoted ? "tuner-row-promoted" : ""}">
+        <td class="col-time" title="${escapeHtml(r.created_at || "")}">${fmtManilaDateTime(r.created_at)}</td>
+        <td class="tuner-params-cell">${escapeHtml(formatTunerParams(r.challenger))}</td>
+        <td class="col-num mono">${testWr != null ? formatTunerPct(testWr) : "—"}</td>
+        <td class="col-num mono ${Number(testRet) >= 0 ? "positive" : "negative"}">${testRet != null ? formatTunerPct(testRet) : "—"}</td>
+        <td class="col-num mono">${trades ?? "—"}</td>
+        <td class="col-num mono">${score != null ? Number(score).toFixed(2) : "—"}</td>
+        <td><span class="tag ${promoted ? "tag-ok" : ""}">${promoted ? "Promoted" : "Suggest"}</span></td>
+      </tr>`;
+    }).join("")}</tbody>
+  </table>`;
 }
 
 function setTrainingLoading(loading) {
@@ -1968,15 +2693,17 @@ function renderTrainingModels(data) {
   const cfg = data.config || {};
   const active = model.active_model || "warming_up";
   const pg = (data.postgate_stats || {}).post_gate || {};
-  const threshold = cfg.supervised_threshold ?? om.gate_threshold;
+  const threshold = model.effective_threshold ?? cfg.supervised_threshold ?? om.gate_threshold;
   const thresholdPct = threshold != null ? (Number(threshold) * 100).toFixed(0) : "—";
 
   const activeLabel =
-    active === "online"
-      ? "Online"
-      : active === "onnx"
-        ? "ONNX fallback"
-        : "Warming up";
+    active === "ensemble"
+      ? "Ensemble"
+      : active === "online"
+        ? "Online"
+        : active === "onnx"
+          ? "ONNX only"
+          : "Warming up";
 
   const samples = Number(om.samples || 0);
   const minSamples = Number(om.min_samples || cfg.min_training_samples || 0);
@@ -2033,12 +2760,23 @@ function renderTrainingModels(data) {
 
   const gateStats = $("#training-gate-stats");
   if (gateStats) {
+    const blendW = model.ensemble_online_weight;
+    const blendLabel =
+      blendW != null
+        ? `${Math.round(Number(blendW) * 100)}% online / ${Math.round((1 - Number(blendW)) * 100)}% ONNX`
+        : "—";
+    const kellyLabel = model.kelly_fraction != null ? `${Number(model.kelly_fraction).toFixed(2)}× fractional` : "—";
+    const rFmt = (v) => (v != null && Number.isFinite(Number(v)) ? `${Number(v).toFixed(2)}R` : "—");
     gateStats.innerHTML = `
       <table class="data"><tbody>
         <tr><td>ML threshold</td><td class="mono">≥ ${thresholdPct}%</td></tr>
         <tr><td>Hard gate</td><td>${cfg.hard_ml_gate ? "On" : "Off"}</td></tr>
+        <tr><td>Ensemble blend</td><td class="mono">${blendLabel}</td></tr>
+        <tr><td>Kelly sizing</td><td class="mono">${kellyLabel}</td></tr>
+        <tr><td>Realized avg win / loss</td><td class="mono">${rFmt(model.avg_win_r)} / ${rFmt(model.avg_loss_r)}</td></tr>
+        <tr><td>Auto ONNX retrain</td><td class="mono">${model.auto_retrain_enabled ? "ON" : "OFF"}</td></tr>
+        <tr><td>Auto gate</td><td class="mono">${model.gate_auto_enabled ? "ON" : "OFF"}</td></tr>
         <tr><td>Trade learn weights</td><td class="mono">${cfg.trade_win_weight ?? 2}× win / ${cfg.trade_loss_weight ?? 3.5}× loss</td></tr>
-        <tr><td>Shadow ML rejects</td><td class="mono">${data.learning?.shadow_ml_reject_weight ?? "—"}×</td></tr>
         <tr><td>Last updated</td><td>${om.updated_at ? fmtManilaDateTime(om.updated_at) : "—"}</td></tr>
       </tbody></table>`;
   }
@@ -2236,7 +2974,7 @@ function renderBacktestResult(res) {
   const resultEl = $("#training-backtest-result");
   const badge = $("#training-backtest-badge");
   if (!card || !resultEl) return;
-  card.style.display = "";
+  card.classList.remove("hidden");
   if (res.error) {
     resultEl.innerHTML = `<span class="negative">${res.error}</span>`;
     return;
@@ -2246,16 +2984,25 @@ function renderBacktestResult(res) {
     badge.className = "tag tag-ok";
   }
   const r4 = (v) => v != null ? (Number(v) * 100).toFixed(2) + "%" : "—";
+  const gateLabel =
+    res.settings?.gate === "decision_engine"
+      ? "Decision engine (EV + R:R gates)"
+      : res.settings?.ml_threshold != null
+        ? `ML threshold ≥ ${Number(res.settings.ml_threshold).toFixed(1)}%`
+        : "—";
+  const pf = res.profit_factor;
   resultEl.innerHTML = `<table class="data"><tbody>
     <tr><td>Total signals</td><td>${res.total_signals ?? "—"}</td></tr>
-    <tr><td>Filtered by ML gate</td><td>${res.filtered_by_ml ?? "—"}</td></tr>
+    <tr><td>Filtered by gate</td><td>${res.filtered ?? res.filtered_by_ml ?? "—"}</td></tr>
     <tr><td>Traded</td><td>${res.traded ?? "—"}</td></tr>
     <tr><td>Wins / Losses / Expired</td><td>${res.wins ?? 0} / ${res.losses ?? 0} / ${res.expired ?? 0}</td></tr>
     <tr><td>Win rate</td><td>${r4(res.win_rate)}</td></tr>
+    <tr><td>Profit factor</td><td class="mono">${pf != null ? Number(pf).toFixed(2) : res.traded > 0 && res.losses === 0 ? "∞ (no losses)" : "—"}</td></tr>
     <tr><td>Total return</td><td class="${Number(res.total_return_pct) >= 0 ? "positive" : "negative"}">${r4(res.total_return_pct)}</td></tr>
     <tr><td>Max drawdown</td><td class="negative">${r4(res.max_drawdown_pct)}</td></tr>
     <tr><td>Expectancy / trade</td><td>${r4(res.expectancy_per_trade)}</td></tr>
-    <tr><td>ML threshold</td><td class="mono">${res.settings?.ml_threshold?.toFixed(1) ?? "—"}%</td></tr>
+    <tr><td>Avg win / avg loss</td><td class="mono">${r4(res.avg_win)} / ${r4(res.avg_loss)}</td></tr>
+    <tr><td>Gate</td><td>${gateLabel}</td></tr>
   </tbody></table>`;
 
   // Equity curve chart
@@ -2297,13 +3044,14 @@ function renderWalkForwardResult(res) {
   const card = $("#training-wf-card");
   const resultEl = $("#training-wf-result");
   if (!card || !resultEl) return;
-  card.style.display = "";
+  card.classList.remove("hidden");
   if (res.error) {
     resultEl.innerHTML = `<span class="negative">${res.error}</span>`;
     return;
   }
   const pct = (v) => v != null ? (Number(v) * 100).toFixed(1) + "%" : "—";
   const oos = res.out_of_sample || {};
+  const pnl = oos.traded_pnl || {};
   resultEl.innerHTML = `<table class="data"><tbody>
     <tr><td>Train samples</td><td>${res.train_samples ?? "—"}</td></tr>
     <tr><td>Test samples (OOS)</td><td>${res.test_samples ?? "—"}</td></tr>
@@ -2313,7 +3061,57 @@ function renderWalkForwardResult(res) {
     <tr><td>OOS win rate</td><td>${pct(oos.win_rate)}</td></tr>
     <tr><td>OOS precision</td><td>${pct(oos.precision)}</td></tr>
     <tr><td>OOS trades evaluated</td><td>${oos.total ?? "—"}</td></tr>
+    <tr><td colspan="2" style="font-weight:600;padding-top:.5rem">Model-traded PnL (OOS)</td></tr>
+    <tr><td>Trades taken</td><td>${pnl.traded ?? "—"}</td></tr>
+    <tr><td>Traded win rate</td><td>${pct(pnl.win_rate)}</td></tr>
+    <tr><td>Total return</td><td class="${Number(pnl.total_return_pct) >= 0 ? "positive" : "negative"}">${pct(pnl.total_return_pct)}</td></tr>
+    <tr><td>Profit factor</td><td class="mono">${pnl.profit_factor != null ? Number(pnl.profit_factor).toFixed(2) : "—"}</td></tr>
+    <tr><td>Max drawdown</td><td class="negative">${pct(pnl.max_drawdown_pct)}</td></tr>
   </tbody></table>`;
+}
+
+function renderAcceptanceResult(res) {
+  const card = $("#training-acceptance-card");
+  const resultEl = $("#training-acceptance-result");
+  const badge = $("#training-acceptance-badge");
+  if (!card || !resultEl) return;
+  card.classList.remove("hidden");
+  if (res.error) {
+    resultEl.innerHTML = `<span class="negative">${escapeHtml(res.error)}</span>`;
+    if (badge) { badge.textContent = "Error"; badge.className = "tag tag-warn"; }
+    return;
+  }
+  const acc = res.acceptance || {};
+  const passed = acc.passed === true;
+  if (badge) {
+    badge.textContent = passed ? "PASSED" : "NOT READY";
+    badge.className = "tag " + (passed ? "tag-ok" : "tag-warn");
+  }
+  const fmtVal = (v) => {
+    if (v == null) return "—";
+    const n = Number(v);
+    if (!Number.isFinite(n)) return escapeHtml(String(v));
+    return Number.isInteger(n) ? String(n) : n.toFixed(3);
+  };
+  const checks = (acc.checks || []).map((c) => `
+    <tr>
+      <td>${escapeHtml(c.check || "—")}</td>
+      <td class="mono">${fmtVal(c.actual)}</td>
+      <td class="mono">${fmtVal(c.required)}</td>
+      <td class="${c.passed ? "positive" : "negative"}">${c.passed ? "✓ pass" : "✗ fail"}</td>
+    </tr>`).join("");
+  const liveNote = res.live_trading_enabled
+    ? '<span class="negative">Live trading is already enabled.</span>'
+    : passed
+      ? "Gates cleared — you may enable live trading in settings."
+      : "Keep paper trading until every gate passes.";
+  resultEl.innerHTML = `
+    <table class="data">
+      <thead><tr><th>Check</th><th>Actual</th><th>Required</th><th>Result</th></tr></thead>
+      <tbody>${checks || '<tr><td colspan="4" class="empty">No checks returned</td></tr>'}</tbody>
+    </table>
+    <p class="hint" style="margin-top:.5rem">${acc.summary ? escapeHtml(acc.summary) + " · " : ""}${liveNote}</p>`;
+  renderBacktestResult(res.metrics || {});
 }
 
 function pnlModeParam() {
@@ -2470,7 +3268,10 @@ function initTabs() {
       btn.classList.add("active");
       const id = btn.dataset.tab;
       $(`#panel-${id}`)?.classList.add("active");
-      if (id === "trading") loadBalanceHistory();
+      if (id === "trading") {
+        loadBalanceHistory();
+        loadDashboardMarket();
+      }
       if (id === "signals") loadSignalsTab();
       if (id === "positions") loadPositionsTab();
       if (id === "readiness") loadReadinessTab();
@@ -2618,6 +3419,18 @@ function initControls() {
       showFeedback(fb, msg, true);
       await refreshSnapshotHttp();
       if ($("#panel-positions")?.classList.contains("active")) await loadPositionsTab();
+    } catch (e) {
+      showFeedback(fb, e.message, false);
+    }
+  });
+
+  $("#btn-reset-circuit-breaker")?.addEventListener("click", async () => {
+    const fb = $("#control-feedback");
+    try {
+      const res = await apiPost("/risk/circuit-breaker/reset");
+      if (res.error) throw new Error(res.error);
+      showFeedback(fb, "Circuit breaker reset — trading resumed.", true);
+      await refreshSnapshotHttp();
     } catch (e) {
       showFeedback(fb, e.message, false);
     }
@@ -2844,6 +3657,19 @@ function initControls() {
     }
   });
 
+  $("#btn-training-acceptance")?.addEventListener("click", async () => {
+    const fb = $("#training-feedback");
+    showFeedback(fb, "Replaying history through the decision engine and checking go-live gates…", true);
+    try {
+      const res = await apiPost("/backtest/acceptance", {});
+      renderAcceptanceResult(res);
+      const passed = res.acceptance?.passed === true;
+      showFeedback(fb, passed ? "Acceptance gate PASSED — strategy cleared all go-live minimums." : "Acceptance gate not passed yet — see the checks below.", passed);
+    } catch (e) {
+      showFeedback(fb, `Acceptance check failed: ${e.message}`, false);
+    }
+  });
+
   $("#btn-notifications")?.addEventListener("click", (ev) => {
     ev.stopPropagation();
     setNotificationsOpen($("#notification-panel")?.classList.contains("hidden"));
@@ -3060,13 +3886,67 @@ function initTelegramControls() {
   });
 }
 
+// ── Tauri in-app update banner ────────────────────────────────────────────────
+// Called by the Tauri desktop backend via win.eval(...) when a newer version is
+// available on GitHub Releases.  Works only when running inside the Tauri app;
+// silently no-ops in the browser.
+
+let _pendingUpdateInstalling = false;
+
+window.showUpdateBanner = function showUpdateBanner(version, notes) {
+  const banner = $("#update-banner");
+  if (!banner) return;
+  const title = $("#update-banner-title");
+  const notesEl = $("#update-banner-notes");
+  if (title) title.textContent = `Update available: v${version}`;
+  if (notesEl) notesEl.textContent = notes ? notes.slice(0, 120) : "";
+  banner.classList.remove("hidden");
+};
+
+function initUpdateBanner() {
+  const banner = $("#update-banner");
+  const installBtn = $("#btn-update-install");
+  const dismissBtn = $("#btn-update-dismiss");
+  if (!banner) return;
+
+  dismissBtn?.addEventListener("click", () => {
+    banner.classList.add("hidden");
+  });
+
+  installBtn?.addEventListener("click", async () => {
+    if (_pendingUpdateInstalling) return;
+    _pendingUpdateInstalling = true;
+    installBtn.disabled = true;
+    installBtn.textContent = "Installing…";
+    try {
+      // Use Tauri IPC if available (desktop only).
+      if (window.__TAURI__?.core?.invoke) {
+        await window.__TAURI__.core.invoke("install_update");
+      } else {
+        // Fallback: open the GitHub releases page in the default browser.
+        window.open("https://github.com/OWNER/mexc-trading-bot-rust/releases/latest", "_blank", "noopener");
+        banner.classList.add("hidden");
+      }
+    } catch (err) {
+      installBtn.textContent = "Install & Restart";
+      installBtn.disabled = false;
+      _pendingUpdateInstalling = false;
+      const notesEl = $("#update-banner-notes");
+      if (notesEl) notesEl.textContent = `Install failed: ${err}. Download from GitHub Releases.`;
+    }
+  });
+}
+
 async function init() {
   initTabs();
   initControls();
   initTelegramControls();
+  initDashboardMarketControls();
+  initUpdateBanner();
   await loadUserProfile();
   await refreshSnapshotHttp();
   await loadBalanceHistory();
+  await loadDashboardMarket();
   connectWebSocket();
   startPolling();
 }

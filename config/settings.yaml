@@ -8,9 +8,12 @@ scanner:
   kline_lookback_bars: 60
   max_symbols_kline_poll: 150
   min_24h_turnover_usdt: 500000.0
-  min_price_usdt: 0.00001
+  min_price_usdt: 0.05
   usdt_m_crypto_only: true
   kline_refresh_sec: 60
+  htf_interval: Min15
+  htf_lookback_bars: 48
+  fetch_funding_rate: true
 zones:
   enabled: true
   lookback_bars: 50
@@ -18,93 +21,73 @@ zones:
   pivot_right: 2
   zone_width_pct: 0.2
   proximity_pct: 0.25
-confluence:
-  enabled: true
-  min_composite_score: 60.0
-  min_zone_score: 58.0
-  min_confluences: 4
-  min_move_pct: 0.2
-  max_move_pct: 3.0
-  volume_surge_multiplier: 2.0
-  volume_zscore_threshold: 2.3
-  alert_cooldown_sec: 300
+trading:
+  mode: ai
+  max_hold_sec: 2400
+ai:
+  min_move_pct: 0.1
+  move_lookback_ticks: 6
+  signal_cooldown_sec: 120
+  atr_sl_mult: 1.5
+  tp_r_multiples: [1.5, 2.5, 4.0]
+  tp_close_fractions: [0.5, 0.3, 0.2]
+  base_leverage: 20
+risk:
+  max_risk_per_trade: 0.01
+  max_leverage: 100
+  max_concurrent_positions: 10
+  daily_loss_limit: 0.08
+  min_position_margin_usdt: 3.0
+  use_live_wallet_equity: false
+  max_funding_rate_abs: 0.001
+  max_atr_pct: 14.0
   default_sl_pct: 0.02
   trailing_stop_pct: 0.01
   trailing_activation_pct: 0.012
-  tp_levels_pct:
-  - 0.02
-  - 0.045
-  - 0.08
-  tp_close_fractions:
-  - 0.4
-  - 0.35
-  - 0.25
-  max_hold_sec: 3600
-  max_risk_per_trade: 0.03
-  max_concurrent_positions: 1
-  require_structure: false
-  require_market_structure_bias: true
-  market_structure_lookback_bars: 48
-  require_inside_zone: true
-  require_ema_trend: false
-  ema_trend_span: 20
-  require_pullback_candle: false
-  max_range_extreme_pct: 0.18
-  max_extension_pct: 1.8
-  base_leverage: 20
-  moderate_leverage: 50
-  strong_leverage: 100
-  htf_enabled: true
-  htf_interval: Min15
-  htf_lookback_bars: 120
-  liquidity_grab_enabled: true
-  require_liquidity_grab: true
-  liquidity_grab_lookback_bars: 80
-  liquidity_grab_max_age_bars: 5
-  liquidity_grab_sweep_pct: 0.04
-  liquidity_grab_min_rejection: 0.4
   trailing_extended_activation_pct: 0.03
   trailing_extended_stop_pct: 0.014
   trailing_runner_activation_pct: 0.05
   trailing_runner_stop_pct: 0.024
-trading:
-  mode: all
-risk:
-  max_risk_per_trade: 0.03
-  max_leverage: 200
-  max_concurrent_positions: 2
-  daily_loss_limit: 0.1
-  min_position_margin_usdt: 5.0
-  use_live_wallet_equity: true
-  max_exposure_pct: 0.8
-  max_funding_rate_abs: 0.001
-  max_atr_pct: 12.0
-  default_sl_pct: 0.03
-  trailing_stop_pct: 0.035
   allow_hedge: false
-  max_consecutive_losses: 3
-  loss_streak_cooldown_sec: 1800
-  max_drawdown_halt_pct: 0.15
-  symbol_loss_cooldown_sec: 1200
-  ws_stale_sec: 30
-  min_profit_usdt: 2.5
-  max_confluence_positions: 1
-  max_volume_pump_positions: 1
+  max_consecutive_losses: 5
+  loss_streak_cooldown_sec: 900
+  max_drawdown_halt_pct: 0.2
+  symbol_loss_cooldown_sec: 1800
+  ws_stale_sec: 45
+  min_profit_usdt: 0.5
 execution:
-  live_trading_enabled: true
-  dry_run: false
-  sync_exchange_positions: true
+  live_trading_enabled: false
+  dry_run: true
+  sync_exchange_positions: false
+  paper_fee_rate: 0.0006
+  paper_slippage_pct: 0.0005
+  paper_initial_equity: 100.0
+  paper_reset_on_start: false
+  paper_relax_gates: true
+  limit_offset_pct: 0.001
+  limit_ttl_sec: 30
 storage:
   sqlite_path: data/mexc_trading_bot.db
 ml:
   enabled: true
   supervised_enabled: true
-  supervised_threshold: 0.63
-  min_training_samples: 100
+  supervised_threshold: 0.52
+  min_training_samples: 50
   hard_ml_gate: false
   onnx_model_path: data/models/supervised.onnx
   trade_win_weight: 2.0
   trade_loss_weight: 3.5
+  gate_min_accuracy: 0.6
+  gate_disable_accuracy: 0.52
+  gate_auto_min_samples: 500
+  ml_risk_scale_min: 0.35
+  ml_risk_scale_max: 1.0
+  kelly_fraction: 0.5
+  auto_retrain_enabled: false
+  retrain_interval_hours: 6
+  retrain_min_new_samples: 30
+  python_bin: python3
+  export_script_path: scripts/export_onnx.py
 server:
   host: 127.0.0.1
   port: 8001
@@ -112,13 +95,13 @@ learning:
   enabled: true
   shadow_ml_rejects: true
   shadow_ml_reject_weight: 0.75
-  shadow_max_per_symbol_hour: 2
+  shadow_max_per_symbol_hour: 4
   shadow_max_pending: 500
-  shadow_near_miss: true
-  near_miss_margin: 4.0
   shadow_near_miss_weight: 0.2
-scalp:
-  enabled: false
+  shadow_sentiment_weight: 0.4
+  auto_tune_enabled: true
+  auto_tune_apply: suggest
+  auto_tune_interval_hours: 6
 watchlist:
   mode: all
 backtest:
@@ -130,44 +113,32 @@ alerts:
   webhook_url: ''
   telegram_chat_id: ''
   min_interval_sec: 300
-sniper:
-  entry_mode: sniper
-  limit_offset_pct: 0.001
-  limit_ttl_sec: 30
-  sniper_lookback_bars: 5
-  sniper_min_wick_rejection: 0.4
-  sniper_max_pullback_pct: 0.7
-  htf_setup_expiry_sec: 600
-pump:
+sentiment:
   enabled: true
-  volume_surge_multiplier: 3.5
-  volume_zscore_threshold: 2.5
-  price_change_pct_min: 0.8
-  price_change_pct_max: 8.0
-  ewma_span: 20
-  min_composite_score: 62.0
-  universe_rank_max: 5
-  min_24h_turnover_usdt: 500000.0
-  max_24h_turnover_usdt: 50000000.0
-  alert_cooldown_sec: 180
-  entry_mode: limit
-  limit_offset_pct: 0.001
-  limit_ttl_sec: 15
-  default_sl_pct: 0.012
-  tp_levels_pct:
-  - 0.015
-  - 0.03
-  - 0.05
-  tp_close_fractions:
-  - 0.5
-  - 0.3
-  - 0.2
-  max_hold_sec: 900
-  trailing_stop_pct: 0.008
-  trailing_activation_pct: 0.01
-  base_leverage: 20
-  moderate_leverage: 50
-  strong_leverage: 100
-  max_concurrent_positions: 1
-  min_profit_usdt: 1.0
-  max_risk_per_trade: 0.01
+  poll_interval_sec: 300
+  block_long_below: -0.7
+  block_short_above: 0.7
+  symbol_block_threshold: 0.65
+  decay_half_life_sec: 7200.0
+# Local LLM regime layer (Ollama). Never hard-blocks: if Ollama is offline
+# the regime stays neutral and the bot trades on ML alone.
+llm:
+  enabled: true
+  base_url: http://localhost:11434
+  model: llama3.2
+  poll_interval_sec: 300
+  timeout_sec: 30
+# Unified decision & sizing authority (Phase 5). Combines ML win prob,
+# expected value, LLM regime alignment, and sentiment into go/no-go + size.
+# With a neutral regime this is a pure EV / reward-risk gate on the ML edge.
+decision:
+  enabled: true
+  min_expected_value: 0.0
+  min_reward_risk: 0.8
+  regime_veto_confidence: 0.6
+  regime_veto_alignment: 0.5
+  regime_size_boost: 0.25
+  high_vol_size_haircut: 0.25
+  sentiment_size_weight: 0.15
+  min_size_scale: 0.4
+  max_size_scale: 1.5

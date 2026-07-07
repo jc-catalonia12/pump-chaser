@@ -15,7 +15,8 @@ use serde_json::{json, Value};
 use crate::config::SharedAppConfig;
 use crate::db::Database;
 use crate::exchange::TickerSnapshot;
-use crate::execution::trailing::{TrailingTrack, update_trailing, update_trailing_simple};
+use crate::execution::paper_fill::paper_chunk_pnl;
+use crate::execution::trailing::{TrailingTrack, update_trailing};
 use crate::risk::RiskManager;
 
 pub struct PaperTrader {
@@ -41,6 +42,8 @@ impl PaperTrader {
     ) -> Vec<Value> {
         let mut events = Vec::new();
         let cfg = self.config.read().unwrap().clone();
+        let fee_rate = cfg.execution.paper_fee_rate;
+        let slippage = cfg.execution.paper_slippage_pct;
         let positions = self.db.get_open_positions().await.unwrap_or_default();
         for pos in positions {
             let Some(paper) = pos.get("paper").and_then(|v| v.as_bool()) else {
@@ -61,7 +64,6 @@ impl PaperTrader {
             let side = pos.get("side").and_then(|v| v.as_str()).unwrap_or("long").to_string();
             let entry = pos.get("entry_price").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let mut sl = pos.get("stop_loss").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let strategy = pos.get("strategy").and_then(|v| v.as_str()).unwrap_or("confluence");
             let opened = pos.get("opened_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let remaining = pos
                 .get("remaining_size")
@@ -70,8 +72,9 @@ impl PaperTrader {
                 .unwrap_or_else(|| pos.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0));
 
             // ── Time exit ─────────────────────────────────────────────────
-            if let Some(reason) = self.check_time_exit(strategy, &opened) {
-                if let Ok(pnl) = self.db.close_position(id, price, 1.0, 0.0, &reason).await {
+            if let Some(reason) = self.check_time_exit(&opened) {
+                let exit = paper_chunk_pnl(entry, price, remaining, &side, slippage, fee_rate).0;
+                if let Ok(pnl) = self.db.close_position(id, exit, 1.0, fee_rate, &reason).await {
                     let _ = risk.update_pnl(pnl).await;
                     let _ = risk.record_trade_outcome(&symbol, pnl > 0.0).await;
                     let _ = self
@@ -94,19 +97,7 @@ impl PaperTrader {
                 if track.stop <= 0.0 && sl > 0.0 {
                     track.stop = sl;
                 }
-                sl = if strategy == "volume_pump" {
-                    let p = &cfg.pump;
-                    update_trailing_simple(
-                        &side,
-                        entry,
-                        price,
-                        track,
-                        p.trailing_activation_pct,
-                        p.trailing_stop_pct,
-                    )
-                } else {
-                    update_trailing(&side, entry, price, track, &cfg.confluence)
-                };
+                sl = update_trailing(&side, entry, price, track, &cfg.risk);
                 if (sl - prev_sl).abs() > 1e-10 {
                     let _ = self.db.update_position_sl_tp(id, Some(sl), None).await;
                 }
@@ -172,27 +163,28 @@ impl PaperTrader {
                     let _ = self.db.update_position_sl_tp(id, None, Some(&new_levels_str)).await;
                 }
 
-                let pnl = if side == "long" {
-                    (price - entry) * close_vol
-                } else {
-                    (entry - price) * close_vol
-                };
+                let (exit_px, pnl) = paper_chunk_pnl(entry, price, close_vol, &side, slippage, fee_rate);
 
                 if is_last_tp || (remaining - close_vol) < 0.01 {
-                    let _ = self.db.close_position(id, price, 1.0, 0.0, "take_profit").await;
+                    if let Ok(pnl) =
+                        self.db
+                            .close_position(id, exit_px, 1.0, fee_rate, "take_profit")
+                            .await
+                    {
                     let _ = risk.update_pnl(pnl).await;
-                    let _ = risk.record_trade_outcome(&symbol, true).await;
+                    let _ = risk.record_trade_outcome(&symbol, pnl > 0.0).await;
                     let _ = self.db.log_event(
                         "position_closed",
-                        &format!("Paper TP{level} {symbol} ({side}) @ {price:.6}"),
+                        &format!("Paper TP{level} {symbol} ({side}) @ {exit_px:.6}"),
                         Some(json!({"pnl": pnl, "reason": "take_profit"})),
                     ).await;
                     events.push(json!({"position_id": id, "symbol": symbol, "reason": "take_profit", "level": level, "pnl": pnl}));
                     self.trailing_stops.remove(&id);
                     closed_full = true;
+                    }
                 } else {
                     let new_remaining = (remaining - close_vol).max(0.0);
-                    let _ = self.db.partial_close_position(id, new_remaining, price).await;
+                    let _ = self.db.partial_close_position(id, new_remaining, exit_px, pnl).await;
                     let _ = risk.update_pnl(pnl).await;
                 let _ = self.db.log_event(
                         "position_partial_tp",
@@ -227,7 +219,17 @@ impl PaperTrader {
             } else {
                 "stop_loss"
             };
-            if let Ok(pnl) = self.db.close_position(id, price, 1.0, 0.0, reason).await {
+            if let Ok(pnl) = self
+                .db
+                .close_position(
+                    id,
+                    paper_chunk_pnl(entry, price, remaining, &side, slippage, fee_rate).0,
+                    1.0,
+                    fee_rate,
+                    reason,
+                )
+                .await
+            {
                 let _ = risk.update_pnl(pnl).await;
                 let _ = risk.record_trade_outcome(&symbol, false).await;
                 let event_type = if reason.contains("stop") || reason == "trailing_stop" {
@@ -250,13 +252,8 @@ impl PaperTrader {
         events
     }
 
-    fn check_time_exit(&self, strategy: &str, opened_at: &str) -> Option<String> {
-        let cfg = self.config.read().unwrap();
-        let max_hold = match strategy {
-            "confluence" => cfg.confluence.max_hold_sec,
-            "volume_pump" => cfg.pump.max_hold_sec,
-            _ => 0,
-        };
+    fn check_time_exit(&self, opened_at: &str) -> Option<String> {
+        let max_hold = self.config.read().unwrap().trading.max_hold_sec;
         if max_hold == 0 {
             return None;
         }
@@ -265,11 +262,7 @@ impl PaperTrader {
             .ok()?;
         let age = Utc::now().signed_duration_since(opened).num_seconds().max(0) as u64;
         if age >= max_hold {
-            Some(if strategy == "volume_pump" {
-                "volume_pump_time_exit".into()
-            } else {
-                "confluence_time_exit".into()
-            })
+            Some("time_exit".into())
         } else {
             None
         }

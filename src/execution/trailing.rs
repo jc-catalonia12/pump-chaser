@@ -1,6 +1,6 @@
 //! Adaptive trailing stop — widens as profit grows so runners aren't cut on pullbacks.
 
-use crate::config::ConfluenceConfig;
+use crate::config::RiskConfig;
 
 #[derive(Debug, Clone, Default)]
 pub struct TrailingTrack {
@@ -19,7 +19,7 @@ impl TrailingTrack {
 }
 
 /// Trail distance for the current unrealized move (wider on bigger pumps/dumps).
-pub fn effective_trail_pct(cfg: &ConfluenceConfig, move_pct: f64) -> f64 {
+pub fn effective_trail_pct(cfg: &RiskConfig, move_pct: f64) -> f64 {
     if move_pct >= cfg.trailing_runner_activation_pct {
         cfg.trailing_runner_stop_pct
     } else if move_pct >= cfg.trailing_extended_activation_pct {
@@ -35,7 +35,7 @@ pub fn update_trailing(
     entry: f64,
     price: f64,
     track: &mut TrailingTrack,
-    cfg: &ConfluenceConfig,
+    cfg: &RiskConfig,
 ) -> f64 {
     if entry <= 0.0 || price <= 0.0 {
         return track.stop;
@@ -77,55 +77,12 @@ pub fn update_trailing(
     track.stop
 }
 
-/// Basic trailing for volume-pump (fixed trail % after activation).
-pub fn update_trailing_simple(
-    side: &str,
-    entry: f64,
-    price: f64,
-    track: &mut TrailingTrack,
-    activation_pct: f64,
-    trail_pct: f64,
-) -> f64 {
-    if entry <= 0.0 || price <= 0.0 {
-        return track.stop;
-    }
-    if track.peak_favorable <= 0.0 {
-        track.peak_favorable = entry;
-    }
-    if side == "long" {
-        track.peak_favorable = track.peak_favorable.max(price);
-    } else {
-        track.peak_favorable = track.peak_favorable.min(price);
-    }
-    let move_pct = if side == "long" {
-        (track.peak_favorable - entry) / entry
-    } else {
-        (entry - track.peak_favorable) / entry
-    };
-    if move_pct < activation_pct {
-        return track.stop;
-    }
-    let new_trail = if side == "long" {
-        track.peak_favorable * (1.0 - trail_pct)
-    } else {
-        track.peak_favorable * (1.0 + trail_pct)
-    };
-    track.stop = if track.stop <= 0.0 {
-        new_trail
-    } else if side == "long" {
-        new_trail.max(track.stop)
-    } else {
-        new_trail.min(track.stop)
-    };
-    track.stop
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ConfluenceConfig;
+    use crate::config::RiskConfig;
 
-    fn test_cfg() -> ConfluenceConfig {
+    fn test_cfg() -> RiskConfig {
         serde_json::from_value(serde_json::json!({
             "trailing_stop_pct": 0.01,
             "trailing_activation_pct": 0.015,

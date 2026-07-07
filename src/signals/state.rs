@@ -2,27 +2,12 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::{
-    exchange::{KlineBar, TickerSnapshot},
-    signals::sniper::PendingSetup,
-};
+use crate::exchange::{KlineBar, TickerSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Long,
     Short,
-}
-
-/// Volume surge armed — waiting for breakout / bias confirmation before entry.
-#[derive(Debug, Clone)]
-pub struct PendingPumpSetup {
-    pub side: Side,
-    pub armed_at: DateTime<Utc>,
-    pub composite_score: f64,
-    pub price_change_pct: f64,
-    pub volume_surge_ratio: f64,
-    pub vol_z: f64,
-    pub universe_rank: Option<u32>,
 }
 
 pub struct SymbolState {
@@ -33,13 +18,11 @@ pub struct SymbolState {
     /// Higher-timeframe klines (e.g. 15m/30m) for structural bias checks.
     pub htf_klines: Vec<KlineBar>,
     pub last_ticker: Option<TickerSnapshot>,
-    pub last_confluence_at: Option<DateTime<Utc>>,
+    pub last_signal_at: Option<DateTime<Utc>>,
     pub last_scanned_at: Option<DateTime<Utc>>,
-    pub last_pump_at: Option<DateTime<Utc>>,
-    /// HTF setup waiting for a 1m sniper trigger before firing.
-    pub pending_setup: Option<PendingSetup>,
-    /// Volume surge armed — waiting for breakout / bias confirmation.
-    pub pending_pump: Option<PendingPumpSetup>,
+    /// Latest perpetual funding rate (fraction, e.g. 0.0001 = 0.01%). Refreshed
+    /// periodically in the background; 0.0 until the first successful fetch.
+    pub funding_rate: f64,
 }
 
 impl SymbolState {
@@ -51,11 +34,9 @@ impl SymbolState {
             klines: Vec::new(),
             htf_klines: Vec::new(),
             last_ticker: None,
-            last_confluence_at: None,
+            last_signal_at: None,
             last_scanned_at: None,
-            last_pump_at: None,
-            pending_setup: None,
-            pending_pump: None,
+            funding_rate: 0.0,
         }
     }
 

@@ -10,23 +10,33 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::config::{AppConfig, EntryMode, SharedAppConfig};
+use crate::ai::{LlmRegimeService, RegimeInputs};
+use crate::config::{AppConfig, SharedAppConfig};
 use crate::db::Database;
 use crate::exchange::{MexcClient, TickerSnapshot};
-use crate::execution::{reconcile_on_boot, LivePositionMonitor, LiveTrader, PaperTrader};
+use crate::execution::{cleanup_after_position_closed, reconcile_on_boot, LivePositionMonitor, LiveTrader, PaperTrader};
+use crate::learning::ParamTuner;
+use crate::ml::labels::{compute_r_multiple, soft_label_from_r};
 use crate::ml::features::{normalize_feature_vector, TechnicalFeatureBuilder, FEATURE_DIM};
-use crate::ml::{EnhanceOutcome, MlPipeline};
+use crate::ml::{EnhanceOutcome, MlFeatureContext, MlPipeline};
 use crate::risk::RiskManager;
-use crate::signals::confluence::{ConfluenceEngine, ScanDiagnosis};
-use crate::signals::pump::{MacroHtfState, PumpConfirmResult, turnover_velocity, VolumePumpEngine};
-use crate::signals::sniper::{self, TriggerResult};
-use crate::signals::{PumpSignal, SymbolState, SymbolStates};
+use crate::sentiment::{sentiment_allows, SentimentService};
+use crate::signals::macro_filter::htf_move_pct;
+use crate::signals::state::Side;
+use crate::signals::{MacroHtfState, PumpSignal, SymbolState, SymbolStates};
 use crate::utils::{Alerter, UserSecrets};
 
-const VALID_TRADING_MODES: &[&str] = &["confluence", "pump", "volume_pump", "scalp", "both", "all"];
+const VALID_TRADING_MODES: &[&str] = &["ai"];
+
+/// Dedupe window for shadow-signal saves per symbol+side (seconds).
+const SHADOW_DEDUPE_SEC: i64 = 300;
 
 /// How often the learning loop resolves closed trades and trains the model.
 const LEARNING_INTERVAL_SEC: u64 = 30;
+
+/// Funding rates only settle every few hours, so we refresh them far less
+/// often than klines to keep REST load bounded across many tracked symbols.
+const FUNDING_REFRESH_EVERY_N_CYCLES: u64 = 10;
 
 /// Max pending signals shadow-resolved against price action per learning cycle.
 /// Keeps the per-cycle MEXC kline fetches bounded.
@@ -53,6 +63,7 @@ fn shadow_resolve_weight(cfg: &crate::config::LearningConfig, sig: &Value) -> f6
     match sig.get("reject_reason").and_then(|v| v.as_str()) {
         Some("ml_gate") => cfg.shadow_ml_reject_weight,
         Some("confluence_near_miss") => cfg.shadow_near_miss_weight,
+        Some("sentiment_gate") => cfg.shadow_sentiment_weight,
         _ => 1.0,
     }
 }
@@ -106,11 +117,7 @@ struct ScannerInner {
     db: Arc<Database>,
     risk: Arc<RwLock<RiskManager>>,
     exchange: MexcClient,
-    confluence: ConfluenceEngine,
-    volume_pump: VolumePumpEngine,
-    /// Universe turnover-velocity rank (1 = hottest), refreshed each ticker batch.
-    pump_ranks: RwLock<HashMap<String, u32>>,
-    /// BTC + ETH HTF bars for volume-pump macro gate.
+    /// BTC + ETH HTF bars for macro market context (ML features).
     macro_htf: RwLock<MacroHtfState>,
     paper: Mutex<PaperTrader>,
     live: Mutex<LiveTrader>,
@@ -131,6 +138,9 @@ struct ScannerInner {
     /// Throttle automatic phantom-position healing (unix sec).
     position_heal_at: AtomicI64,
     alerter: Arc<Alerter>,
+    sentiment: Arc<SentimentService>,
+    llm_regime: Arc<LlmRegimeService>,
+    last_tune_at: AtomicI64,
 }
 
 impl ScannerService {
@@ -157,6 +167,8 @@ impl ScannerService {
         let live = LiveTrader::new(config.clone(), db.clone(), secrets_snap.clone());
         let live_client = crate::exchange::MexcPrivateClient::from_secrets(&config.read().unwrap().mexc, &secrets_snap);
         let alerter = Arc::new(Alerter::new(config.read().unwrap().alerts.clone()).with_secrets(secrets.clone()));
+        let sentiment = Arc::new(SentimentService::new(config.clone(), db.clone()));
+        let llm_regime = Arc::new(LlmRegimeService::new(config.clone()));
         let live_monitor =
             LivePositionMonitor::new(config.clone(), db.clone(), live_client).with_alerter(alerter.clone());
         let inner = Arc::new(ScannerInner {
@@ -164,9 +176,6 @@ impl ScannerService {
             db: db.clone(),
             risk: risk.clone(),
             exchange,
-            confluence: ConfluenceEngine::new(config.clone()),
-            volume_pump: VolumePumpEngine::new(config.clone()),
-            pump_ranks: RwLock::new(HashMap::new()),
             macro_htf: RwLock::new(MacroHtfState::default()),
             paper: Mutex::new(PaperTrader::new(config.clone(), db)),
             live: Mutex::new(live),
@@ -184,6 +193,9 @@ impl ScannerService {
             started_at: RwLock::new(None),
             position_heal_at: AtomicI64::new(0),
             alerter,
+            sentiment,
+            llm_regime,
+            last_tune_at: AtomicI64::new(0),
         });
         Ok(Self {
             inner,
@@ -192,19 +204,7 @@ impl ScannerService {
     }
 
     fn active_strategies(&self) -> Vec<&str> {
-        let cfg = self.inner_cfg();
-        let mode = cfg.trading.mode.as_str();
-        let mut active = Vec::new();
-        if matches!(mode, "confluence" | "all") && cfg.confluence.enabled {
-            active.push("confluence");
-        }
-        if matches!(mode, "pump" | "volume_pump" | "both" | "all") && cfg.pump.enabled {
-            active.push("volume_pump");
-        }
-        if matches!(mode, "scalp" | "both" | "all") && cfg.scalp.enabled {
-            active.push("scalp");
-        }
-        active
+        vec!["ai"]
     }
 
     pub fn get_trading_settings(&self) -> Value {
@@ -212,10 +212,6 @@ impl ScannerService {
         json!({
             "trading_mode": cfg.trading.mode,
             "active_strategies": self.active_strategies(),
-            "scalp_enabled": cfg.scalp.enabled,
-            "scalp_active": self.active_strategies().contains(&"scalp"),
-            "confluence_enabled": cfg.confluence.enabled,
-            "pump_enabled": cfg.pump.enabled,
             "valid_modes": VALID_TRADING_MODES,
         })
     }
@@ -300,7 +296,7 @@ impl ScannerService {
                     .and_then(|s| s.last_scanned_at)
                     .map(|t| t.to_rfc3339());
                 let last_signal = state
-                    .and_then(|s| s.last_confluence_at)
+                    .and_then(|s| s.last_signal_at)
                     .map(|t| t.to_rfc3339());
 
                 let mut monitoring = Vec::new();
@@ -313,7 +309,7 @@ impl ScannerService {
                 if ticks_n > 0 {
                     monitoring.push(format!("Price ticks buffered: {ticks_n}"));
                 }
-                monitoring.push("Confluence: volume, zone, structure, liquidity".into());
+                monitoring.push("AI pipeline: features, ML gate, sentiment".into());
 
                 json!({
                     "rank": rank + 1,
@@ -354,6 +350,9 @@ impl ScannerService {
                 let healed = live.heal_phantom_open_positions().await;
                 if healed > 0 {
                     info!("Auto-healed {healed} phantom live position(s) not on MEXC");
+                    drop(live);
+                    let mut risk = self.inner.risk.write().await;
+                    let _ = risk.reconcile_pnl_from_db().await;
                 }
             }
         }
@@ -439,6 +438,82 @@ impl ScannerService {
         positions
     }
 
+    /// Enrich a single position with mark/unrealized PnL for charts (no phantom heal).
+    pub async fn enrich_position_for_chart(&self, mut pos: Value) -> Value {
+        let symbol = pos
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if symbol.is_empty() {
+            return pos;
+        }
+
+        let entry = pos.get("entry_price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let side = pos
+            .get("side")
+            .and_then(|v| v.as_str())
+            .unwrap_or("long")
+            .to_string();
+        let paper = pos.get("paper").and_then(|v| v.as_bool()).unwrap_or(true);
+        let size = pos
+            .get("remaining_size")
+            .and_then(|v| v.as_f64())
+            .filter(|&s| s > 0.0)
+            .or_else(|| pos.get("size").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+        let leverage = pos.get("leverage").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        let contract_size = if paper {
+            1.0
+        } else {
+            let live = self.inner.live.lock().await;
+            live.contract_size(&symbol)
+        };
+        let qty = size * contract_size;
+        let tickers = self.inner.ticker_map.read().await;
+        let mark = tickers
+            .get(&symbol)
+            .map(|t| t.last_price)
+            .filter(|&m| m > 0.0)
+            .unwrap_or(entry);
+        let is_open = pos.get("status").and_then(|v| v.as_str()) != Some("closed");
+
+        if let Some(obj) = pos.as_object_mut() {
+            obj.insert("mark_price".into(), json!(mark));
+            obj.insert("contract_size".into(), json!(contract_size));
+            if entry > 0.0 && is_open {
+                let move_pct = if side == "short" {
+                    (entry - mark) / entry * 100.0
+                } else {
+                    (mark - entry) / entry * 100.0
+                };
+                let upnl = if side == "short" {
+                    (entry - mark) * qty
+                } else {
+                    (mark - entry) * qty
+                };
+                let roi_pct = if leverage > 0.0 {
+                    move_pct * leverage
+                } else {
+                    move_pct
+                };
+                obj.insert(
+                    "unrealized_pnl".into(),
+                    json!((upnl * 1_000_000.0).round() / 1_000_000.0),
+                );
+                obj.insert(
+                    "unrealized_pnl_pct".into(),
+                    json!((move_pct * 100.0).round() / 100.0),
+                );
+                obj.insert(
+                    "unrealized_roi_pct".into(),
+                    json!((roi_pct * 100.0).round() / 100.0),
+                );
+            }
+        }
+        pos
+    }
+
     /// Live mark / unrealized PnL for one position (open positions only).
     pub async fn get_position_live(&self, position_id: i64) -> Option<Value> {
         self.get_open_positions_live()
@@ -450,19 +525,6 @@ impl ScannerService {
     pub async fn get_risk_metrics(&self) -> Value {
         let open = self.inner.db.get_open_positions().await.unwrap_or_default();
         let open_n = open.len() as i64;
-        let scalp = open
-            .iter()
-            .filter(|p| p.get("strategy").and_then(|v| v.as_str()) == Some("scalp"))
-            .count() as i64;
-        let confluence = open
-            .iter()
-            .filter(|p| p.get("strategy").and_then(|v| v.as_str()) == Some("confluence"))
-            .count() as i64;
-        let volume_pump = open
-            .iter()
-            .filter(|p| p.get("strategy").and_then(|v| v.as_str()) == Some("volume_pump"))
-            .count() as i64;
-        let risk = self.inner.risk.read().await;
         let stale_threshold = self.inner_cfg().risk.ws_stale_sec as i64;
         let last_tick = self.inner.last_tick_at.load(Ordering::Relaxed);
         let ws_stale = if last_tick == 0 {
@@ -470,7 +532,9 @@ impl ScannerService {
         } else {
             Utc::now().timestamp() - last_tick > stale_threshold
         };
-        risk.metrics_json(open_n, scalp, confluence, volume_pump, ws_stale)
+        let mut risk = self.inner.risk.write().await;
+        let _ = risk.sync_pnl_totals_from_db().await;
+        risk.metrics_json(open_n, ws_stale)
     }
 
     pub async fn get_symbol_klines(&self, symbol: &str) -> Vec<crate::exchange::KlineBar> {
@@ -484,35 +548,33 @@ impl ScannerService {
     }
 
     pub async fn get_learning_status(&self) -> Value {
-        let conf_stats = self
+        let trade_stats = self
             .inner
             .db
-            .get_trade_stats(200, Some("confluence"))
-            .await
-            .unwrap_or_else(|_| json!({}));
-        let pump_stats = self
-            .inner
-            .db
-            .get_trade_stats(200, Some("volume_pump"))
+            .get_trade_stats(200, None)
             .await
             .unwrap_or_else(|_| json!({}));
         let model = self.inner.ml.lock().await.learning_status();
         let settings = self.inner_cfg();
         let ml = &settings.ml;
         let learning = &settings.learning;
+        let promotion = self
+            .inner
+            .db
+            .promotion_metrics()
+            .await
+            .unwrap_or_else(|_| json!({}));
         json!({
             "enabled": learning.enabled,
             "shadow_ml_rejects": learning.shadow_ml_rejects,
-            "shadow_near_miss": learning.shadow_near_miss,
-            "confluence_trade_stats": conf_stats,
-            "volume_pump_trade_stats": pump_stats,
+            "trade_stats": trade_stats,
             "model": model,
+            "promotion": promotion,
             "message": format!(
-                "Continuous learning — trade W/L {:.1}×/{:.1}×, ML rejects {:.2}×, near-miss {:.2}×",
+                "Continuous learning — trade W/L {:.1}×/{:.1}×, ML rejects {:.2}×",
                 ml.trade_win_weight,
                 ml.trade_loss_weight,
                 learning.shadow_ml_reject_weight,
-                learning.shadow_near_miss_weight,
             ),
         })
     }
@@ -552,6 +614,24 @@ impl ScannerService {
         self.inner.ml.lock().await.learning_status()
     }
 
+    pub async fn sentiment_status(&self) -> Value {
+        self.inner.sentiment.status_json().await
+    }
+
+    pub async fn llm_regime_status(&self) -> Value {
+        self.inner.llm_regime.status_json().await
+    }
+
+    pub async fn param_evolution_history(&self) -> Value {
+        let runs = self
+            .inner
+            .db
+            .get_param_evolution_history(25)
+            .await
+            .unwrap_or_default();
+        json!({ "runs": runs })
+    }
+
     pub async fn start(&self) -> crate::error::Result<Value> {
         if self.inner.running.load(Ordering::SeqCst) {
             return Ok(self.get_status().await);
@@ -563,6 +643,13 @@ impl ScannerService {
         self.inner.running.store(true, Ordering::SeqCst);
         *self.inner.started_at.write().await = Some(Utc::now());
         let _ = self.inner.db.log_event("scanner", "Scanner starting", None).await;
+
+        // Paper learning: don't let a persisted ML auto-gate block all entries.
+        let cfg = self.inner.config.read().unwrap().clone();
+        if !cfg.execution.live_trading_enabled && cfg.execution.paper_relax_gates {
+            self.inner.ml.lock().await.set_gate_auto_enabled(false);
+            let _ = self.inner.db.set_ml_gate_auto_state(false).await;
+        }
 
         let inner = self.inner.clone();
         let tasks_arc = self.tasks.clone();
@@ -666,7 +753,12 @@ impl ScannerService {
     }
 
     pub async fn sync_exchange_positions(&self) -> Value {
-        self.inner.live.lock().await.sync_exchange_positions().await
+        let result = self.inner.live.lock().await.sync_exchange_positions().await;
+        {
+            let mut risk = self.inner.risk.write().await;
+            let _ = risk.reconcile_pnl_from_db().await;
+        }
+        result
     }
 
     /// Manually close an open position at the current mark price (paper) or via
@@ -810,11 +902,12 @@ impl ScannerService {
                 );
                 self.inner.alerter.trade_event("position_closed", &msg, Some(&details)).await;
                 info!("Manually closed position {position_id} {symbol} pnl={pnl:.4}");
-                // Cancel any dangling SL/TP plan orders left on MEXC.
                 if !paper {
+                    let exchange_pos_id = pos.get("exchange_position_id").and_then(|v| v.as_i64());
                     let live = self.inner.live.lock().await;
                     if live.is_live() {
-                        let _ = live.client().cancel_all_plan_orders(&symbol).await;
+                        cleanup_after_position_closed(live.client(), &symbol, exchange_pos_id)
+                            .await;
                     }
                 }
                 json!({
@@ -925,6 +1018,35 @@ impl ScannerInner {
                 guard.push(learn_task);
                 info!("Continuous learning loop started (every {LEARNING_INTERVAL_SEC}s)");
             }
+            if self.cfg().sentiment.enabled {
+                let sentiment = self.sentiment.clone();
+                guard.push(tokio::spawn(async move {
+                    sentiment.run_loop().await;
+                }));
+                info!("Sentiment poll loop started");
+            }
+            if self.cfg().ml.auto_retrain_enabled {
+                let retrain_inner = self.clone();
+                guard.push(tokio::spawn(async move {
+                    retrain_inner.retrain_loop().await;
+                }));
+                info!(
+                    "ONNX auto-retrain loop started (every {}h)",
+                    self.cfg().ml.retrain_interval_hours
+                );
+            }
+            if self.cfg().llm.enabled {
+                let regime_inner = self.clone();
+                guard.push(tokio::spawn(async move {
+                    regime_inner.llm_regime_loop().await;
+                }));
+                info!(
+                    "LLM regime loop started ({} @ {}, every {}s)",
+                    self.cfg().llm.model,
+                    self.cfg().llm.base_url,
+                    self.cfg().llm.poll_interval_sec
+                );
+            }
         }
 
         let _ = self.db.log_event("scanner", "Scanner started", None).await;
@@ -935,31 +1057,16 @@ impl ScannerInner {
     }
 
     async fn kline_refresh_loop(&self) {
+        let mut cycle: u64 = 0;
         while self.running.load(Ordering::SeqCst) {
             let cfg = self.cfg();
             let interval = cfg.scanner.kline_interval.clone();
             let lookback = cfg.scanner.kline_lookback_bars;
-            let htf_enabled = cfg.confluence.htf_enabled;
-            let htf_interval = cfg.confluence.htf_interval.clone();
-            let htf_lookback = cfg.confluence.htf_lookback_bars;
-            let pump_htf_enabled = cfg.pump.htf_enabled;
-            let pump_htf_interval = cfg.pump.htf_interval.clone();
-            let pump_htf_lookback = cfg.pump.htf_lookback_bars;
-            let sym_htf_enabled = htf_enabled || pump_htf_enabled;
-            let sym_htf_interval = if htf_enabled {
-                htf_interval.clone()
-            } else {
-                pump_htf_interval.clone()
-            };
-            let sym_htf_lookback = if htf_enabled {
-                htf_lookback
-            } else {
-                pump_htf_lookback
-            };
-            let macro_enabled = cfg.pump.macro_filter_enabled;
-            let macro_interval = cfg.pump.macro_htf_interval.clone();
-            let macro_lookback = cfg.pump.macro_htf_lookback_bars;
+            let htf_interval = cfg.scanner.htf_interval.clone();
+            let htf_lookback = cfg.scanner.htf_lookback_bars;
             let refresh_sec = cfg.scanner.kline_refresh_sec;
+            let fetch_funding =
+                cfg.scanner.fetch_funding_rate && cycle % FUNDING_REFRESH_EVERY_N_CYCLES == 0;
             let symbols = self.tracked_symbols.read().await.clone();
             for symbol in symbols {
                 if !self.running.load(Ordering::SeqCst) {
@@ -979,37 +1086,189 @@ impl ScannerInner {
                     }
                     Err(exc) => debug!("Kline refresh {symbol} skipped: {exc}"),
                 }
-                // Higher-timeframe klines for structural bias (confluence and/or pump)
-                if sym_htf_enabled {
-                    match self.exchange.get_klines(&symbol, &sym_htf_interval).await {
-                        Ok(mut bars) => {
-                            if bars.len() > sym_htf_lookback as usize {
-                                bars = bars[bars.len() - sym_htf_lookback as usize..].to_vec();
-                            }
+                // Higher-timeframe klines for structural context features
+                match self.exchange.get_klines(&symbol, &htf_interval).await {
+                    Ok(mut bars) => {
+                        if bars.len() > htf_lookback as usize {
+                            bars = bars[bars.len() - htf_lookback as usize..].to_vec();
+                        }
+                        let mut states = self.states.write().await;
+                        if let Some(state) = states.get_mut(&symbol) {
+                            state.update_htf_klines(bars);
+                        }
+                    }
+                    Err(exc) => debug!("HTF kline refresh {symbol} skipped: {exc}"),
+                }
+                // Funding rate — low-frequency ML feature input, not a trading gate.
+                if fetch_funding {
+                    match self.exchange.get_funding_rate(&symbol).await {
+                        Ok(rate) => {
                             let mut states = self.states.write().await;
                             if let Some(state) = states.get_mut(&symbol) {
-                                state.update_htf_klines(bars);
+                                state.funding_rate = rate;
                             }
                         }
-                        Err(exc) => debug!("HTF kline refresh {symbol} skipped: {exc}"),
+                        Err(exc) => debug!("Funding rate refresh {symbol} skipped: {exc}"),
                     }
                 }
             }
-            if macro_enabled {
-                self.refresh_macro_htf(&macro_interval, macro_lookback).await;
-            }
+            self.refresh_macro_htf(&htf_interval, htf_lookback).await;
+            cycle = cycle.wrapping_add(1);
             tokio::time::sleep(tokio::time::Duration::from_secs(refresh_sec))
                 .await;
         }
     }
 
+    /// Background loop: periodically retrain the ONNX GBM offline and hot-reload
+    /// it. Sleeps `ml.retrain_interval_hours` between checks, re-reading config
+    /// each cycle so toggling `auto_retrain_enabled` off takes effect promptly.
+    async fn retrain_loop(&self) {
+        let mut last_retrain_resolved: i64 = 0;
+        while self.running.load(Ordering::SeqCst) {
+            let cfg = self.cfg();
+            if cfg.ml.auto_retrain_enabled {
+                if let Some(resolved) = self.maybe_retrain_onnx(last_retrain_resolved).await {
+                    last_retrain_resolved = resolved;
+                }
+            }
+            let sleep_sec = cfg.ml.retrain_interval_hours.max(1) * 3600;
+            for _ in 0..sleep_sec {
+                if !self.running.load(Ordering::SeqCst) {
+                    return;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    /// Run `scripts/export_onnx.py` against the live DB if enough new resolved
+    /// signals have accumulated since the last retrain, then hot-reload the
+    /// resulting ONNX file into the live pipeline. Best-effort: any failure
+    /// (missing Python, missing deps, too few samples) just logs a warning —
+    /// the bot keeps trading on the online model / previous ONNX export.
+    /// Returns the resolved-signal count at the time of a successful retrain.
+    async fn maybe_retrain_onnx(&self, last_retrain_resolved: i64) -> Option<i64> {
+        let counts = match self.db.get_signal_outcome_counts().await {
+            Ok(c) => c,
+            Err(exc) => {
+                debug!("Retrain check skipped — couldn't read signal outcome counts: {exc}");
+                return None;
+            }
+        };
+        let resolved = counts.get("resolved").and_then(|v| v.as_i64()).unwrap_or(0);
+        let cfg = self.cfg();
+        if resolved - last_retrain_resolved < cfg.ml.retrain_min_new_samples as i64 {
+            debug!(
+                "Retrain skipped — only {} new resolved signal(s), need {}",
+                (resolved - last_retrain_resolved).max(0),
+                cfg.ml.retrain_min_new_samples
+            );
+            return None;
+        }
+
+        let python_bin = cfg.ml.python_bin.clone();
+        let script_path = cfg.ml.export_script_path.clone();
+        let db_path = cfg.storage.sqlite_path.clone();
+        let out_path = crate::ml::onnx_model_path(&cfg.ml);
+
+        info!("Starting offline ONNX retrain ({resolved} resolved signals available)...");
+        let output = tokio::process::Command::new(&python_bin)
+            .arg(&script_path)
+            .arg("--db")
+            .arg(&db_path)
+            .arg("--out")
+            .arg(&out_path)
+            .output()
+            .await;
+
+        match output {
+            Ok(out) if out.status.success() => {
+                info!(
+                    "ONNX retrain succeeded: {}",
+                    String::from_utf8_lossy(&out.stdout).trim()
+                );
+                self.ml.lock().await.reload_onnx();
+                let _ = self
+                    .db
+                    .log_event(
+                        "ml_retrain",
+                        "ONNX model retrained offline and hot-reloaded",
+                        Some(json!({ "resolved_signals": resolved })),
+                    )
+                    .await;
+                Some(resolved)
+            }
+            Ok(out) => {
+                warn!(
+                    "ONNX retrain script exited with {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                None
+            }
+            Err(exc) => {
+                warn!("Failed to spawn ONNX retrain script ({python_bin} {script_path}): {exc}");
+                None
+            }
+        }
+    }
+
+    /// Background loop: periodically classify the market regime via the local
+    /// Ollama LLM. The cached result feeds ML feature slots 27–32. Offline or
+    /// misbehaving Ollama degrades to a neutral regime — never blocks trading.
+    async fn llm_regime_loop(&self) {
+        while self.running.load(Ordering::SeqCst) {
+            let inputs = self.build_regime_inputs().await;
+            self.llm_regime.refresh(&inputs).await;
+            let interval = self.cfg().llm.poll_interval_sec.max(30);
+            for _ in 0..interval {
+                if !self.running.load(Ordering::SeqCst) {
+                    return;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    /// Assemble the market snapshot the LLM classifies: BTC/ETH HTF moves and
+    /// BTC volatility from the macro kline cache, plus news sentiment state.
+    async fn build_regime_inputs(&self) -> RegimeInputs {
+        let lookback = (self.cfg().scanner.htf_lookback_bars as usize).max(2);
+        let (btc_move, eth_move, btc_atr) = {
+            let macro_htf = self.macro_htf.read().await;
+            let btc_move = htf_move_pct(&macro_htf.btc_klines, lookback);
+            let eth_move = htf_move_pct(&macro_htf.eth_klines, lookback);
+            let hlc: Vec<(f64, f64, f64)> = macro_htf
+                .btc_klines
+                .iter()
+                .rev()
+                .take(15)
+                .rev()
+                .map(|b| (b.high, b.low, b.close))
+                .collect();
+            (btc_move, eth_move, crate::signals::indicators::atr_pct(&hlc))
+        };
+        let snap = self.sentiment.snapshot().await;
+        RegimeInputs {
+            btc_move_pct: btc_move,
+            eth_move_pct: eth_move,
+            btc_atr_pct: btc_atr,
+            global_sentiment: snap.global_score,
+            fear_greed: snap.fear_greed,
+        }
+    }
+
     /// Background loop: resolve closed-trade outcomes and train the online model.
     async fn learning_loop(&self) {
-        // Cold start only: replay resolved history into a brand-new (empty) model.
-        // A persisted model already carries that learning, so we don't double-count
-        // on restart — new trades flow in through the loop below.
         if self.ml.lock().await.online_sample_count() == 0 {
             self.bootstrap_online_model().await;
+        }
+        let paper_relax = !self.cfg().execution.live_trading_enabled
+            && self.cfg().execution.paper_relax_gates;
+        if paper_relax {
+            self.ml.lock().await.set_gate_auto_enabled(false);
+        } else if let Ok(enabled) = self.db.get_ml_gate_auto_state().await {
+            self.ml.lock().await.set_gate_auto_enabled(enabled);
         }
         while self.running.load(Ordering::SeqCst) {
             for _ in 0..LEARNING_INTERVAL_SEC {
@@ -1021,12 +1280,218 @@ impl ScannerInner {
             if let Err(exc) = self.resolve_outcomes_and_learn().await {
                 warn!("Learning loop error: {exc}");
             }
-            // Also learn from signals that never became trades by replaying them
-            // against the price action that followed. Multiplies training data.
-            let learning_enabled = self.config.read().unwrap().learning.enabled;
-            if learning_enabled {
-                let _ = self.resolve_pending_signals_from_price(SIGNAL_RESOLVE_BATCH).await;
+            let _ = self.resolve_pending_signals_from_price(SIGNAL_RESOLVE_BATCH).await;
+
+            if !paper_relax {
+                if let Some(toggled) = self.ml.lock().await.evaluate_gate_auto() {
+                    let _ = self.db.set_ml_gate_auto_state(toggled).await;
+                    let _ = self
+                        .db
+                        .log_event(
+                            "ml_gate_auto",
+                            &format!("ML gate auto-{}", if toggled { "enabled" } else { "disabled" }),
+                            None,
+                        )
+                        .await;
+                }
             }
+
+            self.maybe_run_auto_tune().await;
+        }
+    }
+
+    async fn maybe_run_auto_tune(&self) {
+        let cfg = self.cfg();
+        if !cfg.learning.auto_tune_enabled {
+            return;
+        }
+        let interval_sec = cfg.learning.auto_tune_interval_hours.max(1) * 3600;
+        let now = Utc::now().timestamp();
+        let last = self.last_tune_at.load(Ordering::Relaxed);
+        if last > 0 && now - last < interval_sec as i64 {
+            return;
+        }
+        self.last_tune_at.store(now, Ordering::Relaxed);
+
+        let signals = self
+            .db
+            .get_resolved_signals_with_features(2000)
+            .await
+            .unwrap_or_default();
+        if signals.len() < 50 {
+            return;
+        }
+        let champion = ParamTuner::load_champion(&self.db, &cfg)
+            .await
+            .map(|t| t.champion)
+            .unwrap_or_else(|_| ParamTuner::default_champion(&cfg));
+        let result = ParamTuner::tune(&signals, &champion);
+        let improved = result.get("improved").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !improved {
+            return;
+        }
+        let challenger = result.get("challenger").cloned().unwrap_or(json!({}));
+        let oos = result.get("oos_metrics").cloned().unwrap_or(json!({}));
+        let champion_oos = ParamTuner::tune(&signals, &champion)
+            .get("oos_metrics")
+            .cloned()
+            .unwrap_or(json!({}));
+        let promote = ParamTuner::should_promote(&champion_oos, &oos);
+        let apply = cfg.learning.auto_tune_apply == "apply";
+        if promote && apply {
+            let _ = self.db.set_strategy_overlay(&challenger).await;
+        }
+        let _ = self
+            .db
+            .insert_param_evolution(&champion, &challenger, &oos, promote && apply)
+            .await;
+        let _ = self
+            .db
+            .log_event(
+                "param_tune",
+                if promote && apply {
+                    "Parameter challenger promoted to overlay"
+                } else if promote {
+                    "Parameter tune suggests promotion (auto_tune_apply=suggest)"
+                } else {
+                    "Parameter tune completed — no promotion"
+                },
+                Some(result),
+            )
+            .await;
+    }
+
+    async fn ml_feature_context(&self, symbol: &str) -> MlFeatureContext {
+        let lookback = self.cfg().scanner.htf_lookback_bars as usize;
+        let btc_move = {
+            let macro_htf = self.macro_htf.read().await;
+            htf_move_pct(&macro_htf.btc_klines, lookback.max(2))
+        };
+        let global = self.sentiment.global_score().await;
+        let symbol_sentiment = self.sentiment.symbol_score(symbol).await.unwrap_or(0.0);
+        let (symbol_htf_move, funding_rate) = {
+            let states = self.states.read().await;
+            match states.get(symbol) {
+                Some(state) => (htf_move_pct(&state.htf_klines, lookback.max(2)), state.funding_rate),
+                None => (0.0, 0.0),
+            }
+        };
+        MlFeatureContext {
+            btc_htf_move_pct: btc_move,
+            global_sentiment: global,
+            symbol_htf_move_pct: symbol_htf_move,
+            funding_rate,
+            symbol_sentiment,
+            regime: self.llm_regime.regime().await,
+        }
+    }
+
+    async fn sentiment_allows_signal(&self, signal: &PumpSignal) -> bool {
+        let cfg = self.cfg().sentiment.clone();
+        let side = if signal.price_change_pct >= 0.0 {
+            Side::Long
+        } else {
+            Side::Short
+        };
+        let sym_score = self.sentiment.symbol_score(&signal.symbol).await;
+        let snap = self.sentiment.snapshot().await;
+        sentiment_allows(
+            side,
+            &signal.symbol,
+            snap.global_score,
+            sym_score,
+            snap.fear_greed,
+            &cfg,
+        )
+        .allows
+    }
+
+    async fn route_enhanced_signal(
+        &self,
+        signal: PumpSignal,
+        klines: &[crate::exchange::KlineBar],
+    ) -> Option<PumpSignal> {
+        let ctx = self.ml_feature_context(&signal.symbol).await;
+        let mut ml = self.ml.lock().await;
+        let mut enhanced = match ml.enhance_signal_outcome(signal, Some(klines), &ctx) {
+            EnhanceOutcome::Tradable(e) => e,
+            EnhanceOutcome::MlRejected(r) => {
+                drop(ml);
+                self.save_shadow_signal(r, "ml_gate").await;
+                return None;
+            }
+        };
+        drop(ml);
+
+        let cfg = self.cfg();
+        let paper_relax =
+            !cfg.execution.live_trading_enabled && cfg.execution.paper_relax_gates;
+
+        // Phase 5: unified decision authority. Fuses ML win prob, expected
+        // value, LLM regime alignment, and sentiment into go/no-go + sizing.
+        if cfg.decision.enabled {
+            if let Some(rejected) = self.apply_decision(&mut enhanced, &ctx, &cfg, paper_relax).await {
+                self.save_shadow_signal(rejected, "decision_gate").await;
+                return None;
+            }
+        }
+
+        if !paper_relax && !self.sentiment_allows_signal(&enhanced).await {
+            self.save_shadow_signal(enhanced, "sentiment_gate").await;
+            return None;
+        }
+        Some(enhanced)
+    }
+
+    /// Run the decision engine against an ML-enhanced signal, annotate it with
+    /// EV / reward-risk / reasoning, and (when approved) apply the conviction
+    /// size & leverage multipliers on top of the ML Kelly base. Returns
+    /// `Some(signal)` when the trade is rejected and should be shadowed;
+    /// `None` when it's approved (or when paper-relax keeps it for data).
+    async fn apply_decision(
+        &self,
+        signal: &mut PumpSignal,
+        ctx: &MlFeatureContext,
+        cfg: &AppConfig,
+        paper_relax: bool,
+    ) -> Option<PumpSignal> {
+        let side_long = signal.price_change_pct >= 0.0;
+        let take_profit = signal
+            .projected_take_profits
+            .first()
+            .copied()
+            .unwrap_or(signal.last_price);
+        let inputs = crate::ai::DecisionInputs {
+            win_prob: (signal.setup_probability_pct / 100.0).clamp(0.0, 1.0),
+            side_long,
+            entry: signal.last_price,
+            stop_loss: signal.projected_stop_loss,
+            take_profit,
+            regime: ctx.regime.clone(),
+            global_sentiment: ctx.global_sentiment,
+            symbol_sentiment: ctx.symbol_sentiment,
+        };
+        let decision = crate::ai::DecisionEngine::decide(&cfg.decision, &inputs);
+
+        let round2 = |x: f64| (x * 100.0).round() / 100.0;
+        signal.expected_value_r = round2(decision.expected_value_r);
+        signal.reward_risk = round2(decision.reward_risk);
+        signal.decision_reason = decision.reason.clone();
+        signal.message.push_str(&format!(" | {}", decision.reason));
+
+        if decision.approved {
+            signal.suggested_risk_pct *= decision.size_scale;
+            signal.suggested_leverage =
+                ((signal.suggested_leverage as f64) * decision.leverage_scale).round().max(1.0) as u32;
+            return None;
+        }
+
+        // Rejected. In paper-relax we keep collecting data (ML Kelly sizing
+        // left intact, decision reasoning recorded); otherwise shadow it.
+        if paper_relax {
+            None
+        } else {
+            Some(signal.clone())
         }
     }
 
@@ -1035,7 +1500,7 @@ impl ScannerInner {
     /// position. For each pending signal whose hold window has fully elapsed, we
     /// fetch the klines covering that window and label it win / loss / expired.
     async fn resolve_pending_signals_from_price(&self, max_signals: u32) -> u32 {
-        let max_hold = self.cfg().confluence.max_hold_sec.max(60) as i64;
+        let max_hold = self.cfg().trading.max_hold_sec.max(60) as i64;
         let now = Utc::now().timestamp();
         let pending = self.db.get_pending_signals(300).await.unwrap_or_default();
         // 60 one-minute bars before the signal are enough to recompute the full
@@ -1117,10 +1582,13 @@ impl ScannerInner {
                     let fv = TechnicalFeatureBuilder::feature_vector(&pre, None);
                     if fv.iter().any(|&v| v != 0.0) {
                         features = normalize_feature_vector(Some(&fv), FEATURE_DIM);
-                        let _ = self.db.set_signal_features(sig_id, &features).await;
                         backfilled += 1;
                     }
                 }
+            }
+            TechnicalFeatureBuilder::enrich_context_from_payload(&mut features, sig);
+            if features.iter().any(|&v| v != 0.0) {
+                let _ = self.db.set_signal_features(sig_id, &features).await;
             }
             if !features.iter().any(|&v| v != 0.0) {
                 continue;
@@ -1217,11 +1685,11 @@ impl ScannerInner {
                 .to_string();
             {
                 let mut risk = self.risk.write().await;
-                let before_ks = risk.metrics_json(0, 0, 0, 0, false)["kill_switch"]
+                let before_ks = risk.metrics_json(0, false)["kill_switch"]
                     .as_bool()
                     .unwrap_or(false);
                 let _ = risk.record_trade_outcome(&symbol, won).await;
-                let after = risk.metrics_json(0, 0, 0, 0, false);
+                let after = risk.metrics_json(0, false);
                 // Fire alert if kill switch was just auto-activated.
                 if !before_ks && after["kill_switch"].as_bool().unwrap_or(false) {
                     self.alerter
@@ -1292,11 +1760,26 @@ impl ScannerInner {
                 .map(|arr| arr.iter().filter_map(|x| x.as_f64()).collect())
                 .unwrap_or_default();
             if features.iter().any(|&v| v != 0.0) {
+                let entry_price = row.get("entry_price").and_then(json_f64).unwrap_or(0.0);
+                let side = row.get("side").and_then(|v| v.as_str()).unwrap_or("long");
+                let size = row.get("size").and_then(json_f64).unwrap_or(0.0);
+                let sl = row
+                    .get("payload")
+                    .and_then(|p| p.get("projected_stop_loss"))
+                    .and_then(json_f64)
+                    .unwrap_or(0.0);
+                let side_long = side == "long";
+                let r_mult = compute_r_multiple(pnl, entry_price, sl, size, side_long);
+                let soft = soft_label_from_r(r_mult);
                 let weight = self.cfg().ml.trade_outcome_weight(won);
-                self.ml
-                    .lock()
-                    .await
-                    .record_outcome_weighted(&features, won, weight);
+                let mut ml = self.ml.lock().await;
+                ml.record_outcome_soft(&features, soft, weight);
+                ml.record_r_outcome(r_mult, won);
+                drop(ml);
+                let _ = self
+                    .db
+                    .set_signal_outcome_meta(signal_id, r_mult, soft)
+                    .await;
                 learned += 1;
             }
         }
@@ -1315,6 +1798,10 @@ impl ScannerInner {
                     Some(stats),
                 )
                 .await;
+        }
+        {
+            let mut risk = self.risk.write().await;
+            let _ = risk.reconcile_pnl_from_db().await;
         }
         Ok(())
     }
@@ -1393,10 +1880,8 @@ impl ScannerInner {
         if !learning.enabled {
             return;
         }
-        match reject_reason {
-            "ml_gate" if !learning.shadow_ml_rejects => return,
-            "confluence_near_miss" if !learning.shadow_near_miss => return,
-            _ => {}
+        if reject_reason == "ml_gate" && !learning.shadow_ml_rejects {
+            return;
         }
 
         if let Ok(pending) = self.db.count_pending_shadow_signals().await {
@@ -1423,9 +1908,9 @@ impl ScannerInner {
             }
         }
 
-        // Dedupe: one shadow per symbol+side within confluence cooldown window.
+        // Dedupe: one shadow per symbol+side within the dedupe window.
         let side_long = signal.price_change_pct > 0.0;
-        let cooldown = self.cfg().confluence.alert_cooldown_sec as i64;
+        let cooldown = SHADOW_DEDUPE_SEC;
         if let Ok(dup) = self
             .db
             .count_recent_shadow_signals_side(&signal.symbol, side_long, cooldown)
@@ -1465,25 +1950,6 @@ impl ScannerInner {
         }
     }
 
-    async fn refresh_pump_ranks(&self) {
-        let states = self.states.read().await;
-        let tracked = self.tracked_symbols.read().await.clone();
-        let mut scores: Vec<(String, f64)> = Vec::new();
-        for sym in tracked {
-            if let Some(s) = states.get(&sym) {
-                if s.klines.len() >= 20 {
-                    scores.push((sym, turnover_velocity(&s.klines)));
-                }
-            }
-        }
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mut ranks = HashMap::new();
-        for (i, (sym, _)) in scores.iter().enumerate() {
-            ranks.insert(sym.clone(), (i + 1) as u32);
-        }
-        *self.pump_ranks.write().await = ranks;
-    }
-
     async fn refresh_macro_htf(&self, interval: &str, lookback: u32) {
         let mut btc_klines = Vec::new();
         match self.exchange.get_klines("BTC_USDT", interval).await {
@@ -1511,156 +1977,12 @@ impl ScannerInner {
         };
     }
 
-    async fn process_volume_pump_symbol(&self, symbol: &str, ticker: &TickerSnapshot) {
-        let pump_on = matches!(
-            self.cfg().trading.mode.as_str(),
-            "pump" | "volume_pump" | "both" | "all"
-        ) && self.cfg().pump.enabled;
-        if !pump_on {
-            return;
-        }
-
-        let rank = self.pump_ranks.read().await.get(symbol).copied();
-        let confirmation_enabled = self.cfg().pump.confirmation_enabled;
-        let macro_htf = self.macro_htf.read().await.clone();
-
-        let mut signal_to_emit: Option<PumpSignal> = None;
-        let klines;
-
-        {
-            let mut states = self.states.write().await;
-            let state = match states.get_mut(symbol) {
-                Some(s) => s,
-                None => return,
-            };
-
-            if self.volume_pump.in_cooldown(state) {
-                return;
-            }
-
-            if state.klines.len() < 10 || state.prices.len() < 6 {
-                return;
-            }
-
-            klines = state.klines.clone();
-
-            if confirmation_enabled {
-                if let Some(pending) = state.pending_pump.clone() {
-                    match self
-                        .volume_pump
-                        .check_confirmation(state, &pending, None, &macro_htf)
-                    {
-                        PumpConfirmResult::Fire(signal) => {
-                            state.pending_pump = None;
-                            signal_to_emit = Some(signal);
-                        }
-                        PumpConfirmResult::Expired => {
-                            state.pending_pump = None;
-                            let _ = self
-                                .db
-                                .log_event(
-                                    "volume_pump_expired",
-                                    &format!("Pump confirmation expired for {symbol}"),
-                                    None,
-                                )
-                                .await;
-                        }
-                        PumpConfirmResult::Waiting => {}
-                    }
-                } else if let Some(armed) = self.volume_pump.try_arm(state, rank, None) {
-                    let _ = self
-                        .db
-                        .log_event(
-                            "volume_pump_armed",
-                            &format!("Volume pump armed for {symbol} — awaiting confirmation"),
-                            Some(json!({
-                                "symbol": symbol,
-                                "side": if armed.side == crate::signals::state::Side::Long { "long" } else { "short" },
-                                "composite_score": armed.composite_score,
-                            })),
-                        )
-                        .await;
-                    state.pending_pump = Some(armed);
-                }
-            } else if let Some(signal) = self.volume_pump.evaluate(state, rank, None, &macro_htf) {
-                signal_to_emit = Some(signal);
-            }
-        }
-
-        if let Some(signal) = signal_to_emit {
-            self.emit_volume_pump_signal(symbol, signal, &klines).await;
-            return;
-        }
-
-        let diagnosis = {
-            let states = self.states.read().await;
-            states
-                .get(symbol)
-                .map(|s| self.volume_pump.diagnose(s, rank, None, &macro_htf))
-                .unwrap_or(ScanDiagnosis {
-                    action: "skipped".into(),
-                    message: "State unavailable".into(),
-                    composite_score: None,
-                    confluence_count: None,
-                    side: None,
-                })
-        };
-        if diagnosis.action == "rejected" || diagnosis.action == "warming" {
-            self.maybe_record_scan(
-                symbol,
-                &diagnosis.action,
-                &format!("[pump] {}", diagnosis.message),
-                diagnosis.composite_score,
-                diagnosis.confluence_count,
-                diagnosis.side.as_deref(),
-                ticker,
-            )
-            .await;
-        }
-    }
-
-    async fn emit_volume_pump_signal(
-        &self,
-        symbol: &str,
-        signal: PumpSignal,
-        klines: &[crate::exchange::KlineBar],
-    ) {
-        let _ = self
-            .db
-            .log_event(
-                "volume_pump_detected",
-                &format!("Volume pump setup: {}", signal.symbol),
-                Some(signal.to_payload()),
-            )
-            .await;
-        let mut ml = self.ml.lock().await;
-        match ml.enhance_signal_outcome(signal, Some(klines)) {
-            EnhanceOutcome::Tradable(enhanced) => {
-                drop(ml);
-                self.emit_signal(enhanced).await;
-                let mut states = self.states.write().await;
-                if let Some(s) = states.get_mut(symbol) {
-                    s.last_pump_at = Some(Utc::now());
-                    s.pending_pump = None;
-                }
-            }
-            EnhanceOutcome::MlRejected(rejected) => {
-                drop(ml);
-                self.save_shadow_signal(rejected, "ml_gate").await;
-            }
-        }
-    }
-
     async fn process_tickers(&self, tickers: Vec<TickerSnapshot>) {
         // Stamp the last time we received live ticker data for WS-staleness detection.
         self.last_tick_at.store(Utc::now().timestamp(), Ordering::Relaxed);
 
-        self.refresh_pump_ranks().await;
-
-        let app_cfg = self.cfg();
         let tracked: Vec<String> = self.tracked_symbols.read().await.clone();
-        let mode = app_cfg.trading.mode.clone();
-        let conf_on = matches!(mode.as_str(), "confluence" | "all") && app_cfg.confluence.enabled;
+        let cfg = self.cfg();
 
         for ticker in tickers {
             self.ticker_map
@@ -1672,199 +1994,60 @@ impl ScannerInner {
             }
 
             let symbol = ticker.symbol.clone();
-            let mut states = self.states.write().await;
-            let state = states
-                .entry(symbol.clone())
-                .or_insert_with(|| SymbolState::new(symbol.clone()));
-            state.update_ticker(&ticker);
-            state.last_scanned_at = Some(Utc::now());
-
-            if conf_on {
-            let mut skip_confluence_body = false;
-            // ── Sniper check: poll pending 15m setup for 1m trigger ────────
-            let pending_setup = state.pending_setup.take();
-            if let Some(pending) = pending_setup {
-                let klines_snap = state.klines.clone();
-                drop(states);
-                let sniper_cfg = &app_cfg.sniper;
-                match sniper::check_trigger(&pending, &klines_snap, sniper_cfg) {
-                    TriggerResult::Fire { signal, limit_price: _ } => {
-                        info!(
-                            "[sniper] 1m trigger fired for {} — emitting sniper entry",
-                            signal.symbol
-                        );
-                        let _ = self.db.log_event(
-                            "sniper_triggered",
-                            &format!("Sniper 1m trigger for {}", signal.symbol),
-                            Some(serde_json::json!({
-                                "limit_price": signal.limit_entry_price,
-                                "entry_mode": signal.entry_mode,
-                            })),
-                        ).await;
-                        self.emit_signal(signal).await;
-                        let mut states = self.states.write().await;
-                        if let Some(s) = states.get_mut(&symbol) {
-                            s.last_confluence_at = Some(Utc::now());
-                        }
-                        skip_confluence_body = true;
+            // Update state and evaluate the AI candidate generator under one
+            // lock scope; stamp the cooldown as soon as a candidate is taken so
+            // subsequent ticks don't re-emit while routing is in flight.
+            let candidate = {
+                let mut states = self.states.write().await;
+                let state = states
+                    .entry(symbol.clone())
+                    .or_insert_with(|| SymbolState::new(symbol.clone()));
+                state.update_ticker(&ticker);
+                state.last_scanned_at = Some(Utc::now());
+                match crate::signals::AiCandidateEngine::evaluate(&cfg, state) {
+                    Some(signal) => {
+                        state.last_signal_at = Some(Utc::now());
+                        Some((signal, state.klines.clone()))
                     }
-                    TriggerResult::Expired => {
-                        info!("[sniper] Setup expired for {} without trigger", symbol);
-                        let _ = self.db.log_event(
-                            "sniper_expired",
-                            &format!("Sniper setup expired for {} — no clean 1m trigger", symbol),
-                            None,
-                        ).await;
-                        skip_confluence_body = true;
-                    }
-                    TriggerResult::Waiting => {
-                        let mut states = self.states.write().await;
-                        if let Some(s) = states.get_mut(&symbol) {
-                            s.pending_setup = Some(pending);
-                        }
-                        skip_confluence_body = true;
-                    }
+                    None => None,
                 }
-            } else {
-                drop(states);
-            }
-            // ──────────────────────────────────────────────────────────────
-
-            if !skip_confluence_body {
-            let mut states = self.states.write().await;
-            let state = states
-                .entry(symbol.clone())
-                .or_insert_with(|| SymbolState::new(symbol.clone()));
-            if self.confluence.in_cooldown(state) {
-                drop(states);
-                self.maybe_record_scan(
-                    &symbol,
-                    "cooldown",
-                    "On alert cooldown — skipping re-analysis",
-                    None,
-                    None,
-                    None,
-                    &ticker,
-                )
-                .await;
-            } else if state.klines.len() < 15 || state.prices.len() < 8 {
-                let klines_n = state.klines.len();
-                let ticks_n = state.prices.len();
-                drop(states);
-                self.maybe_record_scan(
-                    &symbol,
-                    "warming",
-                    &format!("Collecting data — klines {klines_n}/15, ticks {ticks_n}/8"),
-                    None,
-                    None,
-                    None,
-                    &ticker,
-                )
-                .await;
-            } else {
-            let evaluated = self.confluence.evaluate(state, None, false);
-            let near_miss = if evaluated.is_none() && app_cfg.learning.shadow_near_miss {
-                self.confluence.evaluate_near_miss(
-                    state,
-                    None,
-                    false,
-                    app_cfg.learning.near_miss_margin,
-                )
-            } else {
-                None
             };
-            let klines = state.klines.clone();
-            drop(states);
 
-            if let Some(signal) = evaluated {
-                let mut ml = self.ml.lock().await;
-                match ml.enhance_signal_outcome(signal, Some(&klines)) {
-                    EnhanceOutcome::Tradable(enhanced) => {
-                        drop(ml);
-                        let entry_mode = &app_cfg.sniper.entry_mode;
-                        if *entry_mode == EntryMode::Sniper {
-                            // Park the HTF-confirmed signal; wait for a 1m trigger
-                            let pending = sniper::record_setup(&enhanced);
-                            info!(
-                                "[sniper] HTF setup confirmed for {} — waiting for 1m trigger",
-                                enhanced.symbol
-                            );
-                            let _ = self.db.log_event(
-                                "sniper_setup_parked",
-                                &format!("15m setup parked for {} — waiting 1m trigger", enhanced.symbol),
-                                Some(serde_json::json!({ "score": enhanced.composite_score })),
-                            ).await;
-                            let mut states = self.states.write().await;
-                            if let Some(s) = states.get_mut(&symbol) {
-                                s.pending_setup = Some(pending);
-                                s.last_confluence_at = Some(Utc::now());
-                            }
-                        } else if *entry_mode == EntryMode::Limit {
-                            // Immediate limit order offset from current price
-                            let mut sig = enhanced.clone();
-                            sig.entry_mode = "limit".to_string();
-                            // limit_entry_price stays 0 → live.rs will apply the offset
-                            self.emit_signal(sig).await;
-                            let mut states = self.states.write().await;
-                            if let Some(s) = states.get_mut(&symbol) {
-                                s.last_confluence_at = Some(Utc::now());
-                            }
-                        } else {
-                            // Market mode — fire immediately (original behaviour)
-                            self.emit_signal(enhanced).await;
-                            let mut states = self.states.write().await;
-                            if let Some(s) = states.get_mut(&symbol) {
-                                s.last_confluence_at = Some(Utc::now());
-                            }
-                        }
-                    }
-                    EnhanceOutcome::MlRejected(rejected) => {
-                        drop(ml);
-                        self.save_shadow_signal(rejected, "ml_gate").await;
-                    }
-                }
-            } else if let Some(near) = near_miss {
-                let mut ml = self.ml.lock().await;
-                let enriched = ml.attach_features(near, Some(&klines));
-                drop(ml);
-                self.save_shadow_signal(enriched, "confluence_near_miss")
-                    .await;
-            } else {
-            let diagnosis = {
-                let states = self.states.read().await;
-                states
-                    .get(&symbol)
-                    .map(|s| self.confluence.diagnose(s, None, false))
-                    .unwrap_or(ScanDiagnosis {
-                        action: "skipped".into(),
-                        message: "State unavailable".into(),
-                        composite_score: None,
-                        confluence_count: None,
-                        side: None,
-                    })
-            };
-            self.maybe_record_scan(
-                &symbol,
-                &diagnosis.action,
-                &diagnosis.message,
-                diagnosis.composite_score,
-                diagnosis.confluence_count,
-                diagnosis.side.as_deref(),
-                &ticker,
-            )
-            .await;
+            if let Some((signal, klines)) = candidate {
+                self.process_ai_candidate(signal, klines, &ticker).await;
             }
-            }
-            }
-            } // conf_on
-
-            self.process_volume_pump_symbol(&symbol, &ticker).await;
         }
 
         let map = self.ticker_map.read().await.clone();
         let mut risk = self.risk.write().await;
         let _ = self.paper.lock().await.monitor_positions(&map, &mut risk).await;
         let _ = self.live_monitor.lock().await.monitor(&map, &mut risk).await;
+    }
+
+    /// Route a fresh AI candidate through the ML/sentiment pipeline and emit
+    /// it for execution when tradable. Rejected candidates become shadow
+    /// signals inside `route_enhanced_signal` so the model still learns.
+    async fn process_ai_candidate(
+        &self,
+        signal: PumpSignal,
+        klines: Vec<crate::exchange::KlineBar>,
+        ticker: &TickerSnapshot,
+    ) {
+        let side = if signal.price_change_pct >= 0.0 { "long" } else { "short" };
+        self.maybe_record_scan(
+            &signal.symbol,
+            "candidate",
+            &signal.message,
+            Some(signal.composite_score),
+            Some(signal.confluence_count),
+            Some(side),
+            ticker,
+        )
+        .await;
+
+        if let Some(enhanced) = self.route_enhanced_signal(signal, &klines).await {
+            self.emit_signal(enhanced).await;
+        }
     }
 
     async fn maybe_record_scan(
@@ -1954,25 +2137,13 @@ impl ScannerInner {
             )
             .await;
         }
-        let event_type = if signal.strategy == "volume_pump" {
-            "volume_pump_signal"
-        } else {
-            "signal"
-        };
-        let event_msg = if signal.strategy == "volume_pump" {
-            format!(
-                "Volume pump signal: {} score={:.1}",
-                signal.symbol, signal.composite_score
-            )
-        } else {
-            format!(
-                "Confluence signal: {} score={:.1}",
-                signal.symbol, signal.composite_score
-            )
-        };
+        let event_msg = format!(
+            "Signal: {} score={:.1}",
+            signal.symbol, signal.composite_score
+        );
         let _ = self
             .db
-            .log_event(event_type, &event_msg, Some(payload))
+            .log_event("signal", &event_msg, Some(payload))
             .await;
 
         // Gate execution when the WS feed is stale — prices may be stale too.

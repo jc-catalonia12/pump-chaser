@@ -17,7 +17,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-FEATURE_DIM = 15  # 10 technical + 5 signal-context features (composite_score, zone_score, volume_surge, side_long, price_chg_abs)
+FEATURE_DIM = 33  # must match `FEATURE_DIM` / `FEATURE_COLUMNS` in src/ml/features.rs (Phase 2+)
 
 
 def normalize(vec: list[float] | None, dim: int = FEATURE_DIM) -> list[float]:

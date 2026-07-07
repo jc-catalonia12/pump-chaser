@@ -32,7 +32,7 @@ pub async fn run() -> Result<()> {
     let config: crate::config::SharedAppConfig = Arc::new(RwLock::new(loaded));
     let config_snap = config.read().unwrap().clone();
     let db = Arc::new(Database::connect(&config_snap.storage.sqlite_path).await?);
-    db.migrate().await?;
+    db.migrate(config_snap.execution.paper_initial_equity).await?;
 
     let risk = Arc::new(AsyncRwLock::new(
         RiskManager::new(config.clone(), db.clone()).await?,

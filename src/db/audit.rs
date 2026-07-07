@@ -24,6 +24,7 @@ pub const NOTIFICATION_EVENT_TYPES: &[&str] = &[
     "position_rollback",
     "scanner",
     "signal",
+    // Legacy event types kept so old audit rows still surface in the feed.
     "volume_pump_detected",
     "volume_pump_signal",
     "volume_pump_armed",

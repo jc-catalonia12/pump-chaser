@@ -44,6 +44,11 @@ pub fn router(state: AppState) -> Router {
         .route("/activity/seen", post(handlers::activity_seen))
         .route("/learning/status", get(handlers::learning_status))
         .route("/learning/reload", post(handlers::learning_reload))
+        .route("/sentiment/status", get(handlers::sentiment_status))
+        .route("/sentiment/news", get(handlers::sentiment_news))
+        .route("/llm/status", get(handlers::llm_regime_status))
+        .route("/tuner/history", get(handlers::tuner_history))
+        .route("/promotion/status", get(handlers::promotion_status))
         .route("/audit", get(handlers::audit))
         .route("/optimization", get(handlers::optimization))
         // User config (settings.yaml)
@@ -56,6 +61,7 @@ pub fn router(state: AppState) -> Router {
         .route("/trading/settings", put(handlers::trading_settings_put))
         .route("/kill-switch/activate", post(handlers::kill_switch_activate))
         .route("/kill-switch/deactivate", post(handlers::kill_switch_deactivate))
+        .route("/risk/circuit-breaker/reset", post(handlers::circuit_breaker_reset))
         // ML
         .route("/ml/stack", get(handlers::ml_stack))
         .route("/ml/status", get(handlers::ml_status))
@@ -87,6 +93,7 @@ pub fn router(state: AppState) -> Router {
         .route("/training/run", post(handlers::training_run))
         .route("/training/run/sync", post(handlers::training_run_sync))
         .route("/backtest", post(handlers::backtest))
+        .route("/backtest/acceptance", post(handlers::backtest_acceptance))
         .route("/walk-forward", post(handlers::walk_forward))
         .route("/historical/fetch", post(handlers::historical_fetch))
         // Exchanges & live

@@ -1,8 +1,10 @@
 pub mod audit;
+pub mod news;
 pub mod pnl;
 pub mod portfolio;
 pub mod positions;
 pub mod signals;
+pub mod tuner;
 
 pub use portfolio::PortfolioState;
 
@@ -47,7 +49,7 @@ impl Database {
         &self.pool
     }
 
-    pub async fn migrate(&self) -> Result<()> {
+    pub async fn migrate(&self, paper_initial_equity: f64) -> Result<()> {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS portfolio_state (
@@ -79,7 +81,7 @@ impl Database {
                 closed_at TEXT,
                 realized_pnl REAL NOT NULL DEFAULT 0,
                 paper INTEGER NOT NULL DEFAULT 1,
-                strategy TEXT NOT NULL DEFAULT 'confluence',
+                strategy TEXT NOT NULL DEFAULT 'ai',
                 leverage INTEGER,
                 signal_id INTEGER
             );
@@ -112,6 +114,26 @@ impl Database {
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS news_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                title TEXT NOT NULL,
+                url TEXT NOT NULL DEFAULT '',
+                score REAL NOT NULL DEFAULT 0,
+                symbols TEXT NOT NULL DEFAULT '[]',
+                published_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS param_evolution (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                champion TEXT NOT NULL,
+                challenger TEXT NOT NULL,
+                oos_metrics TEXT NOT NULL,
+                promoted INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
             "#,
         )
         .execute(&self.pool)
@@ -142,11 +164,14 @@ impl Database {
             .await?;
 
         if row.0 == 0 {
+            let eq = paper_initial_equity.max(1.0);
             let now = chrono::Utc::now().to_rfc3339();
             sqlx::query(
                 "INSERT INTO portfolio_state (id, equity, daily_pnl, weekly_pnl, peak_equity, updated_at)
-                 VALUES (1, 10000, 0, 0, 10000, ?)",
+                 VALUES (1, ?, 0, 0, ?, ?)",
             )
+            .bind(eq)
+            .bind(eq)
             .bind(&now)
             .execute(&self.pool)
             .await?;

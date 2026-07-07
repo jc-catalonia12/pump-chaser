@@ -4,6 +4,11 @@
   "windows": ["main", "splash"],
   "permissions": [
     "core:default",
-    "core:webview:deny-internal-toggle-devtools"
+    "core:webview:deny-internal-toggle-devtools",
+    "updater:default",
+    "updater:allow-check",
+    "updater:allow-download-and-install",
+    "process:default",
+    "process:allow-restart"
   ]
 }

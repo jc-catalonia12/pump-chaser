@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="/styles.css" />
   <script src="/desktop-guard.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
   <script src="https://s3.tradingview.com/tv.js"></script>
 </head>
 <body>
@@ -66,6 +66,7 @@
           <button id="btn-stop" class="btn" type="button">Stop</button>
         </div>
         <button id="btn-kill" class="btn btn-danger btn-block" type="button">Kill Switch</button>
+        <button id="btn-reset-circuit-breaker" class="btn btn-warning btn-block hidden" type="button">Reset Circuit Breaker</button>
         <p id="control-feedback" class="feedback hidden"></p>
       </div>
 
@@ -161,6 +162,54 @@
             </div>
           </div>
 
+          <div class="grid-2 dashboard-market-row">
+            <div class="card greed-card">
+              <div class="card-head">
+                <h2>Fear &amp; Greed</h2>
+                <a href="https://feargreedmeter.com/crypto" target="_blank" rel="noopener noreferrer" class="hint altme-src">feargreedmeter.com ↗</a>
+              </div>
+              <div id="dash-greed-widget" class="greed-custom-widget">
+                <div class="news-feed-empty">Loading…</div>
+              </div>
+              <div class="sentiment-mini-row">
+                <span class="hint">News sentiment</span>
+                <span id="dash-global-sentiment" class="sentiment-pill mono">—</span>
+              </div>
+              <div class="sentiment-mini-row">
+                <span class="hint">LLM regime</span>
+                <span id="dash-llm-regime" class="sentiment-pill" title="Local Ollama market-regime read — neutral when offline">—</span>
+              </div>
+            </div>
+            <div class="card news-feed-card">
+              <div class="card-head">
+                <h2>News</h2>
+                <span id="dash-news-counter" class="tag">—</span>
+              </div>
+              <div class="table-wrap">
+                <table class="data news-table">
+                  <thead>
+                    <tr>
+                      <th class="news-col-source">Source</th>
+                      <th>Headline</th>
+                      <th class="news-col-score">Score</th>
+                      <th class="news-col-age">Age</th>
+                    </tr>
+                  </thead>
+                  <tbody id="dash-news-tbody">
+                    <tr><td colspan="4" class="news-feed-empty">Loading…</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="pagination" id="dash-news-pagination">
+                <span id="dash-news-info" class="hint">—</span>
+                <div class="btn-row">
+                  <button id="dash-news-prev" class="btn btn-sm" type="button" disabled>‹ Prev</button>
+                  <button id="dash-news-next" class="btn btn-sm" type="button">Next ›</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div class="card balance-card">
             <div class="card-head">
               <h2>Balance History</h2>
@@ -188,7 +237,7 @@
         <section id="panel-signals" class="panel">
           <div class="page-head">
             <h1>Signals</h1>
-            <p class="page-desc">Confluence setups ranked by composite score · click row for chart</p>
+            <p class="page-desc">AI pipeline setups ranked by score · click row for chart</p>
           </div>
           <div class="card">
             <div class="card-head">
@@ -289,11 +338,11 @@
         </section>
 
         <!-- Training -->
-        <section id="panel-training" class="panel">
+        <section id="panel-training" class="panel training-panel">
           <div class="page-head page-head-row">
             <div>
               <h1>ML Training</h1>
-              <p class="page-desc">Post-gate performance and prediction quality — ignore training-label win rate</p>
+              <p class="page-desc">Post-gate win rate, gate accuracy, and model health</p>
             </div>
             <div class="btn-row">
               <button id="btn-training-refresh" class="btn btn-sm" type="button">Refresh</button>
@@ -303,31 +352,44 @@
           <p id="training-error" class="feedback err hidden" role="alert"></p>
           <p id="training-feedback" class="feedback hidden"></p>
 
-          <!-- Primary focus metrics -->
-          <div class="training-focus-kpis" id="training-outcomes">
-            <div class="kpi-card kpi-card-hero">
+          <div class="kpi-grid" id="training-outcomes">
+            <div class="kpi-card training-kpi-primary">
               <span class="kpi-label">Post-Gate Win Rate</span>
               <span id="to-postgatewinrate" class="kpi-value mono positive">—</span>
               <span class="kpi-sub" id="to-postgate-resolved">—</span>
-              <span class="kpi-hint">Setups that passed the ML gate — main trading metric</span>
             </div>
             <div class="kpi-card">
               <span class="kpi-label">Gate Accuracy</span>
               <span id="training-gate-accuracy" class="kpi-value mono">—</span>
               <span class="kpi-sub" id="training-gate-threshold">—</span>
-              <span class="kpi-hint">Model correct at your threshold</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-label">Prediction Accuracy</span>
+              <span class="kpi-label">Recent Accuracy</span>
               <span id="training-recent-accuracy" class="kpi-value mono">—</span>
               <span class="kpi-sub" id="training-recent-window">—</span>
-              <span class="kpi-hint">Recent calibration @50%</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-label">Model Status</span>
+              <span class="kpi-label">Model</span>
               <span id="training-active" class="kpi-value">—</span>
               <span class="kpi-sub"><span id="training-online-badge" class="tag">—</span></span>
-              <span class="kpi-hint" id="training-samples-hint">—</span>
+              <span class="kpi-sub" id="training-samples-hint">—</span>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head">
+                <h2>Prediction Quality</h2>
+                <span class="hint">Gate accuracy over time</span>
+              </div>
+              <div class="balance-chart-wrap training-chart-wrap"><canvas id="training-quality-chart"></canvas></div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <h2>7-Day Outcomes</h2>
+                <span class="hint">Daily wins &amp; losses</span>
+              </div>
+              <div class="balance-chart-wrap training-chart-wrap"><canvas id="training-rolling-chart"></canvas></div>
             </div>
           </div>
 
@@ -349,42 +411,58 @@
           </div>
 
           <div class="grid-2">
-            <div class="card">
+            <div class="card" id="training-promotion-card">
               <div class="card-head">
-                <h2>Prediction Quality</h2>
-                <span class="hint">Gate + recent accuracy over time</span>
+                <h2>Live Promotion</h2>
+                <span id="training-promotion-badge" class="tag">—</span>
               </div>
-              <div class="balance-chart-wrap"><canvas id="training-quality-chart"></canvas></div>
+              <div id="training-promotion-stats" class="insight-panel-body">Loading…</div>
             </div>
             <div class="card">
               <div class="card-head">
-                <h2>7-Day Outcomes</h2>
-                <span class="hint">Daily wins &amp; losses</span>
+                <h2>Market Sentiment</h2>
+                <span id="training-sentiment-score" class="tag">—</span>
               </div>
-              <div class="balance-chart-wrap"><canvas id="training-rolling-chart"></canvas></div>
+              <div id="training-sentiment-stats" class="insight-panel-body">Loading…</div>
+              <div id="training-sentiment-headlines" class="training-headlines-list">—</div>
             </div>
           </div>
 
+          <div class="card">
+            <div class="card-head">
+              <h2>Parameter Tuner</h2>
+              <span class="hint">Walk-forward champion / challenger</span>
+            </div>
+            <div id="training-tuner-history" class="table-wrap">Loading…</div>
+          </div>
+
           <details class="card training-advanced">
-            <summary class="training-advanced-summary">Advanced tools &amp; diagnostics</summary>
-            <p class="hint">Shadow learning, backtests, and signal resolution — not needed for day-to-day monitoring.</p>
-            <div class="btn-row" style="margin: 0.75rem 0">
-              <button id="btn-training-resolve" class="btn btn-sm" type="button">Resolve signals from price</button>
+            <summary class="training-advanced-summary">Advanced diagnostics &amp; backtests</summary>
+            <p class="hint training-advanced-note">Shadow learning, backtests, and signal resolution.</p>
+            <div class="btn-row training-advanced-actions">
+              <button id="btn-training-resolve" class="btn btn-sm" type="button">Resolve signals</button>
               <button id="btn-training-backtest" class="btn btn-sm" type="button">Backtest</button>
               <button id="btn-training-walkforward" class="btn btn-sm" type="button">Walk-forward</button>
+              <button id="btn-training-acceptance" class="btn btn-sm" type="button" title="Replay history through the decision engine and check the go-live gates">Acceptance gate</button>
             </div>
             <div id="training-advanced-stats" class="table-wrap">Loading…</div>
           </details>
 
-          <div class="card" id="training-backtest-card" style="display:none">
+          <div class="card training-result-card hidden" id="training-backtest-card">
             <div class="card-head"><h2>Backtest Result</h2><span id="training-backtest-badge" class="tag">—</span></div>
             <div id="training-backtest-result" class="table-wrap">—</div>
-            <div class="balance-chart-wrap" style="max-height:220px"><canvas id="training-backtest-chart"></canvas></div>
+            <div class="balance-chart-wrap training-chart-wrap training-chart-wrap-sm"><canvas id="training-backtest-chart"></canvas></div>
           </div>
 
-          <div class="card" id="training-wf-card" style="display:none">
+          <div class="card training-result-card hidden" id="training-wf-card">
             <div class="card-head"><h2>Walk-Forward (OOS)</h2><span class="hint">Out-of-sample validation</span></div>
             <div id="training-wf-result" class="table-wrap">—</div>
+          </div>
+
+          <div class="card training-result-card hidden" id="training-acceptance-card">
+            <div class="card-head"><h2>Go-Live Acceptance Gate</h2><span id="training-acceptance-badge" class="tag">—</span></div>
+            <p class="hint">Decision-pipeline replay of resolved history checked against the <code class="inline-code">backtest.acceptance_*</code> thresholds. All checks must pass before enabling live trading.</p>
+            <div id="training-acceptance-result" class="table-wrap">—</div>
           </div>
         </section>
 
@@ -613,9 +691,28 @@
     </div>
   </div>
 
+  <!-- Update available banner — shown by Tauri desktop when a new release is detected -->
+  <div id="update-banner" class="update-banner hidden" role="status" aria-live="polite">
+    <div class="update-banner-body">
+      <svg class="update-banner-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/>
+        <line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+      <div class="update-banner-text">
+        <strong id="update-banner-title">Update available</strong>
+        <span id="update-banner-notes" class="hint"></span>
+      </div>
+    </div>
+    <div class="update-banner-actions">
+      <button id="btn-update-install" class="btn btn-primary btn-sm" type="button">Install &amp; Restart</button>
+      <button id="btn-update-dismiss" class="btn btn-sm btn-ghost" type="button" aria-label="Dismiss update notification">Later</button>
+    </div>
+  </div>
+
   <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="false"></div>
 
   <script src="/charts.js" type="module"></script>
-  <script src="/app.js?v=6" type="module"></script>
+  <script src="/app.js?v=11" type="module"></script>
 </body>
 </html>
