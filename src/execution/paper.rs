@@ -24,6 +24,8 @@ pub struct PaperTrader {
     db: Arc<Database>,
     /// In-memory adaptive trailing stop per position id.
     trailing_stops: HashMap<i64, TrailingTrack>,
+    /// Throttle trailing-stop DB writes (position id → last persist unix sec).
+    last_sl_persist_at: HashMap<i64, i64>,
 }
 
 impl PaperTrader {
@@ -32,6 +34,7 @@ impl PaperTrader {
             config,
             db,
             trailing_stops: HashMap::new(),
+            last_sl_persist_at: HashMap::new(),
         }
     }
 
@@ -99,7 +102,12 @@ impl PaperTrader {
                 }
                 sl = update_trailing(&side, entry, price, track, &cfg.risk);
                 if (sl - prev_sl).abs() > 1e-10 {
-                    let _ = self.db.update_position_sl_tp(id, Some(sl), None).await;
+                    let now = Utc::now().timestamp();
+                    let last = self.last_sl_persist_at.get(&id).copied().unwrap_or(0);
+                    if now.saturating_sub(last) >= 3 {
+                        let _ = self.db.update_position_sl_tp(id, Some(sl), None).await;
+                        self.last_sl_persist_at.insert(id, now);
+                    }
                 }
             }
 

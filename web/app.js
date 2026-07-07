@@ -18,6 +18,7 @@ const $$ = (sel) => document.querySelectorAll(sel);
 
 let ws = null;
 let wsReconnectTimer = null;
+let wsLiveConnected = false;
 let pollTimer = null;
 let marketPollTimer = null;
 let dashboardNewsItems = [];
@@ -206,6 +207,8 @@ const DEFAULT_TOAST_EVENT_KEYS = [
 ];
 const TOAST_MAX_VISIBLE = 5;
 const TOAST_DURATION_MS = 6000;
+/** Max trade toasts fired in one snapshot batch — rest stay in the bell feed. */
+const TOAST_BURST_LIMIT = 2;
 let lastToastEventId = 0;
 let toastBaselineSet = false;
 let toastNotificationsEnabled = true;
@@ -442,7 +445,7 @@ function maybeToastNewEvents(events) {
   // If the window was hidden (minimised) we skip toasts for accumulated events
   // to avoid a flood of notifications on restore. The badge still updates.
   if (!document.hidden) {
-    fresh.forEach((e) => {
+    fresh.slice(0, TOAST_BURST_LIMIT).forEach((e) => {
       const spec = toastFromEvent(e);
       if (spec) showTradeToast(spec);
     });
@@ -928,6 +931,89 @@ function renderMetrics(snapshot) {
   }
 }
 
+/** Lightweight header/KPI refresh — only equity, daily P&L, and open-position PnL. */
+function updateLivePnlMetrics(snapshot) {
+  const risk = snapshot.risk || {};
+  const wallet = snapshot.wallet || {};
+  const openPositions = snapshot.positions || [];
+
+  const baseEquity = wallet.equity ?? risk.equity;
+  let totalUnrealized = 0;
+  for (const p of openPositions) {
+    totalUnrealized += Number(p.unrealized_pnl || 0);
+  }
+  const equity = baseEquity != null ? Number(baseEquity) + totalUnrealized : baseEquity;
+  const realizedDaily = Number(risk.daily_pnl ?? 0);
+  const daily = realizedDaily + totalUnrealized;
+  const equityBase = Number(baseEquity ?? risk.equity ?? 0) || 1;
+  const dailyPct = (daily / equityBase) * 100;
+
+  const hdrEquity = $("#hdr-equity");
+  if (hdrEquity) {
+    hdrEquity.textContent = fmtUsd(equity);
+    if (totalUnrealized !== 0) {
+      hdrEquity.title = `Base: ${fmtUsd(baseEquity)}  |  Unrealized: ${totalUnrealized > 0 ? "+" : ""}${fmtUsd(totalUnrealized)}`;
+    } else {
+      hdrEquity.title = "";
+    }
+  }
+
+  const hdrDaily = $("#hdr-daily-pnl");
+  if (hdrDaily) {
+    hdrDaily.textContent = `${fmtUsd(daily)} (${fmtPct(dailyPct)})`;
+    hdrDaily.className = "hmetric-value mono" + pnlClass(daily);
+  }
+
+  const pnlEl = $("#m-positions-pnl");
+  if (pnlEl) {
+    if (openPositions.length) {
+      let totalMargin = 0;
+      for (const p of openPositions) {
+        const csize = Number(p.contract_size || 1) || 1;
+        const sz = Number(p.remaining_size ?? p.size ?? 0) * csize;
+        const entry = Number(p.entry_price || 0);
+        const lev = Number(p.leverage || 1) || 1;
+        totalMargin += (entry * sz) / lev;
+      }
+      const totalPct = totalMargin > 0 ? (totalUnrealized / totalMargin) * 100 : 0;
+      const sign = totalUnrealized > 0 ? "+" : totalUnrealized < 0 ? "-" : "";
+      pnlEl.textContent = `${sign}${fmtUsd(Math.abs(totalUnrealized))} (${totalPct > 0 ? "+" : ""}${totalPct.toFixed(2)}%)`;
+      pnlEl.className = "kpi-sub mono" + pnlClass(totalUnrealized);
+    } else {
+      pnlEl.textContent = "—";
+      pnlEl.className = "kpi-sub mono";
+    }
+  }
+
+  syncOpenPositions(openPositions);
+}
+
+function healthSignature(health = {}, risk = {}) {
+  return [
+    health.scanner_running,
+    health.ws_connected,
+    health.tracked_symbols,
+    health.live_trading,
+    health.dry_run,
+    health.trading_mode,
+    risk.kill_switch,
+    risk.circuit_breaker_active,
+    risk.trading_paused,
+    risk.ws_stale,
+    risk.open_positions,
+  ].join("|");
+}
+
+function activitySignature(events) {
+  return (events || []).map((e) => `${e.id}:${e.seen ? 1 : 0}`).join(",");
+}
+
+function pnlSignature(positions) {
+  return (positions || [])
+    .map((p) => `${p.id}:${Number(p.unrealized_pnl ?? 0).toFixed(4)}`)
+    .join("|");
+}
+
 function renderActivity(events, unreadCount) {
   window.__lastActivityEvents = events || [];
   if (unreadCount != null) activityUnreadCount = unreadCount;
@@ -969,7 +1055,13 @@ function scanActionLabel(action) {
   return (action || "SCAN").toUpperCase();
 }
 
-let lastScanFeedKey = "";
+let lastScanFeedKey = null;
+let lastSignalsPreviewKey = null;
+let lastActivitySig = null;
+let lastHealthSig = null;
+let lastPnlSig = null;
+let lastPnlUpdateAt = 0;
+const PNL_REFRESH_MS = 1000;
 
 function renderLiveScan(scanEvents, health, fallbackSignals) {
   const el = $("#live-scan-list");
@@ -1347,13 +1439,44 @@ function applySnapshot(snapshot) {
     const snap = _pendingSnapshot;
     _pendingSnapshot = null;
     if (!snap) return;
-    renderMetrics(snap);
-    setStatusPill(snap.health, snap.risk);
-    syncTradingModeUI(snap.health || {});
-    renderActivity(snap.activity, snap.activity_unread);
-    renderLiveScan(snap.scan_events, snap.health, snap.signals);
-    renderSignalsTable($("#trading-signals-preview"), snap.signals, { limit: 8, timeCompact: true });
-    syncOpenPositions(snap.positions);
+
+    const health = snap.health || {};
+    const risk = snap.risk || {};
+    const healthSig = healthSignature(health, risk);
+    const healthChanged = healthSig !== lastHealthSig;
+    if (healthChanged) {
+      lastHealthSig = healthSig;
+      renderMetrics(snap);
+      setStatusPill(health, risk);
+      syncTradingModeUI(health);
+    } else {
+      const now = Date.now();
+      const pnlSig = pnlSignature(snap.positions);
+      if (pnlSig !== lastPnlSig || now - lastPnlUpdateAt >= PNL_REFRESH_MS) {
+        lastPnlSig = pnlSig;
+        lastPnlUpdateAt = now;
+        updateLivePnlMetrics(snap);
+      }
+    }
+
+    const actSig = activitySignature(snap.activity);
+    if (actSig !== lastActivitySig) {
+      lastActivitySig = actSig;
+      renderActivity(snap.activity, snap.activity_unread);
+    }
+    const scanKey = (snap.scan_events || [])
+      .slice(0, 20)
+      .map((r) => `${r.scanned_at}|${r.symbol}|${r.action}|${r.message}`)
+      .join(";");
+    if (scanKey !== lastScanFeedKey) {
+      renderLiveScan(snap.scan_events, snap.health, snap.signals);
+    }
+    const sigPreview = (snap.signals || []).slice(0, 8);
+    const sigKey = sigPreview.map((s) => `${s.id}|${s.generated_at}|${s.symbol}`).join(";");
+    if (sigKey !== lastSignalsPreviewKey) {
+      lastSignalsPreviewKey = sigKey;
+      renderSignalsTable($("#trading-signals-preview"), sigPreview, { limit: 8, timeCompact: true });
+    }
     $("#last-updated").textContent = fmtManilaTime(new Date());
   });
 }
@@ -1507,6 +1630,7 @@ async function refreshSnapshotHttp() {
 }
 
 function setWsUi(connected) {
+  wsLiveConnected = !!connected;
   const dot = $("#ws-dot");
   const label = $("#ws-label");
   if (connected) {
@@ -1553,6 +1677,8 @@ function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(() => {
     if (document.hidden) return;
+    // WS already pushes snapshots every 2 s — skip duplicate HTTP load.
+    if (wsLiveConnected && ws?.readyState === WebSocket.OPEN) return;
     if ($("#auto-refresh")?.checked) refreshSnapshotHttp();
   }, 2000);
   if (marketPollTimer) clearInterval(marketPollTimer);

@@ -163,8 +163,169 @@ impl LiveTrader {
         &self.client
     }
 
+    pub fn db(&self) -> &std::sync::Arc<crate::db::Database> {
+        &self.db
+    }
+
+    pub fn config_arc(&self) -> &crate::config::SharedAppConfig {
+        &self.config
+    }
+
     pub async fn get_wallet_balance(&self) -> crate::error::Result<AssetBalance> {
         self.client.get_usdt_balance().await
+    }
+
+    /// Exchange-only execution of a live open order. Unlike `open_from_signal` this
+    /// does NOT interact with `RiskManager` — the caller must call
+    /// `risk.prepare_open_from_signal` before and `risk.commit_open_from_signal` after.
+    /// On success `prepared` is updated in place: `size` becomes the contract count,
+    /// `entry_price` / `entry_mode` / `limit_price` are set to the actual fill values.
+    ///
+    /// Returns `Ok((placed, limit_order_id))`:
+    /// - `placed = false` when rejected or blocked by dry-run.
+    /// - `limit_order_id = Some(id)` for limit/sniper orders so the caller can
+    ///   schedule a TTL cancel task after `risk.commit_open_from_signal` (which
+    ///   provides the local `pos_id` needed to close the unfilled position in DB).
+    pub async fn execute_live_order(
+        &self,
+        signal: &PumpSignal,
+        prepared: &mut crate::risk::manager::PreparedOpen,
+    ) -> crate::error::Result<(bool, Option<String>)> {
+        if !self.is_live() {
+            return Ok((false, None));
+        }
+
+        let cfg = self.config.read().unwrap().clone();
+        let side = if signal.price_change_pct > 0.0 {
+            PositionSide::Long
+        } else {
+            PositionSide::Short
+        };
+
+        // Override leverage (may make a REST call to get per-symbol account max).
+        let leverage = self.resolve_leverage(signal, side).await;
+        prepared.leverage = leverage as i64;
+
+        if self.contracts.get(&signal.symbol).is_none() {
+            warn!(
+                "{} contract metadata missing — vol conversion may be wrong",
+                signal.symbol
+            );
+        }
+
+        let is_limit = matches!(signal.entry_mode.as_str(), "limit" | "sniper");
+        let order_type = if is_limit { 1 } else { 5 };
+        let offset = cfg.execution.limit_offset_pct;
+        let limit_price = if is_limit {
+            let base = if signal.limit_entry_price > 0.0 {
+                signal.limit_entry_price
+            } else {
+                signal.last_price
+            };
+            if side == PositionSide::Long {
+                base * (1.0 - offset)
+            } else {
+                base * (1.0 + offset)
+            }
+        } else {
+            signal.last_price
+        };
+
+        let mut payload = json!({
+            "symbol": signal.symbol,
+            "price": limit_price,
+            "vol": coins_to_contract_vol(prepared.size, self.contracts.get(&signal.symbol)),
+            "side": if side == PositionSide::Long { 1 } else { 3 },
+            "type": order_type,
+            "openType": 2,
+            "leverage": leverage,
+        });
+        payload = self.apply_precision(&signal.symbol, payload);
+        payload = self.enforce_min_margin(&signal.symbol, payload, limit_price, leverage);
+
+        let vol = payload.get("vol").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if vol <= 0.0 {
+            return Ok((false, None));
+        }
+        prepared.size = vol;
+
+        if cfg.execution.dry_run {
+            let _ = self
+                .db
+                .log_event(
+                    "live_order_dry_run",
+                    &format!("Would open {}", signal.symbol),
+                    Some(json!({ "body": payload, "leverage": leverage })),
+                )
+                .await;
+            return Ok((false, None));
+        }
+
+        if !self.ensure_exchange_leverage(&signal.symbol, leverage, side).await {
+            let _ = self
+                .db
+                .log_event(
+                    "live_order_error",
+                    &format!("Failed to set leverage for {}", signal.symbol),
+                    None,
+                )
+                .await;
+            return Ok((false, None));
+        }
+
+        match self.client.submit_order(payload.clone()).await {
+            Ok(result) => {
+                if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
+                    let detail = mexc_reject_message(&signal.symbol, &result);
+                    warn!("{detail} payload={payload}");
+                    let _ = self
+                        .db
+                        .log_event(
+                            "live_order_error",
+                            &detail,
+                            Some(json!({ "exchange": result, "payload": payload })),
+                        )
+                        .await;
+                    return Ok((false, None));
+                }
+
+                prepared.entry_mode = signal.entry_mode.clone();
+                prepared.entry_price = if is_limit { limit_price } else { signal.last_price };
+                prepared.limit_price = if is_limit { Some(limit_price) } else { None };
+
+                // Extract the limit order ID so the caller can schedule a TTL cancel
+                // after committing the position (which provides the local pos_id needed
+                // to close an unfilled position in the DB).
+                let limit_order_id = if is_limit {
+                    result.get("data").and_then(|d| d.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                };
+
+                let order_label = if is_limit { "limit_order" } else { "live_order" };
+                let _ = self
+                    .db
+                    .log_event(
+                        order_label,
+                        &format!("Order placed for {}", signal.symbol),
+                        Some(result),
+                    )
+                    .await;
+                Ok((true, limit_order_id))
+            }
+            Err(exc) => {
+                error!("Open order failed for {}: {exc}", signal.symbol);
+                let _ = self
+                    .db
+                    .log_event(
+                        "live_order_error",
+                        &format!("Order failed for {}", signal.symbol),
+                        Some(json!({ "error": exc.to_string(), "payload": payload })),
+                    )
+                    .await;
+                Ok((false, None))
+            }
+        }
     }
 
     /// Returns the per-symbol max leverage from contract discovery (no API call required).
@@ -372,9 +533,29 @@ impl LiveTrader {
                         Some(result),
                     )
                     .await;
-                self.link_exchange_position(pos_id, &signal.symbol, side)
-                    .await;
-                self.place_sl_tp_for_position(pos_id, signal, side, vol).await;
+
+                // Spawn SL/TP placement and position linking as a background task so
+                // the caller (emit_signal) releases live.lock() and risk.write()
+                // immediately instead of being held for another 5-15 seconds of REST
+                // calls and retry sleeps.
+                {
+                    let finalize = Self {
+                        config: self.config.clone(),
+                        db: self.db.clone(),
+                        client: self.client.clone(),
+                        secrets: UserSecrets::default(),
+                        contracts: self.contracts
+                            .get(&signal.symbol)
+                            .map(|c| std::iter::once((signal.symbol.clone(), c.clone())).collect())
+                            .unwrap_or_default(),
+                    };
+                    let signal_clone = signal.clone();
+                    tokio::spawn(async move {
+                        finalize.link_exchange_position(pos_id, &signal_clone.symbol, side).await;
+                        finalize.place_sl_tp_for_position(pos_id, &signal_clone, side, vol).await;
+                    });
+                }
+
                 Ok(Some(pos_id))
             }
             Err(exc) => {

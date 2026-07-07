@@ -7,7 +7,6 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
 
-use crate::api::handlers;
 use crate::AppState;
 
 pub async fn ws_handler(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -16,7 +15,7 @@ pub async fn ws_handler(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade
 
 async fn handle_socket(state: Arc<AppState>, mut socket: WebSocket) {
     loop {
-        let snapshot = handlers::live_snapshot(State(state.clone())).await.0;
+        let snapshot = state.snapshot_cache.read().await.clone();
         if socket
             .send(Message::Text(snapshot.to_string().into()))
             .await

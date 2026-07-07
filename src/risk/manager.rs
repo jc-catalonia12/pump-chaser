@@ -453,10 +453,14 @@ impl RiskManager {
     ) -> Result<Option<PreparedOpen>> {
         let open_count = self.db.count_open_positions().await?;
         if let Err(BotError::RiskBlocked(msg)) = self.can_open_position(open_count).await {
-            let _ = self
-                .db
-                .log_event("trade_blocked", &msg, Some(signal.to_payload()))
-                .await;
+            // Scanner records a lightweight scan reject when the book is full;
+            // skip audit_log spam that floods the notification panel and SQLite.
+            if !msg.contains("Max positions") {
+                let _ = self
+                    .db
+                    .log_event("trade_blocked", &msg, Some(signal.to_payload()))
+                    .await;
+            }
             return Ok(None);
         }
 

@@ -52,7 +52,21 @@ pub async fn run() -> Result<()> {
         risk,
         scanner,
         secrets,
+        snapshot_cache: Arc::new(AsyncRwLock::new(serde_json::json!({}))),
     };
+
+    // Refresh the UI snapshot cache in the background so WS/HTTP handlers
+    // never block on risk locks or SQLite contention during signal bursts.
+    {
+        let cache_state = Arc::new(state.clone());
+        tokio::spawn(async move {
+            loop {
+                let snap = crate::api::handlers::build_live_snapshot(cache_state.clone()).await;
+                *cache_state.snapshot_cache.write().await = snap;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
 
     spawn_command_poller(Arc::new(state.clone()));
 
