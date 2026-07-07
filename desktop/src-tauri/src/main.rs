@@ -130,10 +130,44 @@ fn open_dashboard(app: &tauri::AppHandle) {
 
 // ── Auto-updater ───────────────────────────────────────────────────────────
 
+/// True when `tauri.conf.json` has real updater credentials (not the dev placeholders).
+/// Local `cargo run` builds keep `TAURI_UPDATER_PUBKEY_PLACEHOLDER` and a GitHub URL
+/// with `/OWNER/` — those 404 and spam the log if we call `updater.check()`.
+fn updater_is_configured(app: &tauri::AppHandle) -> bool {
+    let Some(updater) = app.config().plugins.0.get("updater") else {
+        return false;
+    };
+    let pubkey = updater
+        .get("pubkey")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if pubkey.is_empty() || pubkey.contains("PLACEHOLDER") {
+        return false;
+    }
+    let Some(endpoints) = updater.get("endpoints").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if endpoints.is_empty() {
+        return false;
+    }
+    endpoints.iter().all(|ep| {
+        let url = ep.as_str().unwrap_or("");
+        !url.is_empty()
+            && !url.contains("/OWNER/")
+            && !url.contains("YOUR_USERNAME")
+            && !url.contains("YOUR_GITHUB_USERNAME")
+    })
+}
+
 /// Check for a newer version on GitHub Releases and show the in-app banner.
 /// All errors are logged and ignored so a missing/misconfigured updater never
 /// interrupts trading.
 fn run_update_check(app: tauri::AppHandle) {
+    if !updater_is_configured(&app) {
+        log_startup("Updater skipped — configure plugins.updater in tauri.conf.json (see README)");
+        return;
+    }
+
     let rt = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
         Err(e) => {
@@ -180,6 +214,13 @@ fn run_update_check(app: tauri::AppHandle) {
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
+
+    if !updater_is_configured(&app) {
+        return Err(
+            "Auto-update is not configured. Set plugins.updater in tauri.conf.json (see README)."
+                .into(),
+        );
+    }
 
     let updater = app
         .updater()
