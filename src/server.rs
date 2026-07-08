@@ -33,6 +33,8 @@ pub async fn run() -> Result<()> {
     let config_snap = config.read().unwrap().clone();
     let db = Arc::new(Database::connect(&config_snap.storage.sqlite_path).await?);
     db.migrate(config_snap.execution.paper_initial_equity).await?;
+    db.sync_paper_equity_if_unused(config_snap.execution.paper_initial_equity)
+        .await?;
 
     let risk = Arc::new(AsyncRwLock::new(
         RiskManager::new(config.clone(), db.clone()).await?,

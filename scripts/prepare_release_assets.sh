@@ -64,6 +64,11 @@ if [[ -f "$SRC_DB" ]]; then
   if command -v sqlite3 >/dev/null 2>&1; then
     sqlite3 "$SRC_DB" ".backup '$DEST_DB'"
     echo "    staged mexc_trading_bot.db ($(du -h "$DEST_DB" | cut -f1), checkpointed via sqlite3)"
+    PAPER_EQ=$(awk '/^  paper_initial_equity:/ {print $2; exit}' "$SRC_CONFIG")
+    if [[ -n "$PAPER_EQ" ]]; then
+      sqlite3 "$DEST_DB" "UPDATE portfolio_state SET equity=${PAPER_EQ}, peak_equity=${PAPER_EQ}, daily_pnl=0, weekly_pnl=0, paper_pnl_total=0 WHERE id=1;"
+      echo "    reset bundled portfolio equity → ${PAPER_EQ} USDT"
+    fi
   else
     cp "$SRC_DB" "$DEST_DB"
     echo "    staged mexc_trading_bot.db ($(du -h "$DEST_DB" | cut -f1), raw copy — install sqlite3 for safer checkpoint)"

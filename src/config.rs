@@ -37,6 +37,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub llm: LlmConfig,
     #[serde(default)]
+    pub assistant: AssistantConfig,
+    #[serde(default)]
     pub decision: DecisionConfig,
 }
 
@@ -181,6 +183,50 @@ fn default_llm_poll_sec() -> u64 {
 
 fn default_llm_timeout_sec() -> u64 {
     30
+}
+
+/// In-app virtual assistant (Ollama chat + optional tools).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantConfig {
+    /// Allow `web_fetch` tool (public HTTP GET only).
+    #[serde(default = "default_true")]
+    pub web_enabled: bool,
+    /// Allow `update_settings` tool to write config/settings.yaml.
+    #[serde(default = "default_true")]
+    pub settings_write_enabled: bool,
+    /// Max Ollama tool-call rounds per user message.
+    #[serde(default = "default_assistant_max_tool_rounds")]
+    pub max_tool_rounds: u32,
+    /// Max raw response bytes for web_fetch.
+    #[serde(default = "default_assistant_max_fetch_bytes")]
+    pub max_fetch_bytes: usize,
+    /// Max characters sent back to Ollama per tool result (prevents context blow-up).
+    #[serde(default = "default_assistant_max_tool_result_chars")]
+    pub max_tool_result_chars: usize,
+}
+
+impl Default for AssistantConfig {
+    fn default() -> Self {
+        Self {
+            web_enabled: true,
+            settings_write_enabled: true,
+            max_tool_rounds: default_assistant_max_tool_rounds(),
+            max_fetch_bytes: default_assistant_max_fetch_bytes(),
+            max_tool_result_chars: default_assistant_max_tool_result_chars(),
+        }
+    }
+}
+
+fn default_assistant_max_tool_rounds() -> u32 {
+    4
+}
+
+fn default_assistant_max_fetch_bytes() -> usize {
+    131_072
+}
+
+fn default_assistant_max_tool_result_chars() -> usize {
+    4_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -611,7 +657,7 @@ fn default_paper_slippage() -> f64 {
 }
 
 fn default_paper_initial_equity() -> f64 {
-    10_000.0
+    100.0
 }
 
 fn default_limit_offset() -> f64 {

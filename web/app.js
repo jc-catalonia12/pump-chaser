@@ -3587,7 +3587,7 @@ async function loadBalanceHistory() {
     });
 
     // Anchor the series to the current equity (equity = base + cumulative).
-    const current = latestEquity != null ? latestEquity : 10000;
+    const current = latestEquity != null ? latestEquity : 100;
     const baseEquity = current - finalCum;
 
     // Build the last 7 calendar days, carrying forward the last known cumulative.

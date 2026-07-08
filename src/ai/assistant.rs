@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::warn;
+use tracing::{info, warn};
 
+use crate::ai::assistant_tools::{cap_tool_result, execute_tool, ollama_tool_defs};
 use crate::config::SharedAppConfig;
 use crate::execution::LiveTrader;
 use crate::AppState;
@@ -202,16 +203,37 @@ pub async fn chat(
         };
     }
 
-    let cfg = config.read().unwrap().llm.clone();
+    let cfg = config.read().unwrap().clone();
+    let llm = cfg.llm.clone();
+    let assistant_cfg = cfg.assistant.clone();
     let context = build_bot_context(state.as_ref()).await;
+
+    let tool_lines = {
+        let mut lines: Vec<String> = vec![
+            "- get_settings(): read config/settings.yaml (user-editable fields)".into(),
+        ];
+        if assistant_cfg.web_enabled {
+            lines.push("- web_fetch(url): fetch public web pages for research".into());
+        }
+        if assistant_cfg.settings_write_enabled {
+            lines.push(
+                "- update_settings(patch): merge JSON into settings.yaml — only when the user explicitly asks"
+                    .into(),
+            );
+        }
+        lines.join("\n")
+    };
 
     let system = format!(
         "You are Pump Chaser Bot Assistant — a helpful co-pilot for the MEXC futures trading bot. \
 Answer concisely in plain English (2–6 sentences unless the user asks for detail). \
-Use ONLY the live bot snapshot below for factual status; say if data is missing. \
+Use the live bot snapshot below for factual status; say if data is missing. \
 You can explain: scanner/risk state, why trades may be blocked, open positions, PnL, sentiment, \
 ML/training progress, and how to resume trading (Start button, reset circuit breaker). \
-Do not invent trades or prices not in the snapshot.\n\n--- LIVE SNAPSHOT ---\n{context}\n--- END ---"
+Do not invent trades or prices not in the snapshot.\n\n\
+You have tools:\n{tool_lines}\n\
+When changing settings, confirm what you changed and the config path.\n\n\
+--- LIVE SNAPSHOT ---\n{context}\n--- END ---"
     );
 
     let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system })];
@@ -228,69 +250,198 @@ Do not invent trades or prices not in the snapshot.\n\n--- LIVE SNAPSHOT ---\n{c
     }
     messages.push(json!({ "role": "user", "content": message }));
 
-    if !cfg.enabled {
+    if !llm.enabled {
         return AssistantChatResponse {
             reply: offline_fallback(&context, message),
             ollama_available: false,
         };
     }
 
-    let url = format!("{}/api/chat", cfg.base_url.trim_end_matches('/'));
-    let body = json!({
-        "model": cfg.model,
-        "messages": messages,
-        "stream": false,
-        "options": { "temperature": 0.35, "num_predict": 512 },
-    });
-
+    let tools = ollama_tool_defs(assistant_cfg.web_enabled, assistant_cfg.settings_write_enabled);
+    let max_rounds = assistant_cfg.max_tool_rounds.max(1).min(8) as usize;
+    let base_timeout = std::time::Duration::from_secs(llm.timeout_sec.max(10).min(120));
+    let max_tool_chars = assistant_cfg.max_tool_result_chars.max(256).min(32_000);
+    let url = format!("{}/api/chat", llm.base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let result = client
-        .post(&url)
-        .timeout(std::time::Duration::from_secs(cfg.timeout_sec.max(10).min(120)))
-        .json(&body)
-        .send()
-        .await;
+    let mut ollama_reached = false;
+    let mut used_tools = false;
 
-    match result {
-        Ok(resp) if resp.status().is_success() => {
-            if let Ok(v) = resp.json::<Value>().await {
-                if let Some(text) = v
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_str())
-                {
+    for round in 0..max_rounds {
+        let round_timeout = if round == 0 || !used_tools {
+            base_timeout
+        } else {
+            base_timeout.saturating_mul(3).min(std::time::Duration::from_secs(180))
+        };
+        let include_tools = !tools.is_empty() && round + 1 < max_rounds;
+
+        let mut attempt = 0u8;
+        loop {
+            attempt += 1;
+            let mut body = json!({
+                "model": llm.model,
+                "messages": messages,
+                "stream": false,
+                "options": { "temperature": 0.35, "num_predict": 1024 },
+            });
+            if include_tools {
+                body["tools"] = json!(tools);
+            }
+
+            let result = client.post(&url).timeout(round_timeout).json(&body).send().await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    ollama_reached = true;
+                    let v = match resp.json::<Value>().await {
+                        Ok(v) => v,
+                        Err(exc) => {
+                            warn!("Assistant Ollama JSON parse: {exc}");
+                            break;
+                        }
+                    };
+                    let message_obj = v.get("message").cloned().unwrap_or(json!({}));
+                    let content = message_obj
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    messages.push(message_obj.clone());
+
+                    let tool_calls = message_obj
+                        .get("tool_calls")
+                        .and_then(|t| t.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    if tool_calls.is_empty() {
+                        if content.is_empty() {
+                            return AssistantChatResponse {
+                                reply: "Ollama returned an empty reply. Check that the model is pulled.".into(),
+                                ollama_available: true,
+                            };
+                        }
+                        return AssistantChatResponse {
+                            reply: content,
+                            ollama_available: true,
+                        };
+                    }
+
+                    used_tools = true;
+                    for tc in tool_calls {
+                        let func = tc.get("function").cloned().unwrap_or_default();
+                        let name = func
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let args: Value = func
+                            .get("arguments")
+                            .map(|a| {
+                                if a.is_string() {
+                                    serde_json::from_str(a.as_str().unwrap_or("{}"))
+                                        .unwrap_or(json!({}))
+                                } else {
+                                    a.clone()
+                                }
+                            })
+                            .unwrap_or(json!({}));
+                        info!(tool = %name, round, "assistant tool call");
+                        let result = execute_tool(
+                            state.as_ref(),
+                            &name,
+                            &args,
+                            assistant_cfg.web_enabled,
+                            assistant_cfg.settings_write_enabled,
+                            assistant_cfg.max_fetch_bytes,
+                            max_tool_chars,
+                        )
+                        .await;
+                        messages.push(json!({
+                            "role": "tool",
+                            "content": result,
+                            "tool_name": name,
+                        }));
+                    }
+                    break;
+                }
+                Ok(resp) => {
+                    warn!("Assistant Ollama HTTP {}", resp.status());
+                    if ollama_reached {
+                        return AssistantChatResponse {
+                            reply: format!(
+                                "Ollama returned HTTP {} while summarizing tool results. Try a narrower question.",
+                                resp.status()
+                            ),
+                            ollama_available: true,
+                        };
+                    }
                     return AssistantChatResponse {
-                        reply: text.trim().to_string(),
-                        ollama_available: true,
+                        reply: format!(
+                            "Ollama error (HTTP {}). {}\n\nStart Ollama or enable LLM in Settings, then try again.",
+                            resp.status(),
+                            offline_fallback(&context, message)
+                        ),
+                        ollama_available: false,
+                    };
+                }
+                Err(exc) => {
+                    let is_timeout = exc.is_timeout();
+                    if ollama_reached && attempt == 1 {
+                        warn!(
+                            error = %exc,
+                            round,
+                            "Assistant Ollama retry with smaller tool payload"
+                        );
+                        shrink_tool_messages(&mut messages, max_tool_chars / 2);
+                        continue;
+                    }
+                    if ollama_reached {
+                        warn!("Assistant Ollama failed after tools: {exc}");
+                        return AssistantChatResponse {
+                            reply: if is_timeout {
+                                "Ollama timed out summarizing the web page (it was too large). Try asking for a specific headline or shorter summary.".into()
+                            } else {
+                                format!(
+                                    "Ollama could not finish after fetching data ({exc}). Try a more specific question."
+                                )
+                            },
+                            ollama_available: true,
+                        };
+                    }
+                    warn!("Assistant Ollama unreachable: {exc}");
+                    return AssistantChatResponse {
+                        reply: format!(
+                            "Ollama is offline ({exc}). {}\n\nStart Ollama or enable LLM in Settings, then try again.",
+                            offline_fallback(&context, message)
+                        ),
+                        ollama_available: false,
                     };
                 }
             }
-            AssistantChatResponse {
-                reply: "Ollama returned an empty reply. Check that the model is pulled.".into(),
-                ollama_available: false,
-            }
         }
-        Ok(resp) => {
-            warn!("Assistant Ollama HTTP {}", resp.status());
-            AssistantChatResponse {
-                reply: format!(
-                    "Ollama error (HTTP {}). {}\n\nStart Ollama or enable LLM in Settings, then try again.",
-                    resp.status(),
-                    offline_fallback(&context, message)
-                ),
-                ollama_available: false,
-            }
+    }
+
+    AssistantChatResponse {
+        reply: if ollama_reached {
+            "Assistant reached the tool-call limit. Try a simpler question or increase assistant.max_tool_rounds.".into()
+        } else {
+            "Assistant could not reach Ollama.".into()
+        },
+        ollama_available: ollama_reached,
+    }
+}
+
+fn shrink_tool_messages(messages: &mut [Value], max_chars: usize) {
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("tool") {
+            continue;
         }
-        Err(exc) => {
-            warn!("Assistant Ollama unreachable: {exc}");
-            AssistantChatResponse {
-                reply: format!(
-                    "Ollama is offline ({exc}). {}\n\nStart Ollama or enable LLM in Settings, then try again.",
-                    offline_fallback(&context, message)
-                ),
-                ollama_available: false,
-            }
-        }
+        let Some(content) = msg.get("content").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        let capped = cap_tool_result(content.to_string(), max_chars);
+        msg["content"] = json!(capped);
     }
 }
 
