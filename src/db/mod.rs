@@ -230,4 +230,40 @@ impl Database {
 
         Ok(())
     }
+
+    /// If no positions have ever been opened, align portfolio equity with settings.
+    pub async fn sync_paper_equity_if_unused(&self, paper_initial_equity: f64) -> Result<()> {
+        let positions: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM positions")
+            .fetch_one(&self.pool)
+            .await?;
+        if positions.0 > 0 {
+            return Ok(());
+        }
+        let target = paper_initial_equity.max(1.0);
+        let row: Option<(f64,)> =
+            sqlx::query_as("SELECT equity FROM portfolio_state WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((equity,)) = row else {
+            return Ok(());
+        };
+        if (equity - target).abs() <= 0.001 {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE portfolio_state SET equity = ?, peak_equity = ?, daily_pnl = 0, weekly_pnl = 0, paper_pnl_total = 0, updated_at = ? WHERE id = 1",
+        )
+        .bind(target)
+        .bind(target)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        tracing::info!(
+            "Aligned unused paper portfolio equity {:.2} → {:.2} USDT (settings)",
+            equity,
+            target
+        );
+        Ok(())
+    }
 }

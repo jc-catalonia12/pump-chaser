@@ -41,7 +41,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Get version
         id: version
@@ -132,7 +132,7 @@ jobs:
           echo "=== macOS artifacts ==="
           ls -lh dist/release-macos/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: macos-release
           path: dist/release-macos/**
@@ -143,7 +143,7 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Restore ML models
         env:
@@ -213,7 +213,7 @@ jobs:
           Write-Host "=== Windows artifacts ==="
           Get-ChildItem "dist/release-windows" | Format-Table Name, Length -AutoSize
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: windows-release
           path: dist/release-windows/**
@@ -227,16 +227,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download macOS artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: macos-release
           path: dist/release-macos
 
       - name: Download Windows artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: windows-release
           path: dist/release-windows
@@ -282,7 +282,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: "MEXC Trading Bot v${{ needs.build-macos.outputs.version }}"

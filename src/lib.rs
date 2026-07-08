@@ -21,6 +21,7 @@ pub mod risk;
 pub mod scanner;
 pub mod sentiment;
 pub mod server;
+pub mod settings_commit;
 pub mod signals;
 pub mod user_settings;
 pub mod utils;

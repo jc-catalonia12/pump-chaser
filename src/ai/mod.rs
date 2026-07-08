@@ -2,6 +2,7 @@
 //! decision core (Phase 5).
 
 pub mod assistant;
+pub mod assistant_tools;
 pub mod decision;
 pub mod llm_regime;
 

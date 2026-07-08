@@ -32,7 +32,7 @@ jobs:
       tag: ${{ steps.read.outputs.tag }}
       publish: ${{ steps.read.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve version and tag
         id: read
@@ -60,7 +60,7 @@ jobs:
     needs: version
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Restore ML models from secrets
         if: ${{ !hashFiles('data/models/supervised.onnx') }}
@@ -121,7 +121,7 @@ jobs:
       - name: Collect macOS release artifacts
         run: bash scripts/collect_ci_artifacts.sh macos dist/release-macos
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: macos-release
           if-no-files-found: error
@@ -131,7 +131,7 @@ jobs:
     needs: version
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Restore ML models from secrets
         if: ${{ !hashFiles('data/models/supervised.onnx') }}
@@ -198,7 +198,7 @@ jobs:
         shell: bash
         run: bash scripts/collect_ci_artifacts.sh windows dist/release-windows
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: windows-release
           if-no-files-found: error
@@ -211,16 +211,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download macOS artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: macos-release
           path: dist/release-macos
 
       - name: Download Windows artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: windows-release
           path: dist/release-windows
@@ -241,7 +241,7 @@ jobs:
           echo "=== latest.json ===" && cat dist/latest.json
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: "MEXC Trading Bot v${{ needs.version.outputs.version }}"

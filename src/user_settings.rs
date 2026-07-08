@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::{
-    AppConfig, DecisionConfig, ExecutionConfig, LearningConfig, LlmConfig, RiskConfig,
-    TradingConfig, WatchlistConfig, ZonesConfig,
+    AppConfig, AssistantConfig, DecisionConfig, ExecutionConfig, LearningConfig, LlmConfig,
+    RiskConfig, TradingConfig, WatchlistConfig, ZonesConfig,
 };
 use crate::error::{BotError, Result};
 use crate::utils::discover_project_root;
@@ -321,6 +321,9 @@ pub fn apply_user_settings(cfg: &mut AppConfig, patch: &Value) -> Result<()> {
     }
     if let Some(v) = merged.get("llm") {
         cfg.llm = serde_json::from_value::<LlmConfig>(v.clone())?;
+    }
+    if let Some(v) = merged.get("assistant") {
+        cfg.assistant = serde_json::from_value::<AssistantConfig>(v.clone())?;
     }
     if let Some(v) = merged.get("decision") {
         cfg.decision = serde_json::from_value::<DecisionConfig>(v.clone())?;

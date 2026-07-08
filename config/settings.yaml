@@ -128,6 +128,13 @@ llm:
   model: llama3.2
   poll_interval_sec: 300
   timeout_sec: 30
+# In-app virtual assistant (Ollama chat + tools).
+assistant:
+  web_enabled: true
+  settings_write_enabled: true
+  max_tool_rounds: 4
+  max_fetch_bytes: 131072
+  max_tool_result_chars: 4000
 # Unified decision & sizing authority (Phase 5). Combines ML win prob,
 # expected value, LLM regime alignment, and sentiment into go/no-go + size.
 # With a neutral regime this is a pure EV / reward-risk gate on the ML edge.
