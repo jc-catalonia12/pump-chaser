@@ -92,15 +92,49 @@ pub fn default_api_url() -> String {
     "http://127.0.0.1:8001".into()
 }
 
-/// True when something is already serving the bot API (e.g. `cargo run`).
-pub fn is_api_reachable() -> bool {
+/// Package version of this binary (used to detect stale servers on :8001).
+pub fn package_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Fetch `/health` JSON from the local API, if it responds.
+pub fn fetch_api_health() -> Option<serde_json::Value> {
     let url = format!("{}/health", default_api_url());
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
-        .and_then(|c| c.get(&url).send())
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+        .ok()?
+        .get(&url)
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())?
+        .json()
+        .ok()
+}
+
+/// True when something is already serving the bot API (e.g. `cargo run`).
+pub fn is_api_reachable() -> bool {
+    fetch_api_health().is_some()
+}
+
+/// True when the process on :8001 reports the same package version as this binary.
+pub fn is_same_version_api_reachable() -> bool {
+    let Some(health) = fetch_api_health() else {
+        return false;
+    };
+    let remote = health
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    !remote.is_empty() && remote == package_version()
+}
+
+/// Version string reported by whatever is currently on :8001 (for diagnostics).
+pub fn remote_api_version() -> Option<String> {
+    fetch_api_health()?
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Block until `/health` responds or attempts are exhausted.

@@ -116,8 +116,12 @@ def main():
               "(TAURI_SIGNING_PRIVATE_KEY must be set in CI).", file=sys.stderr)
 
     if not platforms:
-        print("ERROR: no update artifacts found — cannot generate latest.json", file=sys.stderr)
-        sys.exit(1)
+        print(
+            "WARNING: no signed update artifacts found — skipping latest.json "
+            "(installers can still be published without in-app updater).",
+            file=sys.stderr,
+        )
+        sys.exit(0)
 
     manifest = {
         "version":  args.version,

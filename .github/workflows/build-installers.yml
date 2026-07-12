@@ -249,6 +249,8 @@ jobs:
           path: dist/release-windows
 
       - name: Generate latest.json (auto-updater manifest)
+        id: manifest
+        continue-on-error: true
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           TAG: ${{ needs.version.outputs.tag }}
@@ -277,9 +279,11 @@ jobs:
             - **macOS**: download the `.dmg` and drag to Applications
             - **Windows**: download the `.msi` installer (or `*setup*.exe`) and run it
 
-            The in-app updater reads `latest.json` from this release.
+            Close any running copy of the app before installing so Windows can replace UI files.
+            The in-app updater reads `latest.json` from this release when signing is configured.
           draft: false
           prerelease: ${{ contains(needs.version.outputs.tag, '-') }}
+          fail_on_unmatched_files: false
           files: |
             dist/release-macos/*.dmg
             dist/release-macos/*.app.tar.gz

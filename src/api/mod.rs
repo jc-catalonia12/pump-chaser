@@ -3,11 +3,15 @@ pub mod ws;
 
 use std::sync::Arc;
 
+use axum::http::{header, HeaderValue};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
+use tower::ServiceBuilder;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
+use tracing::info;
 
 use crate::AppState;
 use crate::utils::web_assets_dir;
@@ -104,9 +108,23 @@ pub fn router(state: AppState) -> Router {
         .route("/ws", get(ws::ws_handler))
         .with_state(Arc::new(state));
 
-    api.fallback_service(
-        ServeDir::new(web_assets_dir()).append_index_html_on_directories(true),
-    )
-    .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
-    .layer(TraceLayer::new_for_http())
+    // Dashboard HTML/JS/CSS must never be cached by WebView2 — otherwise upgrades
+    // keep showing an old index.html (missing Virtual Assistant / stale UI) while
+    // /health already reports the new binary version.
+    let web_dir = web_assets_dir();
+    info!(path = %web_dir.display(), "Serving dashboard UI from");
+    let static_files = ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, max-age=0, must-revalidate"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::PRAGMA,
+            HeaderValue::from_static("no-cache"),
+        ))
+        .service(ServeDir::new(web_dir).append_index_html_on_directories(true));
+
+    api.fallback_service(static_files)
+        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
+        .layer(TraceLayer::new_for_http())
 }

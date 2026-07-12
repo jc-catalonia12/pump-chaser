@@ -248,6 +248,7 @@ jobs:
           path: dist/release-windows
 
       - name: Generate latest.json (auto-updater manifest)
+        continue-on-error: true
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
@@ -260,7 +261,11 @@ jobs:
             --macos   dist/release-macos \
             --windows dist/release-windows \
             --out     dist/latest.json
-          echo "=== latest.json ===" && cat dist/latest.json
+          if [ -f dist/latest.json ]; then
+            echo "=== latest.json ===" && cat dist/latest.json
+          else
+            echo "No latest.json (signing artifacts missing) — installers will still be published"
+          fi
 
       - name: Extract release notes
         id: notes
@@ -297,6 +302,7 @@ jobs:
           body: ${{ steps.notes.outputs.notes }}
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: false
           files: |
             dist/release-macos/*.dmg
             dist/release-macos/*.app.tar.gz
