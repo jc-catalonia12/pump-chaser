@@ -1,13 +1,14 @@
 # MEXC Trading Bot (Rust)
 
-High-performance **MEXC USDT-M perpetual futures** trading bot with an **AI-first pipeline**: a 33-dimension feature engine, an online + ONNX ensemble classifier with Kelly-based sizing, an optional local-LLM (Ollama) market-regime layer, and a unified decision engine that gates every trade on expected value. Includes a built-in web dashboard, native desktop app (Tauri), live/paper execution, R-based backtesting with go-live acceptance gates, settings hot-reload, and optional Telegram alerts.
+High-performance **MEXC USDT-M perpetual futures** trading bot with a **historical-candle ML pipeline** (V2): offline training from MEXC kline history → walk-forward validation → ONNX registry, and a Rust live path that only does inference. Includes a built-in web dashboard, native desktop app (Tauri), live/paper execution, decision engine, risk management, and optional Telegram alerts.
 
-Everything runs **on localhost** — no cloud APIs are required for trading, learning, or regime classification.
+Everything runs **on localhost** — no cloud APIs are required for trading or (optional) local LLM regime classification.
 
 ## Contents
 
 - [Architecture](#architecture)
 - [The AI pipeline](#the-ai-pipeline)
+- [Historical training (V2)](#historical-training-v2)
 - [First-time setup](#first-time-setup)
 - [Auto-updates](#auto-updates)
 - [Local LLM regime layer (optional)](#local-llm-regime-layer-optional)
@@ -29,52 +30,71 @@ Desktop app (Tauri) or browser  →  http://127.0.0.1:8001
                     ↓ HTTP + WebSocket
          Axum API (this project)
                     ↓
-  Scanner → Features → ML Ensemble → Decision Engine → Risk → Execution
+  Scanner → Bar Features → ONNX Inference → Decision Engine → Risk → Execution
                 ↑                         ↑
         Ollama regime (optional)   Sentiment / macro HTF
                     ↓
     MEXC REST + WebSocket (public + private API)
+
+Offline (Python):
+  MEXC history → parquet → features → labels → walk-forward → models/production.onnx
 ```
 
 **User data** (API keys, SQLite, trade history) lives outside the installer in a local data folder and is never bundled in builds.
 
-**Trained ML models** (`supervised.onnx`, optional `online_model.json`) are bundled in release installers and copied into the user data folder on first launch (existing user models are not overwritten).
+**Trained ML models** (`production.onnx`) are loaded for live inference only. The bot does **not** retrain from incoming live candles by default (`ml.online_learning_enabled: false`).
 
 ---
 
 ## The AI pipeline
 
-The bot runs a **single AI-driven strategy** (`trading.mode: ai`). Legacy confluence / volume-pump engines were retired in the v1.0.0 upgrade. Each candidate trade flows through five stages:
+The bot runs a **single AI-driven strategy** (`trading.mode: ai`). Each candidate trade flows through:
 
-### 1. Feature engine (33 features)
+### 1. Feature engine (24 bar-level features)
 
-Every signal is encoded as a 33-dimension vector: price/volume momentum across multiple timeframes, volatility regime, order-flow proxies (body ratio, volume imbalance), relative strength vs BTC, funding rate, BTC/ETH higher-timeframe macro state, symbol-specific news sentiment, and the LLM regime one-hots. See `src/ml/features.rs` (`FEATURE_COLUMNS`).
+Live HTF candles (default Min15) are encoded to match the historical training schema: EMA ratios, RSI, MACD, ATR%, ADX, VWAP distance, Bollinger width, volume/volatility, candle anatomy, returns/momentum, trend strength, and cyclical time. See `src/ml/features.rs` and `training/schema.py`.
 
-### 2. ML ensemble
+### 2. ONNX classifier (3-class)
 
-Two native classifiers are blended per prediction:
-
-- **Online logistic regression** (pure Rust) — trains on every resolved outcome, no Python at runtime.
-- **ONNX gradient-boosting model** — optional cold-start / backup model, hot-reloadable.
-
-The blend weight shifts toward the online model as it matures. The bot can also **auto-retrain the ONNX model** in the background (`ml.auto_retrain_enabled`) by invoking `scripts/export_onnx.py` against the local DB and hot-swapping the new model without a restart.
+`production.onnx` predicts **NO_TRADE / LONG / SHORT**. The bot uses P(LONG) or P(SHORT) for the candidate side. Online SGD learning from live outcomes is **off by default**.
 
 ### 3. Local LLM regime (optional, Ollama)
 
-A background loop periodically asks a local Ollama model to classify the market regime (trending / chop / high-vol / risk-off + BTC bias + confidence) from BTC/ETH HTF data, breadth, and sentiment. The regime feeds the feature vector and the decision engine. **If Ollama is offline the regime stays neutral and the bot trades on ML alone — nothing blocks.**
+Background regime classification still feeds the **decision engine** (not the ONNX input vector). If Ollama is offline, regime stays neutral.
 
 ### 4. Decision engine (single go/no-go authority)
 
-Combines ML win probability, expected value in R (`EV = p·RR − (1−p)`), reward:risk, regime alignment, and sentiment:
-
-- **Hard gates:** minimum reward:risk, minimum EV, confident-regime veto.
-- **Conviction sizing:** approved trades get a size/leverage multiplier (clamped to `decision.min_size_scale`..`max_size_scale`), plus Kelly-fraction risk scaling from realized win/loss R.
-
-Every signal carries its `expected_value_r`, `reward_risk`, and a human-readable `decision_reason` (visible in the Signals tab).
+Combines ML side probability, expected value in R (`EV = p·RR − (1−p)`), reward:risk, regime alignment, and sentiment.
 
 ### 5. Risk manager (safety net)
 
 Unchanged, deliberately boring: daily loss limit, max drawdown halt, circuit breaker, kill switch, per-symbol and concurrent-position caps, min profit filter.
+
+---
+
+## Historical training (V2)
+
+Train offline from token candle history (not live signal outcomes):
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Easiest: auto-pick top liquid USDT-M symbols, train, promote
+python -m training pipeline --days 180 --interval Min15 --top 20
+```
+
+| Path | Role |
+|------|------|
+| `data/raw/{SYMBOL}_{tf}.csv.gz` | Historical OHLCV |
+| `data/features/`, `data/labels/` | Features + triple-barrier labels |
+| `datasets/training.csv.gz` | Joined training set |
+| `models/production.onnx` | Live model (also copied to `data/models/`) |
+
+Labels: LONG if +1.5% before −0.8%; SHORT if −1.5% before +0.8%; else NO_TRADE.
+
+Enable weekly auto-retrain with `ml.auto_retrain_enabled: true`. Legacy `scripts/export_onnx.py` is **deprecated**.
 
 ---
 
@@ -90,15 +110,16 @@ Follow these steps to go from zero to a running bot. All commands below assume y
 | **macOS:** Xcode Command Line Tools | `xcode-select --install` |
 | **Windows:** [VS C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) | Required only for building desktop installers |
 
-Optional (only for ONNX retraining/export via `scripts/export_onnx.py`):
+Optional (historical ML training / ONNX export):
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+python -m training pipeline --symbols BTC_USDT ETH_USDT --days 90 --interval Min15
 ```
 
-Packages: `scikit-learn`, `skl2onnx`, `onnx`, `onnxruntime` (see `requirements.txt`).
+Packages: `pandas`, `pyarrow`, `lightgbm`, `scikit-learn`, `skl2onnx`, `onnx`, `onnxruntime` (see `requirements.txt`).
 
 **Ollama (LLM regime layer) — handled automatically by the desktop app.**
 The installer / first launch detects whether Ollama is present on your machine.
@@ -189,7 +210,8 @@ The online model trains automatically on every resolved outcome (win / loss / ex
 # With venv active (pip install -r requirements.txt):
 python scripts/export_onnx.py
 # Or point at a specific DB:
-python scripts/export_onnx.py --db data/mexc_trading_bot.db --out data/models/supervised.onnx
+python -m training pipeline --symbols BTC_USDT ETH_USDT --days 180 --interval Min15
+# Writes models/production.onnx (+ copy under data/models/)
 ```
 
 With `ml.auto_retrain_enabled: true` the bot runs this itself on a schedule and hot-reloads the result — no restart needed.
@@ -413,7 +435,7 @@ Saving API credentials writes to the user data directory (packaged) or `data/sec
 
 ### Local build (with bundled ML models)
 
-1. Ensure `data/models/supervised.onnx` exists (train online or export via `scripts/export_onnx.py`).
+1. Ensure `data/models/production.onnx` exists (`python -m training pipeline ...`).
 2. Run the platform script from the **repo root**:
 
 **macOS / Linux:**
@@ -431,7 +453,7 @@ chmod +x scripts/*.sh
 
 The scripts:
 
-1. Copy `data/models/supervised.onnx` (+ optional `online_model.json`) into `release-assets/models/`
+1. Copy `data/models/production.onnx` (+ optional `feature_schema.json`) into `release-assets/models/`
 2. Run `cargo tauri build --release`
 3. Copy artifacts to `dist/macos/` or `dist/windows/`
 
@@ -520,15 +542,19 @@ Full route list: `src/api/mod.rs`.
 ```
 mexc-trading-bot-rust/           # this repo (standalone)
 ├── Cargo.toml
-├── requirements.txt             # optional Python deps (ONNX export/retrain only)
+├── requirements.txt             # Python deps for historical training
+├── UPGRADE-V2.0.0.md            # Historical ML rebuild roadmap
 ├── UPGRADE-v1.0.0.md            # AI-first rebuild plan + phase log
 ├── config/settings.yaml         # defaults (risk, ML, LLM, decision, backtest)
+├── training/                    # V2 offline pipeline (download→features→train→ONNX)
 ├── web/                         # dashboard (HTML/CSS/JS)
 ├── desktop/                     # Tauri shell (see tauri.conf.json)
 ├── .github/workflows/           # CI installer builds
-├── data/                        # SQLite, secrets, models (partially gitignored)
+├── data/                        # SQLite, secrets, raw/features/labels, models
+├── datasets/                    # joined training.csv.gz
+├── models/                      # production.onnx / candidate.onnx / archive/
 ├── scripts/
-│   ├── export_onnx.py           # ONNX train/export from signal DB (33 features)
+│   ├── export_onnx.py           # DEPRECATED signal-DB export
 │   ├── prepare_release_assets.sh
 │   ├── build_installers.sh      # macOS/Linux installer build
 │   ├── build_installers.ps1     # Windows installer build
@@ -536,10 +562,10 @@ mexc-trading-bot-rust/           # this repo (standalone)
 ├── release-assets/models/       # staged for installer (gitignored binaries)
 ├── src/
 │   ├── main.rs                  # Axum server entry
-│   ├── scanner/                 # kline poll, AI signal loop, retrain + regime loops
+│   ├── scanner/                 # kline poll, AI signal loop, historical retrain
 │   ├── signals/                 # AI candidate generator, signal types
 │   ├── ai/                      # LLM regime service + decision engine
-│   ├── ml/                      # features (33-dim), online + ONNX ensemble, Kelly
+│   ├── ml/                      # bar features (24-dim), ONNX 3-class, optional online
 │   ├── backtest/                # R-based replay, walk-forward, acceptance gate
 │   ├── risk/                    # RiskManager, circuit breakers
 │   ├── execution/               # paper + live traders

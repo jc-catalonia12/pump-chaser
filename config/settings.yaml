@@ -12,7 +12,7 @@ scanner:
   usdt_m_crypto_only: true
   kline_refresh_sec: 60
   htf_interval: Min15
-  htf_lookback_bars: 48
+  htf_lookback_bars: 250
   fetch_funding_rate: true
 zones:
   enabled: true
@@ -71,10 +71,10 @@ storage:
 ml:
   enabled: true
   supervised_enabled: true
-  supervised_threshold: 0.52
+  supervised_threshold: 0.60
   min_training_samples: 50
   hard_ml_gate: false
-  onnx_model_path: data/models/supervised.onnx
+  onnx_model_path: data/models/production.onnx
   trade_win_weight: 2.0
   trade_loss_weight: 3.5
   gate_min_accuracy: 0.6
@@ -83,16 +83,25 @@ ml:
   ml_risk_scale_min: 0.35
   ml_risk_scale_max: 1.0
   kelly_fraction: 0.5
+  # V2: train offline from historical candles; do not learn from live outcomes.
+  online_learning_enabled: false
   auto_retrain_enabled: false
-  retrain_interval_hours: 6
+  retrain_interval_hours: 168
   retrain_min_new_samples: 30
-  python_bin: python3
+  python_bin: env/bin/python
   export_script_path: scripts/export_onnx.py
+  training_module: training
+  training_symbols: []
+  training_auto_universe: true
+  training_top_n: 10
+  training_min_turnover_usdt: 500000.0
+  training_interval: Min15
+  training_days: 180
 server:
   host: 127.0.0.1
   port: 8001
 learning:
-  enabled: true
+  enabled: false
   shadow_ml_rejects: true
   shadow_ml_reject_weight: 0.75
   shadow_max_per_symbol_hour: 4

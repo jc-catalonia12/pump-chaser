@@ -330,7 +330,7 @@ fn default_htf_interval() -> String {
 }
 
 fn default_htf_lookback() -> u32 {
-    48
+    250
 }
 
 fn default_true() -> bool {
@@ -375,8 +375,8 @@ fn default_proximity() -> f64 {
 pub struct TradingConfig {
     #[serde(default = "default_trading_mode")]
     pub mode: String,
-    /// Max seconds a position may stay open before the time exit fires.
-    /// 0 = disabled.
+    /// Hold window (seconds) for shadow signal labeling and chart lookback.
+    /// Does **not** force-close open positions — exits are SL / TP / trailing only.
     #[serde(default = "default_max_hold")]
     pub max_hold_sec: u64,
 }
@@ -718,26 +718,53 @@ pub struct MlConfig {
     /// estimation error). Drives `suggested_risk_pct` / `suggested_leverage`.
     #[serde(default = "default_kelly_fraction")]
     pub kelly_fraction: f64,
-    /// Periodically re-train the GradientBoosting ONNX model offline via
-    /// `scripts/export_onnx.py` and hot-reload it into the live pipeline.
+    /// When false (default), the bot does **not** update model weights from
+    /// live signal outcomes. Training is offline from historical candles via
+    /// `python -m training`. Online SGD remains available as an opt-in overlay.
+    #[serde(default)]
+    pub online_learning_enabled: bool,
+    /// Periodically run the historical candle retrain pipeline
+    /// (`python -m training pipeline`) and hot-reload production.onnx.
     /// Requires a local Python env with `requirements.txt` installed — off
     /// by default so the bot never depends on Python unless opted in.
     #[serde(default)]
     pub auto_retrain_enabled: bool,
-    /// Hours between retrain attempts.
+    /// Hours between historical retrain attempts.
     #[serde(default = "default_retrain_interval_hours")]
     pub retrain_interval_hours: u64,
-    /// Minimum newly-resolved signals (since the last retrain) required
-    /// before spending a retrain cycle.
+    /// Minimum newly-resolved signals (legacy gate; historical retrain uses
+    /// candle freshness instead). Kept for config compatibility.
     #[serde(default = "default_retrain_min_new_samples")]
     pub retrain_min_new_samples: u32,
-    /// Python interpreter used to run the export script (repo-root relative
-    /// paths, e.g. from a local venv, are resolved by the OS/shell as usual).
+    /// Python interpreter used for the historical training CLI.
     #[serde(default = "default_python_bin")]
     pub python_bin: String,
-    /// Path to the offline retrain script, relative to the bot's working directory.
+    /// Deprecated signal-DB export script (kept for compatibility). Prefer
+    /// `training_module` / `python -m training pipeline`.
     #[serde(default = "default_export_script_path")]
     pub export_script_path: String,
+    /// Python module invoked for historical retrain (`python -m <module> pipeline`).
+    #[serde(default = "default_training_module")]
+    pub training_module: String,
+    /// Explicit symbols for historical retrain. Empty + `training_auto_universe`
+    /// lets the Python pipeline pick top liquid USDT-M contracts from MEXC.
+    #[serde(default = "default_training_symbols")]
+    pub training_symbols: Vec<String>,
+    /// When true (default), historical retrain uses `--auto-universe`.
+    #[serde(default = "default_true")]
+    pub training_auto_universe: bool,
+    /// Top-N liquid symbols for auto-universe retrains.
+    #[serde(default = "default_training_top_n")]
+    pub training_top_n: u32,
+    /// Minimum 24h turnover (USDT) for auto-universe symbol selection.
+    #[serde(default = "default_training_min_turnover")]
+    pub training_min_turnover_usdt: f64,
+    /// Candle interval for historical training (MEXC name, e.g. Min15).
+    #[serde(default = "default_training_interval")]
+    pub training_interval: String,
+    /// How many days of history to pull on each auto-retrain cycle.
+    #[serde(default = "default_training_days")]
+    pub training_days: u32,
 }
 
 impl MlConfig {
@@ -808,6 +835,30 @@ fn default_python_bin() -> String {
 
 fn default_export_script_path() -> String {
     "scripts/export_onnx.py".into()
+}
+
+fn default_training_module() -> String {
+    "training".into()
+}
+
+fn default_training_symbols() -> Vec<String> {
+    vec![]
+}
+
+fn default_training_top_n() -> u32 {
+    10
+}
+
+fn default_training_min_turnover() -> f64 {
+    500_000.0
+}
+
+fn default_training_interval() -> String {
+    "Min15".into()
+}
+
+fn default_training_days() -> u32 {
+    180
 }
 
 /// Free news/sentiment feed — no paid API keys required.

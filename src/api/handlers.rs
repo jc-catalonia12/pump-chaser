@@ -374,6 +374,11 @@ pub async fn signals_chart(
     let zones = crate::charts::build_chart_zones(&kline_bars, &cfg);
 
     let mut trade = crate::charts::build_trade_overlay(Some(&signal), position.as_ref());
+    let side_hint = trade
+        .get("side")
+        .and_then(|v| v.as_str())
+        .unwrap_or("long");
+    let ta = crate::charts::build_ta_overlay(&kline_bars, Some(&signal), side_hint);
 
     // Resolved signal without a closed position: infer exit marker from price action.
     let pos_closed = position
@@ -437,6 +442,7 @@ pub async fn signals_chart(
         "trade": trade,
         "bars": crate::charts::bars_to_chart_payload(&kline_bars),
         "zones": zones,
+        "ta": ta,
         "interval": interval,
         "data_source": crate::charts::DATA_SOURCE,
         "tv_symbol": crate::charts::mexc_to_tradingview_symbol(symbol),
@@ -582,6 +588,11 @@ pub async fn position_chart(
         crate::charts::load_chart_bars(&exchange, &cached, &symbol, &interval, bars_n).await;
     let zones = crate::charts::build_chart_zones(&kline_bars, &cfg);
     let trade = crate::charts::build_trade_overlay(signal.as_ref(), Some(&position));
+    let side_hint = trade
+        .get("side")
+        .and_then(|v| v.as_str())
+        .unwrap_or("long");
+    let ta = crate::charts::build_ta_overlay(&kline_bars, signal.as_ref(), side_hint);
 
     let is_open = position
         .get("status")
@@ -596,6 +607,7 @@ pub async fn position_chart(
         "overlay_options": { "hide_zones": is_open },
         "bars": crate::charts::bars_to_chart_payload(&kline_bars),
         "zones": zones,
+        "ta": ta,
         "interval": interval,
         "data_source": crate::charts::DATA_SOURCE,
         "tv_symbol": crate::charts::mexc_to_tradingview_symbol(&symbol),

@@ -1,0 +1,47 @@
+{
+  "version": "2.0.0",
+  "feature_columns": [
+    "ema20_ratio",
+    "ema50_ratio",
+    "ema100_ratio",
+    "ema200_ratio",
+    "rsi_14",
+    "macd_hist",
+    "atr_pct",
+    "adx_14",
+    "vwap_dist",
+    "bb_width",
+    "volume_ma_ratio",
+    "volatility",
+    "body_pct",
+    "upper_wick_pct",
+    "lower_wick_pct",
+    "return_1",
+    "return_5",
+    "return_20",
+    "momentum_10",
+    "trend_strength",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos"
+  ],
+  "feature_dim": 24,
+  "label_names": [
+    "NO_TRADE",
+    "LONG",
+    "SHORT"
+  ],
+  "label_encoding": {
+    "NO_TRADE": 0,
+    "LONG": 1,
+    "SHORT": 2
+  },
+  "input_name": "input",
+  "default_interval": "Min15",
+  "triple_barrier": {
+    "tp_pct": 0.02,
+    "sl_pct": 0.01,
+    "horizon_bars": 48
+  }
+}

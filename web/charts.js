@@ -292,6 +292,111 @@ function nearestBarTime(bars, isoTime) {
   return best;
 }
 
+function seriesToLineData(points) {
+  if (!Array.isArray(points)) return [];
+  const dedup = new Map();
+  points.forEach((p) => {
+    const t = barTime(p.timestamp);
+    const v = num(p.value);
+    if (Number.isFinite(t) && Number.isFinite(v)) dedup.set(t, v);
+  });
+  return [...dedup.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([time, value]) => ({ time, value }));
+}
+
+function applyTaOverlays(chart, chartData) {
+  const ta = chartData.ta || {};
+  const series = ta.series || {};
+  const overlays = {};
+
+  chart.priceScale("right").applyOptions({
+    scaleMargins: { top: 0.08, bottom: 0.28 },
+  });
+
+  const emaDefs = [
+    { key: "ema20", color: "#fbbf24", title: "EMA20" },
+    { key: "ema50", color: "#38bdf8", title: "EMA50" },
+    { key: "ema200", color: "#c084fc", title: "EMA200" },
+  ];
+  emaDefs.forEach(({ key, color, title }) => {
+    const data = seriesToLineData(series[key]);
+    if (!data.length) return;
+    const line = chart.addLineSeries({
+      color,
+      lineWidth: 1,
+      title,
+      priceLineVisible: false,
+      lastValueVisible: true,
+      crosshairMarkerVisible: false,
+    });
+    line.setData(data);
+    overlays[key] = line;
+  });
+
+  const rsiData = seriesToLineData(series.rsi);
+  if (rsiData.length) {
+    const rsi = chart.addLineSeries({
+      color: "#fb7185",
+      lineWidth: 1,
+      title: "RSI",
+      priceScaleId: "rsi",
+      priceLineVisible: false,
+      lastValueVisible: true,
+    });
+    chart.priceScale("rsi").applyOptions({
+      scaleMargins: { top: 0.78, bottom: 0.02 },
+      borderVisible: false,
+    });
+    rsi.setData(rsiData);
+    rsi.createPriceLine({
+      price: 70,
+      color: "rgba(248,113,113,0.45)",
+      lineWidth: 1,
+      lineStyle: 2,
+      axisLabelVisible: false,
+      title: "",
+    });
+    rsi.createPriceLine({
+      price: 30,
+      color: "rgba(52,211,153,0.45)",
+      lineWidth: 1,
+      lineStyle: 2,
+      axisLabelVisible: false,
+      title: "",
+    });
+    overlays.rsi = rsi;
+  }
+
+  const macdHist = seriesToLineData(series.macd_hist);
+  if (macdHist.length) {
+    const hist = chart.addHistogramSeries({
+      priceScaleId: "macd",
+      priceFormat: { type: "price", precision: 6, minMove: 0.000001 },
+      lastValueVisible: false,
+    });
+    chart.priceScale("macd").applyOptions({
+      scaleMargins: { top: 0.62, bottom: 0.22 },
+      borderVisible: false,
+    });
+    hist.setData(
+      macdHist.map((p) => ({
+        time: p.time,
+        value: p.value,
+        color: p.value >= 0 ? "rgba(52,211,153,0.55)" : "rgba(248,113,113,0.55)",
+      }))
+    );
+    overlays.macd_hist = hist;
+  }
+
+  // Keep volume tucked under candles, above RSI.
+  chart.priceScale("vol").applyOptions({
+    scaleMargins: { top: 0.72, bottom: 0.14 },
+  });
+
+  return overlays;
+}
+
 export function renderSignalSetupLegend(containerId, chartData) {
   const el = document.getElementById(containerId);
   if (!el) return;
@@ -339,6 +444,23 @@ export function renderSignalSetupLegend(containerId, chartData) {
     `;
   }
 
+  const snap = chartData.ta?.snapshot || {};
+  const reasons = (chartData.ta?.reasons || []).slice(0, 8);
+  const reasonList = reasons.length
+    ? `<ul class="ta-reason-list">${reasons.map((r) => `<li>${r}</li>`).join("")}</ul>`
+    : "";
+  const snapRow = snap.rsi != null
+    ? `<div class="ta-snap-row">
+        <span class="setup-chip">RSI ${num(snap.rsi).toFixed(0)}</span>
+        <span class="setup-chip">ADX ${num(snap.adx).toFixed(0)}</span>
+        <span class="setup-chip">ATR ${num(snap.atr_pct).toFixed(2)}%</span>
+        <span class="setup-chip">Vol ${num(snap.volume_ma_ratio).toFixed(1)}×</span>
+        <span class="setup-chip ta-legend-ema20">EMA20</span>
+        <span class="setup-chip ta-legend-ema50">EMA50</span>
+        <span class="setup-chip ta-legend-ema200">EMA200</span>
+      </div>`
+    : "";
+
   el.innerHTML = `
     <div class="setup-legend-grid">
       <div><span class="hint">Side</span><strong class="setup-side-${trade.side}">${(trade.side || "—").toUpperCase()}</strong></div>
@@ -351,6 +473,11 @@ export function renderSignalSetupLegend(containerId, chartData) {
     </div>
     ${tps ? `<div class="setup-tp-row">${tps}</div>` : ""}
     ${conf ? `<div class="setup-conf-row">${conf}</div>` : ""}
+    <div class="ta-analysis">
+      <div class="ta-analysis-title">Why this trade (technical analysis)</div>
+      ${snapRow}
+      ${reasonList || `<p class="hint">No TA summary available for this chart window.</p>`}
+    </div>
     ${trade.zone_message ? `<p class="hint setup-zone-msg">${trade.zone_message}</p>` : ""}
     ${
       trade.has_position
@@ -478,8 +605,18 @@ export function renderLightweightChart(containerId, chartData) {
       }))
     );
 
+    const taOverlays = applyTaOverlays(chart, chartData);
+
     const { lines, trade, side } = buildTradeLines(chartData);
-    chartInstances.set(containerId, { chart, candleSeries, volSeries, trade, side, visibleRange: null });
+    chartInstances.set(containerId, {
+      chart,
+      candleSeries,
+      volSeries,
+      taOverlays,
+      trade,
+      side,
+      visibleRange: null,
+    });
     lines.forEach((line) => {
       candleSeries.createPriceLine({
         price: line.price,
@@ -541,6 +678,24 @@ export function updateLightweightChartBars(containerId, chartData) {
           : "rgba(248, 113, 113, 0.35)",
     }))
   );
+
+  // Refresh TA series in place when live chart polls.
+  const series = chartData.ta?.series || {};
+  const overlays = inst.taOverlays || {};
+  if (overlays.ema20) overlays.ema20.setData(seriesToLineData(series.ema20));
+  if (overlays.ema50) overlays.ema50.setData(seriesToLineData(series.ema50));
+  if (overlays.ema200) overlays.ema200.setData(seriesToLineData(series.ema200));
+  if (overlays.rsi) overlays.rsi.setData(seriesToLineData(series.rsi));
+  if (overlays.macd_hist) {
+    const macdHist = seriesToLineData(series.macd_hist);
+    overlays.macd_hist.setData(
+      macdHist.map((p) => ({
+        time: p.time,
+        value: p.value,
+        color: p.value >= 0 ? "rgba(52,211,153,0.55)" : "rgba(248,113,113,0.55)",
+      }))
+    );
+  }
 
   const trade = resolveTrade(chartData);
   const side = (trade.side || "long").toLowerCase();

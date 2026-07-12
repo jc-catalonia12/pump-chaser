@@ -84,6 +84,7 @@ pub fn user_settings_values(cfg: &AppConfig) -> Value {
             "trade_win_weight": cfg.ml.trade_win_weight,
             "trade_loss_weight": cfg.ml.trade_loss_weight,
             "kelly_fraction": cfg.ml.kelly_fraction,
+            "online_learning_enabled": cfg.ml.online_learning_enabled,
             "auto_retrain_enabled": cfg.ml.auto_retrain_enabled,
         },
         "llm": cfg.llm,
@@ -143,7 +144,13 @@ pub fn settings_schema() -> Vec<SettingsSection> {
                     vec!["ai"],
                     Some("ai = unified ML-driven signal pipeline"),
                 ),
-                field_int("trading.max_hold_sec", "Max hold (seconds)", 0.0, 86400.0, 60.0),
+                field_int(
+                    "trading.max_hold_sec",
+                    "Signal hold window (sec) — labeling/charts only, not position exit",
+                    0.0,
+                    86400.0,
+                    60.0,
+                ),
             ],
         },
         SettingsSection {
@@ -194,7 +201,7 @@ pub fn settings_schema() -> Vec<SettingsSection> {
         SettingsSection {
             id: "ml".into(),
             title: "Machine Learning".into(),
-            description: "Online + ONNX ensemble gating and Kelly-based sizing.".into(),
+            description: "Historical ONNX model gating and Kelly-based sizing. Train offline with `python -m training`.".into(),
             fields: vec![
                 field_bool("ml.enabled", "ML enabled", None),
                 field_bool("ml.supervised_enabled", "Supervised model enabled", None),
@@ -202,7 +209,8 @@ pub fn settings_schema() -> Vec<SettingsSection> {
                 field_int("ml.min_training_samples", "Min training samples", 10.0, 10_000.0, 10.0),
                 field_bool("ml.hard_ml_gate", "Hard ML gate", Some("Reject signals below threshold instead of soft scoring")),
                 field_num("ml.kelly_fraction", "Kelly fraction", 0.05, 1.0, 0.05),
-                field_bool("ml.auto_retrain_enabled", "Auto ONNX retrain", Some("Periodically retrain the ONNX model from the local DB (needs Python + requirements.txt)")),
+                field_bool("ml.online_learning_enabled", "Online learning", Some("Off by default — V2 trains from historical candles, not live outcomes")),
+                field_bool("ml.auto_retrain_enabled", "Auto historical retrain", Some("Periodically run `python -m training pipeline` and hot-reload production.onnx")),
             ],
         },
         SettingsSection {
@@ -235,7 +243,7 @@ pub fn settings_schema() -> Vec<SettingsSection> {
             title: "Feature Toggles".into(),
             description: "Learning loop and watchlist options.".into(),
             fields: vec![
-                field_bool("learning.enabled", "Learning loop", Some("Record outcomes for model retraining")),
+                field_bool("learning.enabled", "Learning loop", Some("Only runs when ml.online_learning_enabled is also true")),
                 field_select("watchlist.mode", "Watchlist mode", vec!["all", "manual"], Some("all = scan full universe")),
             ],
         },
@@ -314,6 +322,9 @@ pub fn apply_user_settings(cfg: &mut AppConfig, patch: &Value) -> Result<()> {
         }
         if let Some(x) = m.get("kelly_fraction") {
             cfg.ml.kelly_fraction = json_to_f64(x)?;
+        }
+        if let Some(x) = m.get("online_learning_enabled") {
+            cfg.ml.online_learning_enabled = json_to_bool(x)?;
         }
         if let Some(x) = m.get("auto_retrain_enabled") {
             cfg.ml.auto_retrain_enabled = json_to_bool(x)?;

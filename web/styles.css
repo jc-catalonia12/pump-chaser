@@ -1543,9 +1543,47 @@ table.data th.col-time {
 
 .setup-zone-msg,
 .setup-pos-note {
-  margin: 0.45rem 0 0;
-  font-size: 0.75rem;
+  margin: 0.35rem 0 0;
+  font-size: 0.8rem;
 }
+
+.ta-analysis {
+  margin-top: 0.55rem;
+  padding-top: 0.5rem;
+  border-top: 1px dashed var(--border);
+}
+
+.ta-analysis-title {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted, #94a3b8);
+  margin-bottom: 0.35rem;
+}
+
+.ta-snap-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-bottom: 0.4rem;
+}
+
+.ta-reason-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  color: var(--text, #e2e8f0);
+}
+
+.ta-reason-list li {
+  margin: 0.15rem 0;
+}
+
+.ta-legend-ema20 { border-color: #fbbf24; color: #fbbf24; }
+.ta-legend-ema50 { border-color: #38bdf8; color: #38bdf8; }
+.ta-legend-ema200 { border-color: #c084fc; color: #c084fc; }
 
 @keyframes chart-modal-in {
   from {
