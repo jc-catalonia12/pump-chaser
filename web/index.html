@@ -10,7 +10,9 @@
   <script type="importmap" id="asset-importmap"></script>
   <script>
     (function () {
-      var t = Date.now();
+      // Prefer installer/app version from ?v= so upgrades bust WebView2 document cache.
+      var params = new URLSearchParams(window.location.search || "");
+      var t = params.get("v") || String(Date.now());
       window.__ASSET_T = t;
       document.getElementById("asset-importmap").textContent = JSON.stringify({
         imports: {
@@ -23,9 +25,11 @@
       link.rel = "stylesheet";
       link.href = "/styles.css?t=" + t;
       document.head.appendChild(link);
+      var guard = document.createElement("script");
+      guard.src = "/desktop-guard.js?t=" + t;
+      document.head.appendChild(guard);
     })();
   </script>
-  <script src="/desktop-guard.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://unpkg.com/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
   <script src="https://s3.tradingview.com/tv.js"></script>

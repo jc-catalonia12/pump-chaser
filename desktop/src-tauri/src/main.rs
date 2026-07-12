@@ -62,12 +62,22 @@ fn splash_error(app: &tauri::AppHandle, message: &str) {
 // ── API server ─────────────────────────────────────────────────────────────
 
 fn spawn_api_server_if_needed() {
-    if mexc_trading_bot::server::is_api_reachable() {
+    if mexc_trading_bot::server::is_same_version_api_reachable() {
         log_startup(&format!(
-            "API already running at {} — reusing existing server",
-            mexc_trading_bot::server::default_api_url()
+            "API already running at {} (v{}) — reusing existing server",
+            mexc_trading_bot::server::default_api_url(),
+            mexc_trading_bot::server::package_version()
         ));
         return;
+    }
+
+    if mexc_trading_bot::server::is_api_reachable() {
+        let remote = mexc_trading_bot::server::remote_api_version().unwrap_or_else(|| "?".into());
+        log_startup(&format!(
+            "Stale API on {} reports v{remote}, this build is v{} — not reusing (will try to bind)",
+            mexc_trading_bot::server::default_api_url(),
+            mexc_trading_bot::server::package_version()
+        ));
     }
 
     log_startup("Spawning embedded API server thread");
@@ -77,9 +87,11 @@ fn spawn_api_server_if_needed() {
         if let Err(exc) = rt.block_on(mexc_trading_bot::server::run()) {
             let detail = exc.to_string();
             if detail.contains("Address already in use") {
+                let remote = mexc_trading_bot::server::remote_api_version()
+                    .unwrap_or_else(|| "unknown".into());
                 log_startup(&format!(
-                    "Port 8001 in use — using existing API at {}",
-                    mexc_trading_bot::server::default_api_url()
+                    "Port 8001 still held by another process (remote health v{remote}). \
+                     Close other MEXC Trading Bot / cargo run instances and relaunch."
                 ));
             } else {
                 log_startup(&format!("API server exited: {detail}"));
@@ -91,7 +103,13 @@ fn spawn_api_server_if_needed() {
 // ── Dashboard ──────────────────────────────────────────────────────────────
 
 fn open_dashboard(app: &tauri::AppHandle) {
-    let api_url = mexc_trading_bot::server::default_api_url();
+    // Cache-bust the document URL so WebView2 cannot keep a stale index.html
+    // from a previous install (that HTML is what contains the Virtual Assistant FAB).
+    let api_url = format!(
+        "{}/?v={}",
+        mexc_trading_bot::server::default_api_url().trim_end_matches('/'),
+        mexc_trading_bot::server::package_version()
+    );
     let Ok(parsed) = Url::parse(&api_url) else {
         splash_error(app, "Invalid API URL configured for the dashboard.");
         return;
@@ -101,6 +119,9 @@ fn open_dashboard(app: &tauri::AppHandle) {
         splash_error(app, "Main window failed to initialize.");
         return;
     };
+
+    // Drop prior WebView2 HTTP cache for this app so upgrades load bundled UI.
+    let _ = main.clear_all_browsing_data();
 
     if let Err(e) = main.navigate(parsed) {
         splash_error(
@@ -382,11 +403,39 @@ fn run_startup_sequence(app: tauri::AppHandle, ollama_handle: Arc<ollama::Ollama
             return;
         }
 
+        if !mexc_trading_bot::server::is_same_version_api_reachable() {
+            let remote = mexc_trading_bot::server::remote_api_version().unwrap_or_else(|| "?".into());
+            let ours = mexc_trading_bot::server::package_version();
+            let log_hint = mexc_trading_bot::utils::app_data_dir()
+                .join("startup.log")
+                .display()
+                .to_string();
+            log_startup(&format!(
+                "API on :8001 is v{remote}, expected v{ours} — refusing to open stale UI"
+            ));
+            let err_handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                splash_error(
+                    &err_handle,
+                    &format!(
+                        "Port 8001 is still serving an older bot (v{remote}).\n\
+                         This install is v{ours}.\n\n\
+                         1. Open Task Manager and end every \"MEXC Trading Bot\" process\n\
+                         2. Also end any leftover `mexc-trading-bot` / cargo run\n\
+                         3. Relaunch this app\n\n\
+                         Log: {log_hint}"
+                    ),
+                );
+            });
+            return;
+        }
+
         // ── Step 5: Open dashboard ─────────────────────────────────────────
         splash_status(&app, "Loading dashboard…", 5);
         log_startup(&format!(
-            "API ready at {}",
-            mexc_trading_bot::server::default_api_url()
+            "API ready at {} (v{})",
+            mexc_trading_bot::server::default_api_url(),
+            mexc_trading_bot::server::package_version()
         ));
 
         let handle = app.clone();
