@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Stage dev config, ML models, and training database for Tauri installer bundling.
-# Called by scripts/build_release.sh (and build_installers.sh).
+# Stage config, ML models, and training database for Tauri installer bundling.
+# Called by scripts/build_release.sh and CI installer workflows.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODELS_STAGING="$ROOT/release-assets/models"
 DATA_STAGING="$ROOT/release-assets/data"
-SRC_ONNX="$ROOT/data/models/supervised.onnx"
+SRC_PRODUCTION="$ROOT/data/models/production.onnx"
+SRC_SUPERVISED="$ROOT/data/models/supervised.onnx"
 SRC_ONLINE="$ROOT/data/models/online_model.json"
+SRC_SCHEMA="$ROOT/data/models/feature_schema.json"
+SRC_METRICS="$ROOT/data/models/production.metrics.json"
 SRC_DB="$ROOT/data/mexc_trading_bot.db"
 SRC_CONFIG="$ROOT/config/settings.yaml"
 EXPORT_SCRIPT="$ROOT/scripts/export_onnx.py"
@@ -26,23 +29,42 @@ if [[ ! -f "$SRC_CONFIG" ]]; then
 fi
 echo "    config/settings.yaml ($(wc -l < "$SRC_CONFIG" | tr -d ' ') lines) — bundled with installer"
 
-# ── ML models ────────────────────────────────────────────────────────────────
-if [[ ! -f "$SRC_ONNX" && -f "$SRC_DB" && -f "$EXPORT_SCRIPT" ]]; then
+# ── ML models (prefer V2 production.onnx; keep supervised.onnx as fallback) ───
+if [[ ! -f "$SRC_PRODUCTION" && ! -f "$SRC_SUPERVISED" && -f "$SRC_DB" && -f "$EXPORT_SCRIPT" ]]; then
   if command -v python3 >/dev/null 2>&1; then
-    echo "    supervised.onnx missing — exporting from $SRC_DB"
-    python3 "$EXPORT_SCRIPT" --db "$SRC_DB" --out "$SRC_ONNX" || true
+    echo "    ONNX missing — exporting from $SRC_DB"
+    python3 "$EXPORT_SCRIPT" --db "$SRC_DB" --out "$SRC_SUPERVISED" || true
   fi
 fi
 
-if [[ ! -f "$SRC_ONNX" ]]; then
-  echo "ERROR: Missing ONNX model: $SRC_ONNX" >&2
-  echo "       Train/export first, e.g.:" >&2
-  echo "         python3 scripts/export_onnx.py --db data/mexc_trading_bot.db --out data/models/supervised.onnx" >&2
+# Prefer production.onnx; fall back to supervised.onnx and stage both names so
+# older seeds and V2 settings (onnx_model_path=production.onnx) both work.
+SRC_PRIMARY=""
+if [[ -f "$SRC_PRODUCTION" ]]; then
+  SRC_PRIMARY="$SRC_PRODUCTION"
+elif [[ -f "$SRC_SUPERVISED" ]]; then
+  SRC_PRIMARY="$SRC_SUPERVISED"
+fi
+
+if [[ -z "$SRC_PRIMARY" ]]; then
+  echo "ERROR: Missing ONNX model. Need one of:" >&2
+  echo "         $SRC_PRODUCTION" >&2
+  echo "         $SRC_SUPERVISED" >&2
   exit 1
 fi
 
-cp "$SRC_ONNX" "$MODELS_STAGING/supervised.onnx"
-echo "    staged supervised.onnx ($(du -h "$MODELS_STAGING/supervised.onnx" | cut -f1))"
+cp "$SRC_PRIMARY" "$MODELS_STAGING/production.onnx"
+cp "$SRC_PRIMARY" "$MODELS_STAGING/supervised.onnx"
+echo "    staged production.onnx + supervised.onnx from $(basename "$SRC_PRIMARY") ($(du -h "$MODELS_STAGING/production.onnx" | cut -f1))"
+
+if [[ -f "$SRC_SCHEMA" ]]; then
+  cp "$SRC_SCHEMA" "$MODELS_STAGING/feature_schema.json"
+  echo "    staged feature_schema.json"
+fi
+if [[ -f "$SRC_METRICS" ]]; then
+  cp "$SRC_METRICS" "$MODELS_STAGING/production.metrics.json"
+  echo "    staged production.metrics.json"
+fi
 
 if [[ -f "$SRC_ONLINE" ]]; then
   cp "$SRC_ONLINE" "$MODELS_STAGING/online_model.json"
@@ -90,18 +112,25 @@ DB_SHA=""
 if [[ -n "${DEST_DB:-}" && -f "$DEST_DB" ]]; then
   DB_SHA=$(sha256_file "$DEST_DB")
 fi
-ONNX_SHA=$(sha256_file "$MODELS_STAGING/supervised.onnx")
+PRODUCTION_SHA=$(sha256_file "$MODELS_STAGING/production.onnx")
+SUPERVISED_SHA=$(sha256_file "$MODELS_STAGING/supervised.onnx")
 ONLINE_SHA=""
 if [[ -f "$MODELS_STAGING/online_model.json" ]]; then
   ONLINE_SHA=$(sha256_file "$MODELS_STAGING/online_model.json")
+fi
+SCHEMA_SHA=""
+if [[ -f "$MODELS_STAGING/feature_schema.json" ]]; then
+  SCHEMA_SHA=$(sha256_file "$MODELS_STAGING/feature_schema.json")
 fi
 
 cat > "$MANIFEST" <<EOF
 {
   "settings_sha256": "$SETTINGS_SHA",
   "db_sha256": "$DB_SHA",
-  "supervised_onnx_sha256": "$ONNX_SHA",
-  "online_model_sha256": "$ONLINE_SHA"
+  "production_onnx_sha256": "$PRODUCTION_SHA",
+  "supervised_onnx_sha256": "$SUPERVISED_SHA",
+  "online_model_sha256": "$ONLINE_SHA",
+  "feature_schema_sha256": "$SCHEMA_SHA"
 }
 EOF
 echo "    wrote seed.manifest (settings + training fingerprints)"

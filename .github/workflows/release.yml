@@ -49,20 +49,35 @@ jobs:
           TAG="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Sync release version into Cargo + Tauri config
+        run: |
+          TAG="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
+          VERSION="${TAG#v}"
+          printf '%s\n' "$VERSION" > VERSION
+          bash scripts/sync_version.sh
+          echo "Building installer as v$(tr -d ' \n\r' < VERSION)"
+
       - name: Restore ML models
         env:
           SUPERVISED_ONNX_B64: ${{ secrets.SUPERVISED_ONNX_B64 }}
           ONLINE_MODEL_JSON_B64: ${{ secrets.ONLINE_MODEL_JSON_B64 }}
         run: |
-          if [ -z "$SUPERVISED_ONNX_B64" ] && [ ! -f "$ONNX_PATH" ]; then
-            echo "::error::Commit data/models/supervised.onnx or set SUPERVISED_ONNX_B64 secret"
-            exit 1
-          fi
           mkdir -p data/models
-          if [ -n "$SUPERVISED_ONNX_B64" ] && [ ! -f "$ONNX_PATH" ]; then
-            echo "$SUPERVISED_ONNX_B64" | base64 --decode > "$ONNX_PATH"
+          if [ -f data/models/production.onnx ] && [ ! -f data/models/supervised.onnx ]; then
+            cp data/models/production.onnx data/models/supervised.onnx
           fi
-          if [ -n "$ONLINE_MODEL_JSON_B64" ]; then
+          if [ -f data/models/supervised.onnx ] && [ ! -f data/models/production.onnx ]; then
+            cp data/models/supervised.onnx data/models/production.onnx
+          fi
+          if [ ! -f data/models/production.onnx ] && [ ! -f data/models/supervised.onnx ]; then
+            if [ -z "$SUPERVISED_ONNX_B64" ]; then
+              echo "::error::Commit data/models/production.onnx (or supervised.onnx) or set SUPERVISED_ONNX_B64 secret"
+              exit 1
+            fi
+            echo "$SUPERVISED_ONNX_B64" | base64 --decode > data/models/production.onnx
+            cp data/models/production.onnx data/models/supervised.onnx
+          fi
+          if [ -n "$ONLINE_MODEL_JSON_B64" ] && [ ! -f data/models/online_model.json ]; then
             echo "$ONLINE_MODEL_JSON_B64" | base64 --decode > data/models/online_model.json
           fi
 
@@ -100,7 +115,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        working-directory: desktop
+        working-directory: desktop/src-tauri
         run: cargo tauri build --target x86_64-apple-darwin
 
       # Optional: also build for Apple Silicon
@@ -111,26 +126,11 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        working-directory: desktop
+        working-directory: desktop/src-tauri
         run: cargo tauri build --target aarch64-apple-darwin
 
       - name: Collect macOS artifacts
-        run: |
-          mkdir -p dist/release-macos
-          BUNDLE="desktop/src-tauri/target"
-
-          # x86_64
-          find "$BUNDLE/x86_64-apple-darwin/release/bundle" \
-            \( -name "*.dmg" -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \) \
-            -exec cp {} dist/release-macos/ \; 2>/dev/null || true
-
-          # aarch64
-          find "$BUNDLE/aarch64-apple-darwin/release/bundle" \
-            \( -name "*.dmg" -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \) \
-            -exec cp {} dist/release-macos/ \; 2>/dev/null || true
-
-          echo "=== macOS artifacts ==="
-          ls -lh dist/release-macos/
+        run: bash scripts/collect_ci_artifacts.sh macos dist/release-macos
 
       - uses: actions/upload-artifact@v5
         with:
@@ -145,20 +145,36 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Sync release version into Cargo + Tauri config
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
+          VERSION="${TAG#v}"
+          printf '%s\n' "$VERSION" > VERSION
+          bash scripts/sync_version.sh
+          echo "Building installer as v$(tr -d ' \n\r' < VERSION)"
+
       - name: Restore ML models
         env:
           SUPERVISED_ONNX_B64: ${{ secrets.SUPERVISED_ONNX_B64 }}
           ONLINE_MODEL_JSON_B64: ${{ secrets.ONLINE_MODEL_JSON_B64 }}
         shell: pwsh
         run: |
-          if (-not $env:SUPERVISED_ONNX_B64 -and -not (Test-Path $env:ONNX_PATH)) {
-            Write-Error "Commit data/models/supervised.onnx or set SUPERVISED_ONNX_B64 secret"
-          }
           New-Item -ItemType Directory -Force -Path "data/models" | Out-Null
-          if ($env:SUPERVISED_ONNX_B64 -and -not (Test-Path $env:ONNX_PATH)) {
-            [IO.File]::WriteAllBytes($env:ONNX_PATH, [Convert]::FromBase64String($env:SUPERVISED_ONNX_B64))
+          if ((Test-Path "data/models/production.onnx") -and -not (Test-Path "data/models/supervised.onnx")) {
+            Copy-Item "data/models/production.onnx" "data/models/supervised.onnx" -Force
           }
-          if ($env:ONLINE_MODEL_JSON_B64) {
+          if ((Test-Path "data/models/supervised.onnx") -and -not (Test-Path "data/models/production.onnx")) {
+            Copy-Item "data/models/supervised.onnx" "data/models/production.onnx" -Force
+          }
+          if (-not (Test-Path "data/models/production.onnx") -and -not (Test-Path "data/models/supervised.onnx")) {
+            if (-not $env:SUPERVISED_ONNX_B64) {
+              Write-Error "Commit data/models/production.onnx (or supervised.onnx) or set SUPERVISED_ONNX_B64 secret"
+            }
+            [IO.File]::WriteAllBytes("data/models/production.onnx", [Convert]::FromBase64String($env:SUPERVISED_ONNX_B64))
+            Copy-Item "data/models/production.onnx" "data/models/supervised.onnx" -Force
+          }
+          if ($env:ONLINE_MODEL_JSON_B64 -and -not (Test-Path "data/models/online_model.json")) {
             [IO.File]::WriteAllBytes("data/models/online_model.json",
               [Convert]::FromBase64String($env:ONLINE_MODEL_JSON_B64))
           }
@@ -196,22 +212,12 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        working-directory: desktop
+        working-directory: desktop/src-tauri
         run: cargo tauri build
 
       - name: Collect Windows artifacts
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path "dist/release-windows" | Out-Null
-          $bundle = "desktop/src-tauri/target/release/bundle"
-          Get-ChildItem "$bundle/msi" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in ".msi",".sig",".zip" } |
-            Copy-Item -Destination "dist/release-windows" -Force
-          Get-ChildItem "$bundle/nsis" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in ".exe",".sig",".zip" -or $_.Name -like "*setup*" } |
-            Copy-Item -Destination "dist/release-windows" -Force
-          Write-Host "=== Windows artifacts ==="
-          Get-ChildItem "dist/release-windows" | Format-Table Name, Length -AutoSize
+        shell: bash
+        run: bash scripts/collect_ci_artifacts.sh windows dist/release-windows
 
       - uses: actions/upload-artifact@v5
         with:
@@ -256,25 +262,27 @@ jobs:
             --out     dist/latest.json
           echo "=== latest.json ===" && cat dist/latest.json
 
-      - name: Extract release notes from UPGRADE-v1.0.0.md (first 40 lines after last phase)
+      - name: Extract release notes
         id: notes
         run: |
           {
             echo 'notes<<ENDNOTES'
             echo "## MEXC Trading Bot v${{ needs.build-macos.outputs.version }}"
             echo ""
-            echo "Automated release — see [UPGRADE-v1.0.0.md](https://github.com/${{ github.repository }}/blob/main/UPGRADE-v1.0.0.md) for the full change log."
+            echo "V2 release — historical ML training, TA chart overlays, and SL/TP/trailing-only exits."
+            echo ""
+            echo "See [UPGRADE-V2.0.0.md](https://github.com/${{ github.repository }}/blob/master/UPGRADE-V2.0.0.md) for the full change log."
             echo ""
             echo "### What's included"
-            echo "- AI-first trading pipeline (33-feature engine, online+ONNX ensemble, Kelly sizing)"
-            echo "- Local LLM regime layer (Ollama, optional — graceful degradation when offline)"
-            echo "- Unified decision engine (EV + R:R + regime gates)"
-            echo "- R-based backtest + acceptance gate"
+            echo "- Offline historical candle training (\`python -m training\`)"
+            echo "- Production ONNX model gating (meta-labeled)"
+            echo "- Chart TA overlays (EMA / RSI / MACD) + trade reasons"
+            echo "- Positions close only on stop loss, take profit, or trailing stop (no time exit)"
             echo "- In-app auto-update notifications"
             echo ""
             echo "### Installation"
             echo "- **macOS**: download the \`.dmg\` and drag to Applications"
-            echo "- **Windows**: download the \`.msi\` installer and run it"
+            echo "- **Windows**: download the \`.msi\` or \`*-setup.exe\` and run it (uninstall older builds first if the version banner still shows 0.1.x)"
             echo ""
             echo "No additional prerequisites — all dependencies are bundled."
             echo "Ollama is optional (install separately for the LLM regime layer)."
