@@ -15,6 +15,16 @@ pub use online::OnlineClassifier;
 pub fn onnx_model_path(cfg: &crate::config::MlConfig) -> std::path::PathBuf {
     match cfg.onnx_model_path {
         Some(ref p) => std::path::PathBuf::from(p),
-        None => std::path::PathBuf::from("data/models/supervised.onnx"),
+        None => {
+            // Prefer V2 production model; fall back to legacy supervised.onnx.
+            let production = std::path::PathBuf::from("data/models/production.onnx");
+            if production.exists() {
+                production
+            } else if std::path::PathBuf::from("models/production.onnx").exists() {
+                std::path::PathBuf::from("models/production.onnx")
+            } else {
+                std::path::PathBuf::from("data/models/supervised.onnx")
+            }
+        }
     }
 }

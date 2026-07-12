@@ -1,10 +1,5 @@
-//! Paper trading exit engine — stop-loss, take-profit (partial), trailing stop,
-//! and time-based exit for paper positions.
-//!
-//! Previously only SL + time-exit were handled.  This revision adds:
-//!   - Per-TP-level partial closes (mirroring `paper_trader.py`).
-//!   - Trailing-stop ratchet (activated after `trailing_activation_pct` move).
-//!   - "Free ride" SL move to entry after the first TP is hit.
+//! Paper trading exit engine — stop-loss, take-profit (partial), and trailing stop.
+//! Positions stay open until SL, TP, or trailing stop hit (no time-based close).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,28 +62,11 @@ impl PaperTrader {
             let side = pos.get("side").and_then(|v| v.as_str()).unwrap_or("long").to_string();
             let entry = pos.get("entry_price").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let mut sl = pos.get("stop_loss").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let opened = pos.get("opened_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let remaining = pos
                 .get("remaining_size")
                 .and_then(|v| v.as_f64())
                 .filter(|&s| s > 0.0)
                 .unwrap_or_else(|| pos.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0));
-
-            // ── Time exit ─────────────────────────────────────────────────
-            if let Some(reason) = self.check_time_exit(&opened) {
-                let exit = paper_chunk_pnl(entry, price, remaining, &side, slippage, fee_rate).0;
-                if let Ok(pnl) = self.db.close_position(id, exit, 1.0, fee_rate, &reason).await {
-                    let _ = risk.update_pnl(pnl).await;
-                    let _ = risk.record_trade_outcome(&symbol, pnl > 0.0).await;
-                    let _ = self
-                        .db
-                        .log_event("position_closed", &format!("Closed {symbol} ({reason})"), Some(json!({"pnl": pnl})))
-                        .await;
-                    events.push(json!({"position_id": id, "symbol": symbol, "reason": reason, "pnl": pnl}));
-                    self.trailing_stops.remove(&id);
-                }
-                continue;
-            }
 
             // ── Adaptive trailing stop ratchet ─────────────────────────────
             if entry > 0.0 {
@@ -258,21 +236,5 @@ impl PaperTrader {
             }
         }
         events
-    }
-
-    fn check_time_exit(&self, opened_at: &str) -> Option<String> {
-        let max_hold = self.config.read().unwrap().trading.max_hold_sec;
-        if max_hold == 0 {
-            return None;
-        }
-        let opened = chrono::DateTime::parse_from_rfc3339(opened_at)
-            .map(|d| d.with_timezone(&Utc))
-            .ok()?;
-        let age = Utc::now().signed_duration_since(opened).num_seconds().max(0) as u64;
-        if age >= max_hold {
-            Some("time_exit".into())
-        } else {
-            None
-        }
     }
 }

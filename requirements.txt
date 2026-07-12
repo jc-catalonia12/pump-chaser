@@ -1,6 +1,14 @@
-# Optional Python tooling — ONNX export from signal history (scripts/export_onnx.py).
-# Runtime trading bot is Rust-only; install only if you use the export script.
+# Historical candle ML pipeline (V2.0.0) — offline training only.
+# Runtime trading bot is Rust-only; install these for `python -m training`.
+# Prefer Python 3.11–3.12. pyarrow is optional (csv.gz is the default store).
+pandas>=2.1,<3
+numpy>=1.26,<3
+requests>=2.31,<3
 scikit-learn>=1.4,<2
+lightgbm>=4.3,<5
 skl2onnx>=1.16,<2
 onnx>=1.15,<2
 onnxruntime>=1.17,<2
+onnxmltools>=1.12,<2
+# Optional faster columnar IO (install if your Python has wheels):
+# pyarrow>=14,<20

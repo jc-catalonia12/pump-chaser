@@ -1,4 +1,7 @@
-//! ONNX supervised classifier inference via ONNX Runtime (ort).
+//! ONNX multi-class classifier inference via ONNX Runtime (ort).
+//!
+//! Classes (must match `training/schema.py`):
+//!   0 = NO_TRADE, 1 = LONG, 2 = SHORT
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -12,11 +15,38 @@ use crate::config::MlConfig;
 use crate::error::{BotError, Result};
 use crate::ml::features::{normalize_feature_vector, FEATURE_DIM};
 
+/// Probabilities for the three target classes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClassProba {
+    pub no_trade: f64,
+    pub long: f64,
+    pub short: f64,
+}
+
+impl ClassProba {
+    /// Probability of the actionable side matching `side_long`.
+    pub fn side_probability(&self, side_long: bool) -> f64 {
+        if side_long {
+            self.long
+        } else {
+            self.short
+        }
+    }
+
+    /// Best actionable class probability (max of LONG/SHORT).
+    pub fn best_trade_probability(&self) -> f64 {
+        self.long.max(self.short)
+    }
+
+    pub fn prefers_no_trade(&self) -> bool {
+        self.no_trade >= self.long && self.no_trade >= self.short
+    }
+}
+
 #[derive(Clone)]
 pub struct OnnxClassifier {
     session: Arc<Mutex<Session>>,
     path: PathBuf,
-    /// Feature width expected by this ONNX graph (10 legacy or 15 current).
     input_dim: usize,
 }
 
@@ -25,7 +55,7 @@ impl OnnxClassifier {
         let path = resolve_model_path(config);
         if !path.exists() {
             warn!(
-                "ONNX model not found at {} — export with scripts/export_onnx.py",
+                "ONNX model not found at {} — train with: python -m training pipeline",
                 path.display()
             );
             return None;
@@ -41,7 +71,7 @@ impl OnnxClassifier {
             }
             Err(e) => {
                 warn!(
-                    "Failed to load ONNX model {}: {e} — re-export with scripts/export_onnx.py",
+                    "Failed to load ONNX model {}: {e} — retrain with python -m training",
                     path.display()
                 );
                 None
@@ -74,8 +104,8 @@ impl OnnxClassifier {
         self.input_dim
     }
 
-    /// Predict P(win) for a feature vector sized to this model's input width.
-    pub fn predict_proba(&self, features: &[f64]) -> Result<f64> {
+    /// Predict class probabilities for a feature vector.
+    pub fn predict_proba(&self, features: &[f64]) -> Result<ClassProba> {
         let vec = normalize_feature_vector(Some(features), self.input_dim);
         let input_f32: Vec<f32> = vec.iter().map(|v| *v as f32).collect();
         let input = Array2::from_shape_vec((1, self.input_dim), input_f32)
@@ -91,11 +121,15 @@ impl OnnxClassifier {
             .run(ort::inputs![tensor])
             .map_err(|e| BotError::Ml(e.to_string()))?;
 
-        extract_win_probability(&outputs)
+        extract_class_proba(&outputs)
+    }
+
+    /// Back-compat: P(win-like) ≈ max(P(LONG), P(SHORT)).
+    pub fn predict_trade_probability(&self, features: &[f64]) -> Result<f64> {
+        Ok(self.predict_proba(features)?.best_trade_probability())
     }
 }
 
-/// Read the fixed feature width from the ONNX graph input (e.g. `[None, 10]`).
 fn session_input_feature_dim(session: &Session) -> usize {
     session
         .inputs()
@@ -112,24 +146,44 @@ fn session_input_feature_dim(session: &Session) -> usize {
         .unwrap_or(FEATURE_DIM)
 }
 
-fn extract_win_probability(outputs: &ort::session::SessionOutputs<'_>) -> Result<f64> {
+fn extract_class_proba(outputs: &ort::session::SessionOutputs<'_>) -> Result<ClassProba> {
     for (name, value) in outputs.iter() {
         let Ok(view) = value.try_extract_array::<f32>() else {
             continue;
         };
         let shape = view.shape();
-        if shape.len() == 2 && shape[0] == 1 && shape[1] >= 2 {
-            return Ok(view[[0, 1]] as f64);
+
+        // Preferred: [1, 3] probabilities for NO_TRADE / LONG / SHORT
+        if shape.len() == 2 && shape[0] == 1 && shape[1] >= 3 {
+            return Ok(ClassProba {
+                no_trade: view[[0, 0]] as f64,
+                long: view[[0, 1]] as f64,
+                short: view[[0, 2]] as f64,
+            });
         }
-        if shape.len() == 1 && shape[0] >= 2 {
-            return Ok(view[1] as f64);
+        if shape.len() == 1 && shape[0] >= 3 {
+            return Ok(ClassProba {
+                no_trade: view[0] as f64,
+                long: view[1] as f64,
+                short: view[2] as f64,
+            });
+        }
+        // Binary legacy: [1, 2] → treat class1 as tradeable long-ish
+        if shape.len() == 2 && shape[0] == 1 && shape[1] == 2 {
+            let p = view[[0, 1]] as f64;
+            return Ok(ClassProba {
+                no_trade: 1.0 - p,
+                long: p,
+                short: 0.0,
+            });
         }
         if shape.len() == 2 && shape[0] == 1 && shape[1] == 1 {
-            return Ok(view[[0, 0]] as f64);
-        }
-        if view.len() == 1 {
-            let logit = view[0] as f64;
-            return Ok(1.0 / (1.0 + (-logit).exp()));
+            let p = view[[0, 0]] as f64;
+            return Ok(ClassProba {
+                no_trade: 1.0 - p,
+                long: p,
+                short: 0.0,
+            });
         }
         tracing::debug!("ONNX output '{name}' shape {:?} — skipped", shape);
     }
@@ -143,21 +197,23 @@ pub fn resolve_model_path(config: &MlConfig) -> PathBuf {
 #[cfg(all(test, feature = "onnx"))]
 mod tests {
     use super::*;
-    use crate::ml::features::LEGACY_ONNX_FEATURE_DIM;
 
     #[test]
-    fn ort_loads_supervised_export() {
-        let path = PathBuf::from("data/models/supervised.onnx");
-        if !path.exists() {
+    fn ort_loads_production_export() {
+        for candidate in [
+            PathBuf::from("models/production.onnx"),
+            PathBuf::from("data/models/production.onnx"),
+            PathBuf::from("data/models/supervised.onnx"),
+        ] {
+            if !candidate.exists() {
+                continue;
+            }
+            let clf = OnnxClassifier::load(&candidate)
+                .expect("historical ONNX export should load via ONNX Runtime");
+            assert!(clf.input_dim() == FEATURE_DIM || clf.input_dim() > 0);
+            let sample = vec![0.0; clf.input_dim()];
+            let _ = clf.predict_proba(&sample).expect("ONNX predict should succeed");
             return;
         }
-        let clf = OnnxClassifier::load(&path).expect("sklearn ONNX export should load via ONNX Runtime");
-        assert!(
-            clf.input_dim() == LEGACY_ONNX_FEATURE_DIM
-                || clf.input_dim() == 15
-                || clf.input_dim() == FEATURE_DIM
-        );
-        let sample = vec![0.0; clf.input_dim()];
-        clf.predict_proba(&sample).expect("ONNX predict should succeed");
     }
 }

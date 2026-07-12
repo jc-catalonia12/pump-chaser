@@ -1074,13 +1074,17 @@ impl ScannerInner {
             let mut guard = tasks.lock().await;
             guard.push(ticker_task);
             guard.push(kline_task);
-            if self.cfg().learning.enabled {
+            if self.cfg().learning.enabled && self.cfg().ml.online_learning_enabled {
                 let learn_inner = self.clone();
                 let learn_task = tokio::spawn(async move {
                     learn_inner.learning_loop().await;
                 });
                 guard.push(learn_task);
                 info!("Continuous learning loop started (every {LEARNING_INTERVAL_SEC}s)");
+            } else if self.cfg().learning.enabled {
+                info!(
+                    "Learning loop skipped — ml.online_learning_enabled is false (historical ONNX only)"
+                );
             }
             if self.cfg().sentiment.enabled {
                 let sentiment = self.sentiment.clone();
@@ -1183,17 +1187,13 @@ impl ScannerInner {
         }
     }
 
-    /// Background loop: periodically retrain the ONNX GBM offline and hot-reload
-    /// it. Sleeps `ml.retrain_interval_hours` between checks, re-reading config
-    /// each cycle so toggling `auto_retrain_enabled` off takes effect promptly.
+    /// Background loop: periodically run the historical candle training
+    /// pipeline (`python -m training pipeline`) and hot-reload production.onnx.
     async fn retrain_loop(&self) {
-        let mut last_retrain_resolved: i64 = 0;
         while self.running.load(Ordering::SeqCst) {
             let cfg = self.cfg();
             if cfg.ml.auto_retrain_enabled {
-                if let Some(resolved) = self.maybe_retrain_onnx(last_retrain_resolved).await {
-                    last_retrain_resolved = resolved;
-                }
+                self.maybe_retrain_onnx().await;
             }
             let sleep_sec = cfg.ml.retrain_interval_hours.max(1) * 3600;
             for _ in 0..sleep_sec {
@@ -1205,50 +1205,49 @@ impl ScannerInner {
         }
     }
 
-    /// Run `scripts/export_onnx.py` against the live DB if enough new resolved
-    /// signals have accumulated since the last retrain, then hot-reload the
-    /// resulting ONNX file into the live pipeline. Best-effort: any failure
-    /// (missing Python, missing deps, too few samples) just logs a warning —
-    /// the bot keeps trading on the online model / previous ONNX export.
-    /// Returns the resolved-signal count at the time of a successful retrain.
-    async fn maybe_retrain_onnx(&self, last_retrain_resolved: i64) -> Option<i64> {
-        let counts = match self.db.get_signal_outcome_counts().await {
-            Ok(c) => c,
-            Err(exc) => {
-                debug!("Retrain check skipped — couldn't read signal outcome counts: {exc}");
-                return None;
-            }
-        };
-        let resolved = counts.get("resolved").and_then(|v| v.as_i64()).unwrap_or(0);
+    /// Run `python -m training pipeline` (historical candles → walk-forward →
+    /// promote-if-better) then hot-reload production.onnx. Best-effort.
+    async fn maybe_retrain_onnx(&self) -> bool {
         let cfg = self.cfg();
-        if resolved - last_retrain_resolved < cfg.ml.retrain_min_new_samples as i64 {
-            debug!(
-                "Retrain skipped — only {} new resolved signal(s), need {}",
-                (resolved - last_retrain_resolved).max(0),
-                cfg.ml.retrain_min_new_samples
-            );
-            return None;
+        let python_bin = cfg.ml.python_bin.clone();
+        let module = cfg.ml.training_module.clone();
+        let symbols = cfg.ml.training_symbols.clone();
+        let interval = cfg.ml.training_interval.clone();
+        let days = cfg.ml.training_days.to_string();
+        let auto_universe = cfg.ml.training_auto_universe;
+        let top_n = cfg.ml.training_top_n.to_string();
+        let min_turnover = cfg.ml.training_min_turnover_usdt.to_string();
+
+        info!(
+            "Starting historical ONNX retrain (module={module}, interval={interval}, days={days}, auto_universe={auto_universe}, top={top_n}, symbols={symbols:?})..."
+        );
+        let mut cmd = tokio::process::Command::new(&python_bin);
+        cmd.arg("-m")
+            .arg(&module)
+            .arg("pipeline")
+            .arg("--interval")
+            .arg(&interval)
+            .arg("--days")
+            .arg(&days)
+            .arg("--folds")
+            .arg("4");
+        if auto_universe {
+            cmd.arg("--auto-universe")
+                .arg("--top")
+                .arg(&top_n)
+                .arg("--min-turnover")
+                .arg(&min_turnover);
+        } else {
+            cmd.arg("--no-auto-universe");
+            if !symbols.is_empty() {
+                cmd.arg("--symbols").args(&symbols);
+            }
         }
 
-        let python_bin = cfg.ml.python_bin.clone();
-        let script_path = cfg.ml.export_script_path.clone();
-        let db_path = cfg.storage.sqlite_path.clone();
-        let out_path = crate::ml::onnx_model_path(&cfg.ml);
-
-        info!("Starting offline ONNX retrain ({resolved} resolved signals available)...");
-        let output = tokio::process::Command::new(&python_bin)
-            .arg(&script_path)
-            .arg("--db")
-            .arg(&db_path)
-            .arg("--out")
-            .arg(&out_path)
-            .output()
-            .await;
-
-        match output {
+        match cmd.output().await {
             Ok(out) if out.status.success() => {
                 info!(
-                    "ONNX retrain succeeded: {}",
+                    "Historical ONNX retrain finished: {}",
                     String::from_utf8_lossy(&out.stdout).trim()
                 );
                 self.ml.lock().await.reload_onnx();
@@ -1256,30 +1255,36 @@ impl ScannerInner {
                     .db
                     .log_event(
                         "ml_retrain",
-                        "ONNX model retrained offline and hot-reloaded",
-                        Some(json!({ "resolved_signals": resolved })),
+                        "Historical candle model retrained and hot-reloaded",
+                        Some(json!({
+                            "interval": interval,
+                            "days": cfg.ml.training_days,
+                            "auto_universe": auto_universe,
+                            "top_n": cfg.ml.training_top_n,
+                            "symbols": symbols,
+                        })),
                     )
                     .await;
-                Some(resolved)
+                true
             }
             Ok(out) => {
                 warn!(
-                    "ONNX retrain script exited with {}: {}",
+                    "Historical ONNX retrain exited with {}: {}",
                     out.status,
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
-                None
+                false
             }
             Err(exc) => {
-                warn!("Failed to spawn ONNX retrain script ({python_bin} {script_path}): {exc}");
-                None
+                warn!("Failed to spawn historical retrain ({python_bin} -m {module}): {exc}");
+                false
             }
         }
     }
 
     /// Background loop: periodically classify the market regime via the local
-    /// Ollama LLM. The cached result feeds ML feature slots 27–32. Offline or
-    /// misbehaving Ollama degrades to a neutral regime — never blocks trading.
+    /// Ollama LLM. Offline or misbehaving Ollama degrades to a neutral regime —
+    /// never blocks trading. Regime still informs the decision engine.
     async fn llm_regime_loop(&self) {
         while self.running.load(Ordering::SeqCst) {
             let inputs = self.build_regime_inputs().await;
@@ -1476,8 +1481,22 @@ impl ScannerInner {
         klines: &[crate::exchange::KlineBar],
     ) -> Option<PumpSignal> {
         let ctx = self.ml_feature_context(&signal.symbol).await;
+        // Prefer HTF bars for ML features (model is trained on Min15 historical candles).
+        let htf = {
+            let states = self.states.read().await;
+            states
+                .get(&signal.symbol)
+                .map(|s| s.htf_klines.clone())
+                .unwrap_or_default()
+        };
+        let feature_bars: &[crate::exchange::KlineBar] =
+            if htf.len() >= crate::ml::features::MIN_BARS_FOR_FEATURES {
+                &htf
+            } else {
+                klines
+            };
         let mut ml = self.ml.lock().await;
-        let mut enhanced = match ml.enhance_signal_outcome(signal, Some(klines), &ctx) {
+        let mut enhanced = match ml.enhance_signal_outcome(signal, Some(feature_bars), &ctx) {
             EnhanceOutcome::Tradable(e) => e,
             EnhanceOutcome::MlRejected(r) => {
                 drop(ml);

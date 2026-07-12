@@ -1,69 +1,51 @@
-//! Technical feature engineering — mirrors Python `ml/features.py` (pandas-only path).
+//! Bar-level feature engineering — must match `training/schema.py` (V2.0.0).
 //!
-//! Feature layout (FEATURE_DIM = 33):
-//!   0-9   technical indicators (RSI, EMA, MACD, ATR, BB, volume, returns)
-//!  10-14  signal context (composite, zone, volume surge, side, move %)
-//!  15     is_volume_pump (legacy, always 0 now that "ai" is the only strategy)
-//!  16     hour_sin (cyclical time)
-//!  17     hour_cos
-//!  18     btc_htf_move_pct (normalized, clamped)
-//!  19     global_sentiment (-1..1)
-//!  20     symbol_htf_move_pct (own higher-timeframe move, normalized)
-//!  21     rel_strength_vs_btc (symbol HTF move minus BTC HTF move, normalized)
-//!  22     vol_regime_ratio (ATR% expansion/contraction vs ~14 bars ago)
-//!  23     orderflow_body_ratio (candle body/range pressure proxy, last 5 bars)
-//!  24     orderflow_volume_imbalance (up-vol vs down-vol skew, last 10 bars)
-//!  25     funding_rate (normalized, clamped)
-//!  26     symbol_sentiment (-1..1, per-symbol news score)
-//!  27-30  LLM regime one-hot: trending, chop, high_vol, risk_off (Phase 4 fills these in)
-//!  31     llm_btc_bias (-1..1, Phase 4 fills this in)
-//!  32     llm_confidence (0..1, Phase 4 fills this in)
+//! Feature layout (FEATURE_DIM = 24):
+//!   EMA ratios, RSI, MACD, ATR%, ADX, VWAP distance, Bollinger width,
+//!   volume MA ratio, volatility, candle anatomy, returns/momentum,
+//!   trend strength, cyclical hour / day-of-week.
+//!
+//! Signal context / LLM / sentiment remain available via `MlFeatureContext`
+//! for the decision engine, but are **not** model inputs.
 
-use chrono::{Timelike, Utc};
+use chrono::{Datelike, Timelike, TimeZone, Utc};
 use serde_json::Value;
 
 use crate::exchange::KlineBar;
 
-pub const FEATURE_COLUMNS: [&str; 33] = [
+pub const FEATURE_COLUMNS: [&str; 24] = [
+    "ema20_ratio",
+    "ema50_ratio",
+    "ema100_ratio",
+    "ema200_ratio",
     "rsi_14",
-    "ema_ratio",
-    "ema_slope_pct",
     "macd_hist",
     "atr_pct",
+    "adx_14",
+    "vwap_dist",
     "bb_width",
-    "volume_z",
+    "volume_ma_ratio",
+    "volatility",
+    "body_pct",
+    "upper_wick_pct",
+    "lower_wick_pct",
     "return_1",
     "return_5",
-    "hl_range_pct",
-    "composite_score",
-    "zone_score",
-    "volume_surge",
-    "side_long",
-    "price_chg_abs",
-    "is_volume_pump",
+    "return_20",
+    "momentum_10",
+    "trend_strength",
     "hour_sin",
     "hour_cos",
-    "btc_htf_move_pct",
-    "global_sentiment",
-    "symbol_htf_move_pct",
-    "rel_strength_vs_btc",
-    "vol_regime_ratio",
-    "orderflow_body_ratio",
-    "orderflow_volume_imbalance",
-    "funding_rate",
-    "symbol_sentiment",
-    "regime_trending",
-    "regime_chop",
-    "regime_high_vol",
-    "regime_risk_off",
-    "llm_btc_bias",
-    "llm_confidence",
+    "dow_sin",
+    "dow_cos",
 ];
 
-/// Extra context for building signal-level features: cross-asset, funding,
-/// sentiment, and (from Phase 4 onward) local-LLM regime classification.
-/// All fields default to neutral/zero so callers that don't have a signal
-/// yet (e.g. bars-only feature backfill) degrade gracefully.
+pub const FEATURE_DIM: usize = FEATURE_COLUMNS.len(); // 24
+
+/// Minimum bars required for a meaningful feature vector (EMA200 warm-up).
+pub const MIN_BARS_FOR_FEATURES: usize = 200;
+
+/// Extra context for decision-engine gates (not ONNX inputs).
 #[derive(Debug, Clone, Default)]
 pub struct MlFeatureContext {
     pub btc_htf_move_pct: f64,
@@ -74,9 +56,6 @@ pub struct MlFeatureContext {
     pub regime: MarketRegime,
 }
 
-/// Local-LLM market regime read (Phase 4). Until that phase is wired in,
-/// this stays at its default (all false / zero) and the corresponding
-/// feature slots simply carry no signal yet.
 #[derive(Debug, Clone, Default)]
 pub struct MarketRegime {
     pub trending: bool,
@@ -86,12 +65,6 @@ pub struct MarketRegime {
     pub btc_bias: f64,
     pub confidence: f64,
 }
-
-pub const FEATURE_DIM: usize = FEATURE_COLUMNS.len(); // 33
-
-/// Older ONNX exports (pre v15 features) expect 10 technical columns with
-/// absolute `ema_9` / `ema_21` at indices 1–2 instead of `ema_ratio` / `ema_slope_pct`.
-pub const LEGACY_ONNX_FEATURE_DIM: usize = 10;
 
 pub fn normalize_feature_vector(features: Option<&[f64]>, dim: usize) -> Vec<f64> {
     let mut vec = match features {
@@ -161,16 +134,91 @@ fn pct_change(values: &[f64], periods: usize) -> Vec<f64> {
 }
 
 fn nan_to_zero(x: f64) -> f64 {
-    if x.is_finite() { x } else { 0.0 }
+    if x.is_finite() {
+        x
+    } else {
+        0.0
+    }
+}
+
+fn rsi_series(close: &[f64], period: usize) -> Vec<f64> {
+    let n = close.len();
+    let mut rsi = vec![f64::NAN; n];
+    if n < period + 1 {
+        return rsi;
+    }
+    let deltas: Vec<f64> = close.windows(2).map(|w| w[1] - w[0]).collect();
+    if deltas.len() < period {
+        return rsi;
+    }
+    let mut avg_gain = deltas[..period].iter().map(|&d| d.max(0.0)).sum::<f64>() / period as f64;
+    let mut avg_loss = deltas[..period]
+        .iter()
+        .map(|&d| (-d).max(0.0))
+        .sum::<f64>()
+        / period as f64;
+    for (j, &d) in deltas[period..].iter().enumerate() {
+        avg_gain = (avg_gain * (period as f64 - 1.0) + d.max(0.0)) / period as f64;
+        avg_loss = (avg_loss * (period as f64 - 1.0) + (-d).max(0.0)) / period as f64;
+        let rs = if avg_loss == 0.0 {
+            100.0
+        } else {
+            avg_gain / avg_loss
+        };
+        rsi[j + period + 1] = 100.0 - 100.0 / (1.0 + rs);
+    }
+    rsi
+}
+
+fn atr_series(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Vec<f64> {
+    let n = close.len();
+    let mut tr = vec![f64::NAN; n];
+    for i in 1..n {
+        let hl = high[i] - low[i];
+        let hc = (high[i] - close[i - 1]).abs();
+        let lc = (low[i] - close[i - 1]).abs();
+        tr[i] = hl.max(hc).max(lc);
+    }
+    // Skip index 0 NaN for rolling mean of TR
+    let tr_vals: Vec<f64> = tr.iter().map(|&v| if v.is_finite() { v } else { 0.0 }).collect();
+    rolling_mean(&tr_vals, period, period.max(5) / 2)
+}
+
+fn adx_series(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Vec<f64> {
+    let n = close.len();
+    let mut plus_dm = vec![0.0; n];
+    let mut minus_dm = vec![0.0; n];
+    for i in 1..n {
+        let up = high[i] - high[i - 1];
+        let down = low[i - 1] - low[i];
+        plus_dm[i] = if up > down && up > 0.0 { up } else { 0.0 };
+        minus_dm[i] = if down > up && down > 0.0 { down } else { 0.0 };
+    }
+    let atr = atr_series(high, low, close, period);
+    let plus_di_raw = ema(&plus_dm, period);
+    let minus_di_raw = ema(&minus_dm, period);
+    let mut dx = vec![0.0; n];
+    for i in 0..n {
+        let a = atr[i];
+        if !a.is_finite() || a.abs() < 1e-12 {
+            continue;
+        }
+        let pdi = 100.0 * plus_di_raw[i] / a;
+        let mdi = 100.0 * minus_di_raw[i] / a;
+        let denom = pdi + mdi;
+        if denom.abs() > 1e-12 {
+            dx[i] = 100.0 * (pdi - mdi).abs() / denom;
+        }
+    }
+    ema(&dx, period)
 }
 
 pub struct TechnicalFeatureBuilder;
 
 impl TechnicalFeatureBuilder {
-    /// Compute the full 15-feature vector from OHLCV bars.
-    /// Features 10-14 (signal context) default to 0.0 when bars-only.
+    /// Compute the V2 bar-level feature vector from OHLCV bars.
     pub fn feature_vector(bars: &[KlineBar], idx: Option<usize>) -> Vec<f64> {
-        if bars.len() < 10 {
+        if bars.len() < MIN_BARS_FOR_FEATURES {
             return vec![0.0; FEATURE_DIM];
         }
 
@@ -179,316 +227,183 @@ impl TechnicalFeatureBuilder {
         let high: Vec<f64> = bars.iter().map(|b| b.high).collect();
         let low: Vec<f64> = bars.iter().map(|b| b.low).collect();
         let volume: Vec<f64> = bars.iter().map(|b| b.volume).collect();
-        let n = close.len();
-
-        // RSI-14
-        let rsi_14: Vec<f64> = {
-            let deltas: Vec<f64> = close.windows(2).map(|w| w[1] - w[0]).collect();
-            let mut rsi = vec![f64::NAN; n];
-            if deltas.len() >= 14 {
-                let mut avg_gain = deltas[..14].iter().map(|&d| d.max(0.0)).sum::<f64>() / 14.0;
-                let mut avg_loss = deltas[..14].iter().map(|&d| (-d).max(0.0)).sum::<f64>() / 14.0;
-                for (j, &d) in deltas[14..].iter().enumerate() {
-                    avg_gain = (avg_gain * 13.0 + d.max(0.0)) / 14.0;
-                    avg_loss = (avg_loss * 13.0 + (-d).max(0.0)) / 14.0;
-                    let rs = if avg_loss == 0.0 { 100.0 } else { avg_gain / avg_loss };
-                    rsi[j + 15] = 100.0 - 100.0 / (1.0 + rs);
-                }
-            }
-            rsi
-        };
-
-        // EMA 9 and 21
-        let ema_9 = ema(&close, 9);
-        let ema_21 = ema(&close, 21);
-
-        // ema_ratio = ema9/ema21 - 1 (scale-independent trend direction)
-        let ema_ratio: Vec<f64> = ema_9
+        let amount: Vec<f64> = bars
             .iter()
-            .zip(ema_21.iter())
-            .map(|(&e9, &e21)| if e21 != 0.0 { e9 / e21 - 1.0 } else { 0.0 })
+            .map(|b| if b.amount > 0.0 { b.amount } else { b.volume * b.close })
             .collect();
+        let n = close.len();
+        let i = idx.unwrap_or(n - 1).min(n - 1);
 
-        // ema_slope_pct = (ema9_now - ema9_5bars_ago) / close_now  (momentum %)
-        let ema_slope_pct: Vec<f64> = (0..n)
-            .map(|i| {
-                if i < 5 {
-                    return f64::NAN;
-                }
-                let c = close[i];
-                let e_now = ema_9[i];
-                let e_prev = ema_9[i - 5];
-                if c != 0.0 { (e_now - e_prev) / c } else { 0.0 }
-            })
-            .collect();
+        let ema20 = ema(&close, 20);
+        let ema50 = ema(&close, 50);
+        let ema100 = ema(&close, 100);
+        let ema200 = ema(&close, 200);
 
-        // MACD histogram (12/26/9)
+        let rsi = rsi_series(&close, 14);
         let ema12 = ema(&close, 12);
         let ema26 = ema(&close, 26);
-        let macd_line: Vec<f64> = ema12.iter().zip(ema26.iter()).map(|(&a, &b)| a - b).collect();
+        let macd_line: Vec<f64> = ema12
+            .iter()
+            .zip(ema26.iter())
+            .map(|(&a, &b)| a - b)
+            .collect();
         let macd_sig = ema(&macd_line, 9);
-        let macd_hist: Vec<f64> = macd_line.iter().zip(macd_sig.iter()).map(|(&m, &s)| m - s).collect();
-
-        // ATR-14
-        let tr: Vec<f64> = (1..n)
-            .map(|i| {
-                let hl = high[i] - low[i];
-                let hc = (high[i] - close[i - 1]).abs();
-                let lc = (low[i] - close[i - 1]).abs();
-                hl.max(hc).max(lc)
-            })
-            .collect();
-        let atr_raw = rolling_mean(&tr, 14, 5);
-        let atr_pct: Vec<f64> = (0..n)
-            .map(|i| {
-                if i == 0 {
-                    return f64::NAN;
-                }
-                let atr = atr_raw[i - 1];
-                let c = close[i];
-                if c != 0.0 && atr.is_finite() { atr / c } else { f64::NAN }
-            })
+        let macd_hist: Vec<f64> = macd_line
+            .iter()
+            .zip(macd_sig.iter())
+            .map(|(&m, &s)| m - s)
             .collect();
 
-        // Bollinger Bands width
+        let atr = atr_series(&high, &low, &close, 14);
+        let adx = adx_series(&high, &low, &close, 14);
+
         let mid = rolling_mean(&close, 20, 5);
         let std_v = rolling_std(&close, 20, 5);
-        let bb_width: Vec<f64> = (0..n)
-            .map(|i| {
-                let m = mid[i];
-                let s = std_v[i];
-                if m.is_finite() && m != 0.0 && s.is_finite() {
-                    (4.0 * s) / m
-                } else {
-                    f64::NAN
-                }
-            })
-            .collect();
 
-        // Volume Z-score
-        let vol_mean = rolling_mean(&volume, 20, 5);
-        let vol_std = rolling_std(&volume, 20, 5);
-        let volume_z: Vec<f64> = volume
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| {
-                let m = vol_mean[i];
-                let s = vol_std[i];
-                if m.is_finite() && s.is_finite() && s != 0.0 {
-                    (v - m) / s
-                } else {
-                    f64::NAN
-                }
-            })
-            .collect();
+        let mut cum_qv = 0.0;
+        let mut cum_v = 0.0;
+        let mut vwap = vec![f64::NAN; n];
+        for j in 0..n {
+            cum_qv += amount[j];
+            cum_v += volume[j];
+            if cum_v > 1e-12 {
+                vwap[j] = cum_qv / cum_v;
+            }
+        }
 
-        let return_1 = pct_change(&close, 1);
-        let return_5 = pct_change(&close, 5);
-        let hl_range_pct: Vec<f64> = (0..n)
-            .map(|i| {
-                let c = close[i];
-                if c != 0.0 { (high[i] - low[i]) / c } else { f64::NAN }
-            })
-            .collect();
+        let vol_ma = rolling_mean(&volume, 20, 5);
+        let ret1 = pct_change(&close, 1);
+        let volatility = rolling_std(&ret1.iter().map(|&v| nan_to_zero(v)).collect::<Vec<_>>(), 20, 5);
 
-        // Volatility regime: current 14-bar ATR% vs ATR% ~14 bars back. >0 means
-        // volatility is expanding, <0 means it's contracting.
-        let vol_regime_ratio: Vec<f64> = (0..n)
-            .map(|i| {
-                if i < 14 {
-                    return f64::NAN;
-                }
-                let now = atr_pct[i];
-                let prior = atr_pct[i - 14];
-                if now.is_finite() && prior.is_finite() && prior.abs() > 1e-9 {
-                    (now / prior - 1.0).clamp(-1.0, 1.0)
-                } else {
-                    f64::NAN
-                }
-            })
-            .collect();
+        let c = close[i];
+        if c.abs() < 1e-12 {
+            return vec![0.0; FEATURE_DIM];
+        }
 
-        // Order-flow proxy #1: signed candle body / range averaged over the last
-        // 5 bars (no aggressor-side data available from klines, so this stands
-        // in as a buying-vs-selling pressure signal).
-        let orderflow_body_ratio: Vec<f64> = (0..n)
-            .map(|i| {
-                let start = i.saturating_sub(4);
-                let mut sum = 0.0;
-                let mut count = 0.0;
-                for j in start..=i {
-                    let range = high[j] - low[j];
-                    if range > 1e-12 {
-                        sum += (close[j] - open[j]) / range;
-                        count += 1.0;
-                    }
-                }
-                if count > 0.0 { (sum / count).clamp(-1.0, 1.0) } else { f64::NAN }
-            })
-            .collect();
+        let rng = high[i] - low[i];
+        let body = (close[i] - open[i]).abs();
+        let upper = high[i] - open[i].max(close[i]);
+        let lower = open[i].min(close[i]) - low[i];
+        let (body_pct, upper_wick_pct, lower_wick_pct) = if rng > 1e-12 {
+            (body / rng, upper / rng, lower / rng)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
 
-        // Order-flow proxy #2: up-bar vs down-bar volume skew over the last 10 bars.
-        let orderflow_volume_imbalance: Vec<f64> = (0..n)
-            .map(|i| {
-                let start = i.saturating_sub(9);
-                let mut up = 0.0;
-                let mut down = 0.0;
-                for j in start..=i {
-                    if close[j] >= open[j] {
-                        up += volume[j];
-                    } else {
-                        down += volume[j];
-                    }
-                }
-                let total = up + down;
-                if total > 1e-9 { ((up - down) / total).clamp(-1.0, 1.0) } else { f64::NAN }
-            })
-            .collect();
+        let atr_i = atr[i];
+        let trend_strength = if atr_i.is_finite() && atr_i > 1e-12 {
+            (ema20[i] - ema50[i]).abs() / atr_i
+        } else {
+            0.0
+        };
 
-        let i = idx.unwrap_or(n - 1);
+        let ts = bars[i].timestamp;
+        let dt = Utc
+            .timestamp_opt(ts, 0)
+            .single()
+            .unwrap_or_else(Utc::now);
+        let hour = dt.hour() as f64 + dt.minute() as f64 / 60.0;
+        let dow = dt.weekday().num_days_from_monday() as f64;
+        let hour_angle = 2.0 * std::f64::consts::PI * hour / 24.0;
+        let dow_angle = 2.0 * std::f64::consts::PI * dow / 7.0;
+
+        let bb_width = {
+            let m = mid[i];
+            let s = std_v[i];
+            if m.is_finite() && m != 0.0 && s.is_finite() {
+                (4.0 * s) / m
+            } else {
+                0.0
+            }
+        };
+
+        let vol_ma_i = vol_ma[i];
+        let volume_ma_ratio = if vol_ma_i.is_finite() && vol_ma_i > 1e-12 {
+            volume[i] / vol_ma_i
+        } else {
+            0.0
+        };
+
+        let vwap_dist = if vwap[i].is_finite() {
+            (c - vwap[i]) / c
+        } else {
+            0.0
+        };
+
         vec![
-            nan_to_zero(rsi_14[i]),
-            nan_to_zero(ema_ratio[i]),
-            nan_to_zero(ema_slope_pct[i]),
-            nan_to_zero(macd_hist[i]),
-            nan_to_zero(atr_pct[i]),
-            nan_to_zero(bb_width[i]),
-            nan_to_zero(volume_z[i]),
-            nan_to_zero(return_1[i]),
-            nan_to_zero(return_5[i]),
-            nan_to_zero(hl_range_pct[i]),
-            // Features 10-14: signal context (0 when bars-only)
-            0.0, // composite_score
-            0.0, // zone_score
-            0.0, // volume_surge
-            0.0, // side_long
-            0.0, // price_chg_abs
-            0.0, // is_volume_pump (legacy)
-            0.0, // hour_sin
-            0.0, // hour_cos
-            0.0, // btc_htf_move_pct
-            0.0, // global_sentiment
-            0.0, // symbol_htf_move_pct
-            0.0, // rel_strength_vs_btc
-            nan_to_zero(vol_regime_ratio[i]),
-            nan_to_zero(orderflow_body_ratio[i]),
-            nan_to_zero(orderflow_volume_imbalance[i]),
-            0.0, // funding_rate
-            0.0, // symbol_sentiment
-            0.0, // regime_trending
-            0.0, // regime_chop
-            0.0, // regime_high_vol
-            0.0, // regime_risk_off
-            0.0, // llm_btc_bias
-            0.0, // llm_confidence
+            nan_to_zero(ema20[i] / c - 1.0),
+            nan_to_zero(ema50[i] / c - 1.0),
+            nan_to_zero(ema100[i] / c - 1.0),
+            nan_to_zero(ema200[i] / c - 1.0),
+            nan_to_zero(rsi[i] / 100.0),
+            nan_to_zero(macd_hist[i] / c),
+            nan_to_zero(if atr_i.is_finite() { atr_i / c } else { f64::NAN }),
+            nan_to_zero(adx[i] / 100.0),
+            nan_to_zero(vwap_dist),
+            nan_to_zero(bb_width),
+            nan_to_zero(volume_ma_ratio),
+            nan_to_zero(volatility[i]),
+            nan_to_zero(body_pct),
+            nan_to_zero(upper_wick_pct),
+            nan_to_zero(lower_wick_pct),
+            nan_to_zero(pct_change(&close, 1)[i]),
+            nan_to_zero(pct_change(&close, 5)[i]),
+            nan_to_zero(pct_change(&close, 20)[i]),
+            nan_to_zero(pct_change(&close, 10)[i]),
+            nan_to_zero(trend_strength),
+            hour_angle.sin(),
+            hour_angle.cos(),
+            dow_angle.sin(),
+            dow_angle.cos(),
         ]
     }
 
-    /// 10-feature vector matching legacy ONNX exports (absolute EMA prices at idx 1–2).
-    pub fn legacy_onnx_feature_vector(bars: &[KlineBar], idx: Option<usize>) -> Vec<f64> {
-        if bars.len() < 10 {
-            return vec![0.0; LEGACY_ONNX_FEATURE_DIM];
-        }
-        let mut vec = Self::feature_vector(bars, idx);
-        let close: Vec<f64> = bars.iter().map(|b| b.close).collect();
-        let ema_9 = ema(&close, 9);
-        let ema_21 = ema(&close, 21);
-        let i = idx.unwrap_or(close.len() - 1);
-        if vec.len() >= 3 {
-            vec[1] = nan_to_zero(ema_9[i]);
-            vec[2] = nan_to_zero(ema_21[i]);
-        }
-        normalize_feature_vector(Some(&vec), LEGACY_ONNX_FEATURE_DIM)
-    }
-
-    /// Build the full `FEATURE_DIM`-wide vector incorporating bar technicals,
-    /// signal context, and cross-asset/funding/sentiment/regime extras from `ctx`.
+    /// Live inference features: bar-level only (matches historical training).
+    /// `ctx` / signal fields are accepted for API compatibility but ignored
+    /// for the ONNX input vector.
     pub fn signal_features(
         bars: Option<&[KlineBar]>,
-        composite_score: f64,
-        zone_score: f64,
-        volume_surge_ratio: f64,
-        price_change_pct: f64,
-        side_long: bool,
-        strategy: &str,
-        ctx: &MlFeatureContext,
+        _composite_score: f64,
+        _zone_score: f64,
+        _volume_surge_ratio: f64,
+        _price_change_pct: f64,
+        _side_long: bool,
+        _strategy: &str,
+        _ctx: &MlFeatureContext,
     ) -> Vec<f64> {
-        let mut tech = if let Some(b) = bars {
-            if b.len() >= 10 {
-                let fv = Self::feature_vector(b, None);
-                if !fv.is_empty() && fv.iter().any(|&v| v != 0.0) {
-                    fv
-                } else {
-                    vec![0.0; FEATURE_DIM]
-                }
-            } else {
-                vec![0.0; FEATURE_DIM]
+        if let Some(b) = bars {
+            if b.len() >= MIN_BARS_FOR_FEATURES {
+                return Self::feature_vector(b, None);
             }
-        } else {
-            vec![0.0; FEATURE_DIM]
-        };
-
-        if tech.len() < FEATURE_DIM {
-            tech.resize(FEATURE_DIM, 0.0);
         }
-
-        tech[10] = (composite_score / 100.0).clamp(0.0, 1.0);
-        tech[11] = (zone_score / 100.0).clamp(0.0, 1.0);
-        tech[12] = (volume_surge_ratio / 10.0).clamp(0.0, 2.0);
-        tech[13] = if side_long { 1.0 } else { 0.0 };
-        tech[14] = price_change_pct.abs().clamp(0.0, 0.10);
-        tech[15] = if strategy == "volume_pump" { 1.0 } else { 0.0 };
-
-        let hour = Utc::now().hour() as f64;
-        let angle = 2.0 * std::f64::consts::PI * hour / 24.0;
-        tech[16] = angle.sin();
-        tech[17] = angle.cos();
-        tech[18] = (ctx.btc_htf_move_pct / 5.0).clamp(-1.0, 1.0);
-        tech[19] = ctx.global_sentiment.clamp(-1.0, 1.0);
-        tech[20] = (ctx.symbol_htf_move_pct / 5.0).clamp(-1.0, 1.0);
-        let rel_strength = ctx.symbol_htf_move_pct - ctx.btc_htf_move_pct;
-        tech[21] = (rel_strength / 5.0).clamp(-1.0, 1.0);
-        // 22-24 (vol_regime_ratio, orderflow_body_ratio, orderflow_volume_imbalance)
-        // already come from the bar-technical block above.
-        tech[25] = (ctx.funding_rate / 0.003).clamp(-1.0, 1.0);
-        tech[26] = ctx.symbol_sentiment.clamp(-1.0, 1.0);
-        tech[27] = if ctx.regime.trending { 1.0 } else { 0.0 };
-        tech[28] = if ctx.regime.chop { 1.0 } else { 0.0 };
-        tech[29] = if ctx.regime.high_vol { 1.0 } else { 0.0 };
-        tech[30] = if ctx.regime.risk_off { 1.0 } else { 0.0 };
-        tech[31] = ctx.regime.btc_bias.clamp(-1.0, 1.0);
-        tech[32] = ctx.regime.confidence.clamp(0.0, 1.0);
-
-        tech
+        vec![0.0; FEATURE_DIM]
     }
 
-    /// Backfill signal-context features 10-14 from a stored signal payload.
-    pub fn enrich_context_from_payload(features: &mut [f64], sig: &Value) {
-        if features.len() < FEATURE_DIM {
-            return;
-        }
-        let composite = sig.get("composite_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let zone = sig.get("zone_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let vol_surge = sig.get("volume_surge_ratio").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let price_chg = sig.get("price_change_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let strategy = sig.get("strategy").and_then(|v| v.as_str()).unwrap_or("");
-        features[10] = (composite / 100.0).clamp(0.0, 1.0);
-        features[11] = (zone / 100.0).clamp(0.0, 1.0);
-        features[12] = (vol_surge / 10.0).clamp(0.0, 2.0);
-        features[13] = if price_chg >= 0.0 { 1.0 } else { 0.0 };
-        features[14] = price_chg.abs().clamp(0.0, 0.10);
-        features[15] = if strategy == "volume_pump" { 1.0 } else { 0.0 };
-    }
-}
-
-/// Convenience wrapper for legacy ONNX inference (10-feature layout).
-pub fn legacy_onnx_feature_vector(bars: &[KlineBar], idx: Option<usize>) -> Vec<f64> {
-    TechnicalFeatureBuilder::legacy_onnx_feature_vector(bars, idx)
+    /// No-op retained for scanner shadow backfill compatibility.
+    pub fn enrich_context_from_payload(_features: &mut [f64], _sig: &Value) {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synth_bars(n: usize) -> Vec<KlineBar> {
+        (0..n)
+            .map(|i| {
+                let base = 100.0 + (i as f64) * 0.05;
+                KlineBar {
+                    symbol: "BTC_USDT".into(),
+                    timestamp: 1_700_000_000 + (i as i64) * 900,
+                    open: base,
+                    high: base + 0.5,
+                    low: base - 0.5,
+                    close: base + 0.1,
+                    volume: 1000.0 + i as f64,
+                    amount: (1000.0 + i as f64) * base,
+                }
+            })
+            .collect()
+    }
 
     #[test]
     fn normalize_pads_and_truncates() {
@@ -498,78 +413,35 @@ mod tests {
 
     #[test]
     fn feature_vector_from_bars() {
-        let bars: Vec<KlineBar> = (0..30)
-            .map(|i| KlineBar {
-                symbol: "BTC_USDT".into(),
-                timestamp: i as i64,
-                open: 100.0 + i as f64,
-                high: 101.0 + i as f64,
-                low: 99.0 + i as f64,
-                close: 100.5 + i as f64,
-                volume: 1000.0 + i as f64 * 10.0,
-                amount: 0.0,
-            })
-            .collect();
+        let bars = synth_bars(250);
         let fv = TechnicalFeatureBuilder::feature_vector(&bars, None);
         assert_eq!(fv.len(), FEATURE_DIM);
+        assert!(fv.iter().any(|&v| v != 0.0));
     }
 
     #[test]
-    fn signal_features_appends_context() {
-        let bars: Vec<KlineBar> = (0..30)
-            .map(|i| KlineBar {
-                symbol: "X_USDT".into(),
-                timestamp: i as i64,
-                open: 10.0,
-                high: 10.5,
-                low: 9.5,
-                close: 10.0,
-                volume: 1000.0,
-                amount: 0.0,
-            })
-            .collect();
-        let ctx = MlFeatureContext {
-            btc_htf_move_pct: 1.2,
-            global_sentiment: 0.3,
-            symbol_htf_move_pct: 2.0,
-            funding_rate: 0.0015,
-            symbol_sentiment: 0.5,
-            regime: MarketRegime {
-                trending: true,
-                confidence: 0.8,
-                ..Default::default()
-            },
-        };
+    fn short_history_returns_zeros() {
+        let bars = synth_bars(50);
+        let fv = TechnicalFeatureBuilder::feature_vector(&bars, None);
+        assert_eq!(fv, vec![0.0; FEATURE_DIM]);
+    }
+
+    #[test]
+    fn signal_features_matches_bar_features() {
+        let bars = synth_bars(250);
+        let ctx = MlFeatureContext::default();
         let fv = TechnicalFeatureBuilder::signal_features(
-            Some(&bars), 75.0, 65.0, 3.5, 0.02, true, "volume_pump", &ctx,
+            Some(&bars),
+            75.0,
+            65.0,
+            3.5,
+            0.02,
+            true,
+            "ai",
+            &ctx,
         );
         assert_eq!(fv.len(), FEATURE_DIM);
-        // composite_score = 75/100 = 0.75
-        assert!((fv[10] - 0.75).abs() < 1e-9);
-        // zone_score = 65/100 = 0.65
-        assert!((fv[11] - 0.65).abs() < 1e-9);
-        // volume_surge = 3.5/10 = 0.35
-        assert!((fv[12] - 0.35).abs() < 1e-9);
-        // side_long = 1.0
-        assert_eq!(fv[13], 1.0);
-        // price_chg_abs = 0.02
-        assert!((fv[14] - 0.02).abs() < 1e-9);
-        // btc_htf_move_pct = 1.2/5 = 0.24
-        assert!((fv[18] - 0.24).abs() < 1e-9);
-        // global_sentiment
-        assert!((fv[19] - 0.3).abs() < 1e-9);
-        // symbol_htf_move_pct = 2.0/5 = 0.4
-        assert!((fv[20] - 0.4).abs() < 1e-9);
-        // rel_strength_vs_btc = (2.0 - 1.2)/5 = 0.16
-        assert!((fv[21] - 0.16).abs() < 1e-9);
-        // funding_rate = 0.0015/0.003 = 0.5
-        assert!((fv[25] - 0.5).abs() < 1e-9);
-        // symbol_sentiment
-        assert!((fv[26] - 0.5).abs() < 1e-9);
-        // regime_trending one-hot
-        assert_eq!(fv[27], 1.0);
-        assert_eq!(fv[28], 0.0);
-        // llm_confidence
-        assert!((fv[32] - 0.8).abs() < 1e-9);
+        let bar_only = TechnicalFeatureBuilder::feature_vector(&bars, None);
+        assert_eq!(fv, bar_only);
     }
 }
