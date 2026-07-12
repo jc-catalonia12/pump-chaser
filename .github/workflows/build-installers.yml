@@ -63,19 +63,30 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Restore ML models from secrets
-        if: ${{ !hashFiles('data/models/supervised.onnx') }}
+        if: ${{ !hashFiles('data/models/production.onnx') && !hashFiles('data/models/supervised.onnx') }}
         env:
           SUPERVISED_ONNX_B64: ${{ secrets.SUPERVISED_ONNX_B64 }}
           ONLINE_MODEL_JSON_B64: ${{ secrets.ONLINE_MODEL_JSON_B64 }}
         run: |
           if [ -z "$SUPERVISED_ONNX_B64" ]; then
-            echo "::error::Missing data/models/supervised.onnx in repo. Commit the file or set repository secret SUPERVISED_ONNX_B64 (base64-encoded supervised.onnx)."
+            echo "::error::Missing data/models/production.onnx (or supervised.onnx). Commit the file or set SUPERVISED_ONNX_B64."
             exit 1
           fi
           mkdir -p data/models
-          echo "$SUPERVISED_ONNX_B64" | base64 --decode > "$ONNX_PATH"
+          echo "$SUPERVISED_ONNX_B64" | base64 --decode > data/models/production.onnx
+          cp data/models/production.onnx data/models/supervised.onnx
           if [ -n "$ONLINE_MODEL_JSON_B64" ]; then
             echo "$ONLINE_MODEL_JSON_B64" | base64 --decode > data/models/online_model.json
+          fi
+
+      - name: Normalize ONNX filenames for bundling
+        run: |
+          mkdir -p data/models
+          if [ -f data/models/production.onnx ] && [ ! -f data/models/supervised.onnx ]; then
+            cp data/models/production.onnx data/models/supervised.onnx
+          fi
+          if [ -f data/models/supervised.onnx ] && [ ! -f data/models/production.onnx ]; then
+            cp data/models/supervised.onnx data/models/production.onnx
           fi
 
       - name: Inject updater pubkey + endpoint into tauri.conf.json
@@ -134,23 +145,35 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Restore ML models from secrets
-        if: ${{ !hashFiles('data/models/supervised.onnx') }}
+        if: ${{ !hashFiles('data/models/production.onnx') && !hashFiles('data/models/supervised.onnx') }}
         env:
           SUPERVISED_ONNX_B64: ${{ secrets.SUPERVISED_ONNX_B64 }}
           ONLINE_MODEL_JSON_B64: ${{ secrets.ONLINE_MODEL_JSON_B64 }}
         shell: pwsh
         run: |
           if (-not $env:SUPERVISED_ONNX_B64) {
-            Write-Error "Missing data/models/supervised.onnx in repo. Commit the file or set repository secret SUPERVISED_ONNX_B64 (base64-encoded supervised.onnx)."
+            Write-Error "Missing data/models/production.onnx (or supervised.onnx). Commit the file or set SUPERVISED_ONNX_B64."
           }
           New-Item -ItemType Directory -Force -Path "data/models" | Out-Null
-          [IO.File]::WriteAllBytes($env:ONNX_PATH, [Convert]::FromBase64String($env:SUPERVISED_ONNX_B64))
+          [IO.File]::WriteAllBytes("data/models/production.onnx", [Convert]::FromBase64String($env:SUPERVISED_ONNX_B64))
+          Copy-Item "data/models/production.onnx" "data/models/supervised.onnx" -Force
           if ($env:ONLINE_MODEL_JSON_B64) {
             [IO.File]::WriteAllBytes(
               "data/models/online_model.json",
               [Convert]::FromBase64String($env:ONLINE_MODEL_JSON_B64)
             )
           }
+
+      - name: Normalize ONNX filenames for bundling
+        shell: bash
+        run: |
+          mkdir -p data/models
+          if [ -f data/models/production.onnx ] && [ ! -f data/models/supervised.onnx ]; then
+            cp data/models/production.onnx data/models/supervised.onnx
+          fi
+          if [ -f data/models/supervised.onnx ] && [ ! -f data/models/production.onnx ]; then
+            cp data/models/supervised.onnx data/models/production.onnx
+          fi
 
       - name: Inject updater pubkey + endpoint into tauri.conf.json
         env:

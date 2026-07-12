@@ -3,10 +3,10 @@
 #
 # Bundles into the .dmg / .msi:
 #   - config/settings.yaml   (your strategy / risk / ML settings)
-#   - data/models/*          (supervised.onnx + online_model.json)
+#   - data/models/*          (production.onnx + supervised.onnx fallback + schema)
 #   - data/mexc_trading_bot.db (signals, training history, positions)
 #
-# Version: auto-bumps patch in VERSION (0.1.0 → 0.1.1) each run unless --no-bump.
+# Version: auto-bumps patch in VERSION (2.0.0 → 2.0.1) each run unless --no-bump.
 #
 # Usage (from repo root):
 #   ./scripts/build_release.sh
@@ -71,7 +71,7 @@ if ! cargo tauri --version >/dev/null 2>&1; then
 fi
 
 echo "==> Building installer v$RELEASE_VERSION (release)..."
-cd "$ROOT/desktop"
+cd "$ROOT/desktop/src-tauri"
 if ((${#BUILD_ARGS[@]} > 0)); then
   cargo tauri build "${BUILD_ARGS[@]}"
 else

@@ -278,9 +278,13 @@ struct SeedManifest {
     #[serde(default)]
     db_sha256: String,
     #[serde(default)]
+    production_onnx_sha256: String,
+    #[serde(default)]
     supervised_onnx_sha256: String,
     #[serde(default)]
     online_model_sha256: String,
+    #[serde(default)]
+    feature_schema_sha256: String,
 }
 
 /// Sync bundled dev settings, training DB, and models when the installer seed manifest changes.
@@ -337,55 +341,77 @@ fn apply_bundled_seed(resource_root: &Path, data_dir: &Path) {
     }
 
     // ML models — refresh when the installer ships new weights.
-    if !bundled.supervised_onnx_sha256.is_empty()
-        && applied
-            .as_ref()
-            .map(|a| a.supervised_onnx_sha256.as_str())
-            != Some(bundled.supervised_onnx_sha256.as_str())
-    {
-        let src = resource_root.join(BUNDLED_MODELS_REL).join("supervised.onnx");
-        let dst = user_models_dir(data_dir).join("supervised.onnx");
-        if model_should_reseed(
-            &dst,
-            applied.as_ref().map(|a| a.supervised_onnx_sha256.as_str()),
-            &bundled.supervised_onnx_sha256,
-        ) && copy_seed_file(&src, &dst)
-        {
-            tracing::info!("Seeded bundled model → {}", dst.display());
-        } else {
-            next_applied.supervised_onnx_sha256 = applied
-                .as_ref()
-                .map(|a| a.supervised_onnx_sha256.clone())
-                .unwrap_or_default();
-        }
-    }
-
-    if !bundled.online_model_sha256.is_empty()
-        && applied
-            .as_ref()
-            .map(|a| a.online_model_sha256.as_str())
-            != Some(bundled.online_model_sha256.as_str())
-    {
-        let src = resource_root
-            .join(BUNDLED_MODELS_REL)
-            .join("online_model.json");
-        let dst = user_models_dir(data_dir).join("online_model.json");
-        if model_should_reseed(
-            &dst,
-            applied.as_ref().map(|a| a.online_model_sha256.as_str()),
-            &bundled.online_model_sha256,
-        ) && copy_seed_file(&src, &dst)
-        {
-            tracing::info!("Seeded bundled model → {}", dst.display());
-        } else {
-            next_applied.online_model_sha256 = applied
-                .as_ref()
-                .map(|a| a.online_model_sha256.clone())
-                .unwrap_or_default();
-        }
-    }
+    seed_model_from_manifest(
+        resource_root,
+        data_dir,
+        &applied,
+        &bundled,
+        &mut next_applied,
+        "production.onnx",
+        |m| m.production_onnx_sha256.as_str(),
+        |m, v| m.production_onnx_sha256 = v,
+    );
+    seed_model_from_manifest(
+        resource_root,
+        data_dir,
+        &applied,
+        &bundled,
+        &mut next_applied,
+        "supervised.onnx",
+        |m| m.supervised_onnx_sha256.as_str(),
+        |m, v| m.supervised_onnx_sha256 = v,
+    );
+    seed_model_from_manifest(
+        resource_root,
+        data_dir,
+        &applied,
+        &bundled,
+        &mut next_applied,
+        "online_model.json",
+        |m| m.online_model_sha256.as_str(),
+        |m, v| m.online_model_sha256 = v,
+    );
+    seed_model_from_manifest(
+        resource_root,
+        data_dir,
+        &applied,
+        &bundled,
+        &mut next_applied,
+        "feature_schema.json",
+        |m| m.feature_schema_sha256.as_str(),
+        |m, v| m.feature_schema_sha256 = v,
+    );
 
     let _ = save_applied_manifest(data_dir, &next_applied);
+}
+
+fn seed_model_from_manifest(
+    resource_root: &Path,
+    data_dir: &Path,
+    applied: &Option<SeedManifest>,
+    bundled: &SeedManifest,
+    next_applied: &mut SeedManifest,
+    file_name: &str,
+    get_hash: impl Fn(&SeedManifest) -> &str,
+    set_hash: impl Fn(&mut SeedManifest, String),
+) {
+    let bundled_hash = get_hash(bundled);
+    if bundled_hash.is_empty() {
+        return;
+    }
+    let applied_hash = applied.as_ref().map(|a| get_hash(a));
+    if applied_hash == Some(bundled_hash) {
+        return;
+    }
+    let src = resource_root.join(BUNDLED_MODELS_REL).join(file_name);
+    let dst = user_models_dir(data_dir).join(file_name);
+    if model_should_reseed(&dst, applied_hash, bundled_hash) && copy_seed_file(&src, &dst) {
+        tracing::info!("Seeded bundled model → {}", dst.display());
+    } else if let Some(prev) = applied.as_ref() {
+        set_hash(next_applied, get_hash(prev).to_string());
+    } else {
+        set_hash(next_applied, String::new());
+    }
 }
 
 fn apply_bundled_seed_legacy(resource_root: &Path, data_dir: &Path) {
@@ -539,7 +565,13 @@ fn migrate_legacy_models(data_dir: &Path) {
     if !legacy.is_dir() {
         return;
     }
-    for name in ["supervised.onnx", "online_model.json"] {
+    for name in [
+        "production.onnx",
+        "supervised.onnx",
+        "online_model.json",
+        "feature_schema.json",
+        "production.metrics.json",
+    ] {
         let from = legacy.join(name);
         let to = current.join(name);
         if !from.is_file() || to.is_file() {
